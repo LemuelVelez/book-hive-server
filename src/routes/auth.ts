@@ -1,5 +1,5 @@
 import express from "express";
-import bcrypt from "bcryptjs";
+import * as bcrypt from "bcryptjs"; // <- namespace import so it works with/without esModuleInterop
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { query } from "../db";
@@ -56,7 +56,6 @@ async function createAndSendVerifyEmail(userId: string, email: string) {
   );
 
   const serverUrl = process.env.SERVER_PUBLIC_URL || "http://localhost:5000";
-  const clientUrl = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 
   // We send people to an API link that verifies then redirects to your UI callback:
   const confirmUrl = `${serverUrl}/api/auth/verify-email/confirm?token=${encodeURIComponent(
@@ -78,8 +77,8 @@ async function createAndSendVerifyEmail(userId: string, email: string) {
     html,
   });
 
-  // Also include a link the UI could use if you want to build a client-side confirm flow:
-  // ${clientUrl}/auth/verify-email-callback?token=${encodeURIComponent(token)}
+  // If you prefer a purely client-side confirm flow, you could instead email a link like:
+  // `${process.env.CLIENT_ORIGIN || "http://localhost:5173"}/auth/verify-email-callback?token=${encodeURIComponent(token)}`
 }
 
 // --- Routes ---
