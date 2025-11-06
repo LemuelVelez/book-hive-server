@@ -1,5 +1,5 @@
 import express from "express";
-import * as bcrypt from "bcryptjs"; // <- namespace import so it works with/without esModuleInterop
+import * as bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { query } from "../db";
@@ -41,7 +41,7 @@ function setSessionCookie(res: express.Response, token: string) {
     secure: prod,
     sameSite: "lax",
     path: "/",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7d
+    maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 }
 
@@ -69,9 +69,10 @@ async function createAndSendVerifyEmail(
     [userId, token, expiresAt]
   );
 
-  const serverUrl = process.env.SERVER_PUBLIC_URL || "http://localhost:5000";
+  // Helpful for debugging: proves a row was written
+  console.log(`[verify-email] token created for user=${userId} token=${token}`);
 
-  // We send people to an API link that verifies then redirects to your UI callback:
+  const serverUrl = process.env.SERVER_PUBLIC_URL || "http://localhost:5000";
   const confirmUrl = `${serverUrl}/api/auth/verify-email/confirm?token=${encodeURIComponent(
     token
   )}`;
@@ -95,9 +96,6 @@ async function createAndSendVerifyEmail(
     subject: "Verify your email • JRMSU-TC Book-Hive",
     html,
   });
-
-  // If you prefer a purely client-side confirm flow, you could instead email a link like:
-  // `${process.env.CLIENT_ORIGIN || "http://localhost:5173"}/auth/verify-email-callback?token=${encodeURIComponent(token)}`
 }
 
 // --- Routes ---
@@ -180,9 +178,7 @@ router.post("/register", async (req, res, next) => {
        RETURNING *`,
       [
         String(fullName).trim(),
-        String(email)
-          .trim()
-          .toLowerCase(),
+        String(email).trim().toLowerCase(),
         hash,
         accountType,
         studentIdVal,
@@ -193,11 +189,11 @@ router.post("/register", async (req, res, next) => {
 
     const user = ins.rows[0];
 
-    // Send verify email (best-effort)
+    // Send verify email (best-effort, but includes DB insert above)
     try {
       await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     } catch (e) {
-      console.warn("Failed sending verification email:", e);
+      console.warn("Failed creating/sending verification email:", e);
     }
 
     return res.status(201).json({
@@ -227,11 +223,7 @@ router.post("/login", async (req, res, next) => {
 
     const found = await query<UserRow>(
       `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-      [
-        String(email)
-          .trim()
-          .toLowerCase(),
-      ]
+      [String(email).trim().toLowerCase()]
     );
     if (!found.rowCount) {
       return res
@@ -284,6 +276,12 @@ router.post("/verify-email", async (req, res, next) => {
       return res.status(404).json({ ok: false, message: "Account not found." });
     }
     const user = found.rows[0];
+
+    // Optional: invalidate old unused tokens (keeps table tidy)
+    await query(`UPDATE email_verifications SET used = TRUE WHERE user_id = $1 AND used = FALSE`, [
+      user.id,
+    ]);
+
     await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     res.json({ ok: true, message: "Verification email sent." });
   } catch (err) {
@@ -291,11 +289,17 @@ router.post("/verify-email", async (req, res, next) => {
   }
 });
 
-// GET /api/auth/verify-email/confirm?token=...
-router.get("/verify-email/confirm", async (req, res, next) => {
+/**
+ * POST /api/auth/verify-email/confirm
+ * JSON confirm flow for SPA: { token }
+ * Returns JSON instead of redirecting.
+ */
+router.post("/verify-email/confirm", async (req, res, next) => {
   try {
-    const token = String(req.query.token || "");
-    if (!token) return res.status(400).send("Missing token.");
+    const token = String((req.body?.token ?? "")).trim();
+    if (!token) {
+      return res.status(400).json({ ok: false, message: "Missing token." });
+    }
 
     const t = await query<{
       id: string;
@@ -305,12 +309,16 @@ router.get("/verify-email/confirm", async (req, res, next) => {
       used: boolean;
     }>(`SELECT * FROM email_verifications WHERE token = $1 LIMIT 1`, [token]);
 
-    if (!t.rowCount) return res.status(400).send("Invalid token.");
+    if (!t.rowCount) {
+      return res.status(400).json({ ok: false, message: "Invalid token." });
+    }
     const row = t.rows[0];
 
-    if (row.used) return res.status(400).send("Token already used.");
+    if (row.used) {
+      return res.status(400).json({ ok: false, message: "Token already used." });
+    }
     if (new Date(row.expires_at).getTime() < Date.now()) {
-      return res.status(400).send("Token expired.");
+      return res.status(400).json({ ok: false, message: "Token expired." });
     }
 
     await query(`UPDATE users SET is_email_verified = TRUE WHERE id = $1`, [
@@ -320,9 +328,48 @@ router.get("/verify-email/confirm", async (req, res, next) => {
       row.id,
     ]);
 
+    return res.json({ ok: true, message: "Email verified." });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /api/auth/verify-email/confirm?token=...
+ * Email link flow: verify then redirect to FE callback with status.
+ */
+router.get("/verify-email/confirm", async (req, res, next) => {
+  try {
     const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
-    const redirect = `${client}/auth/verify-email-callback?status=success`;
-    res.redirect(302, redirect);
+    const to = (q: string) => `${client}/auth/verify-email/callback${q}`;
+
+    const token = String(req.query.token || "");
+    if (!token) return res.redirect(302, to(`?status=error&reason=missing`));
+
+    const t = await query<{
+      id: string;
+      user_id: string;
+      token: string;
+      expires_at: string;
+      used: boolean;
+    }>(`SELECT * FROM email_verifications WHERE token = $1 LIMIT 1`, [token]);
+
+    if (!t.rowCount) return res.redirect(302, to(`?status=error&reason=invalid`));
+    const row = t.rows[0];
+
+    if (row.used) return res.redirect(302, to(`?status=error&reason=used`));
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.redirect(302, to(`?status=error&reason=expired`));
+    }
+
+    await query(`UPDATE users SET is_email_verified = TRUE WHERE id = $1`, [
+      row.user_id,
+    ]);
+    await query(`UPDATE email_verifications SET used = TRUE WHERE id = $1`, [
+      row.id,
+    ]);
+
+    return res.redirect(302, to(`?status=success`));
   } catch (err) {
     next(err);
   }

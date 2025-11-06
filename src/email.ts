@@ -55,7 +55,6 @@ export async function sendMail(opts: {
     if (rawMessage.includes("535")) {
       const human =
         "Gmail rejected the SMTP login (535). Make sure 2-Step Verification is ON and you're using a fresh 16-character App Password (no spaces) for this Gmail address. Then restart the server so the new .env is loaded.";
-      // Preserve original as cause when possible
       try {
         throw new Error(human, { cause: err });
       } catch {
@@ -63,7 +62,6 @@ export async function sendMail(opts: {
       }
     }
 
-    // Re-throw with a readable message if it wasn't an Error
     if (err instanceof Error) throw err;
     throw new Error(rawMessage);
   }
