@@ -1,0 +1,15 @@
+{
+    "json.schemas": [
+      { "fileMatch": ["tsconfig.json", "tsconfig.*.json"], "url": "./schemas/tsconfig.schema.json" }
+    ],
+    "json.schemaDownload.enable": false,
+
+    "files.associations": {
+      "**/migrations/**/*.sql": "postgres",
+      "*.psql": "postgres"
+    },
+    "[postgres]": {
+      "editor.defaultFormatter": "ms-ossdata.vscode-postgresql"
+    }
+  }
+  

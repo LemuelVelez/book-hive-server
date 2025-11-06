@@ -45,7 +45,21 @@ function setSessionCookie(res: express.Response, token: string) {
   });
 }
 
-async function createAndSendVerifyEmail(userId: string, email: string) {
+/** Escape minimal HTML to safely inject user-provided strings */
+function escapeHtml(input: string) {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function createAndSendVerifyEmail(
+  userId: string,
+  email: string,
+  fullName?: string
+) {
   // Create token row
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
@@ -62,8 +76,13 @@ async function createAndSendVerifyEmail(userId: string, email: string) {
     token
   )}`;
 
+  const safeName =
+    fullName && fullName.trim().length > 0
+      ? escapeHtml(fullName.trim())
+      : "there";
+
   const html = `
-    <p>Hi,</p>
+    <p>Hi ${safeName},</p>
     <p>Thanks for registering at <strong>JRMSU-TC Book-Hive</strong>.</p>
     <p>Please verify your email by clicking the link below:</p>
     <p><a href="${confirmUrl}">${confirmUrl}</a></p>
@@ -176,7 +195,7 @@ router.post("/register", async (req, res, next) => {
 
     // Send verify email (best-effort)
     try {
-      await createAndSendVerifyEmail(user.id, user.email);
+      await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     } catch (e) {
       console.warn("Failed sending verification email:", e);
     }
@@ -265,7 +284,7 @@ router.post("/verify-email", async (req, res, next) => {
       return res.status(404).json({ ok: false, message: "Account not found." });
     }
     const user = found.rows[0];
-    await createAndSendVerifyEmail(user.id, user.email);
+    await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     res.json({ ok: true, message: "Verification email sent." });
   } catch (err) {
     next(err);

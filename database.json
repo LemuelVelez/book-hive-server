@@ -1,0 +1,9 @@
+{
+    "dev": {
+      "databaseUrl": { "env": "DATABASE_URL" },
+      "migrationsDir": "migrations",
+      "migrationTable": "pgmigrations",
+      "schema": "public"
+    }
+  }
+  

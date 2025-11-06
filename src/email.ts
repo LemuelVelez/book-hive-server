@@ -1,24 +1,28 @@
 import * as nodemailer from "nodemailer";
 
-// Expecting Gmail with App Password
-const user = process.env.GMAIL_USER;
-const pass = process.env.GMAIL_APP_PASSWORD;
+// Read and trim creds to avoid hidden spaces/newlines
+const user = process.env.GMAIL_USER?.trim();
+const pass = process.env.GMAIL_APP_PASSWORD?.trim();
 
 if (!user || !pass) {
   console.warn(
-    "⚠️ GMAIL_USER / GMAIL_APP_PASSWORD not set. Using JSON transport to log emails instead of sending."
+    "⚠️ GMAIL_USER / GMAIL_APP_PASSWORD not set. Using JSON transport (logs instead of sending)."
   );
 }
 
 /**
- * Use real Gmail transport when creds exist; otherwise fall back to a
- * JSON transport that logs messages (prevents runtime crashes in dev).
+ * Gmail with App Password works best with explicit SMTP settings.
+ * Port 465 + secure:true is the most reliable path.
  */
 export const mailer =
   user && pass
     ? nodemailer.createTransport({
-        service: "gmail",
+        host: "smtp.gmail.com",
+        port: 465,
+        secure: true, // TLS from the start
         auth: { user, pass },
+        // logger: true,
+        // debug: true,
       })
     : nodemailer.createTransport({
         jsonTransport: true, // logs the message as JSON instead of sending
@@ -36,5 +40,31 @@ export async function sendMail(opts: {
   attachments?: { filename: string; content: Buffer }[];
 }) {
   const from = `"JRMSU-TC Book-Hive" <${user ?? "no-reply@localhost"}>`;
-  return mailer.sendMail({ from, ...opts });
+
+  try {
+    const info = await mailer.sendMail({ from, ...opts });
+    return info;
+  } catch (err) {
+    // Narrow unknown → string message
+    const rawMessage =
+      err && typeof err === "object" && "message" in err
+        ? String((err as { message?: unknown }).message)
+        : "Email send failed.";
+
+    // Make common Gmail error easier to understand
+    if (rawMessage.includes("535")) {
+      const human =
+        "Gmail rejected the SMTP login (535). Make sure 2-Step Verification is ON and you're using a fresh 16-character App Password (no spaces) for this Gmail address. Then restart the server so the new .env is loaded.";
+      // Preserve original as cause when possible
+      try {
+        throw new Error(human, { cause: err });
+      } catch {
+        throw new Error(human);
+      }
+    }
+
+    // Re-throw with a readable message if it wasn't an Error
+    if (err instanceof Error) throw err;
+    throw new Error(rawMessage);
+  }
 }

@@ -9,11 +9,28 @@ import supportRouter from "./routes/support";
 
 const app = express();
 
-// CORS (allow credentials for cookie-based session)
-const origin = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+const dev = process.env.NODE_ENV !== "production";
+const defaultOrigin = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+
+// CORS: allow credentials and common localhost dev origins
+const allowList = new Set<string>([
+  defaultOrigin,
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+]);
+
 app.use(
   cors({
-    origin,
+    origin: (origin, cb) => {
+      // Allow same-origin (no Origin header) and any whitelisted dev origins
+      if (!origin) return cb(null, true);
+      if (allowList.has(origin)) return cb(null, true);
+      // In dev, also allow any localhost:<port>
+      if (dev && /^http:\/\/localhost:\d+$/.test(origin)) return cb(null, true);
+      if (dev && /^http:\/\/127\.0\.0\.1:\d+$/.test(origin))
+        return cb(null, true);
+      return cb(new Error(`CORS blocked for origin ${origin}`));
+    },
     credentials: true,
   })
 );
@@ -52,11 +69,13 @@ app.use(
     console.error("Unhandled error:", err);
     res
       .status(err.status || 500)
-      .json({ ok: false, message: err.message || "Server error" });
+      .json({ ok: false, message: err?.message || "Server error" });
   }
 );
 
 const PORT = Number(process.env.PORT || 5000);
 app.listen(PORT, () => {
-  console.log(`✅ API running at http://localhost:${PORT}`);
+  const origin = dev ? `http://localhost:${PORT}` : `:${PORT}`;
+  console.log(`✅ API running at ${origin}`);
+  console.log(`   CORS allowlist ->`, Array.from(allowList));
 });

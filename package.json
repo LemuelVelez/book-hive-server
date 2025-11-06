@@ -1,20 +1,26 @@
 {
   "name": "book-hive-server",
   "version": "1.0.0",
-  "main": "index.js",
+  "private": true,
+  "license": "ISC",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js"
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "migrate": "dotenv -e .env -- node-pg-migrate --migration-filename-format utc -c dev up",
+    "migrate:down": "dotenv -e .env -- node-pg-migrate --migration-filename-format utc -c dev down",
+    "migrate:reset": "dotenv -e .env -- node-pg-migrate -c dev down --all && dotenv -e .env -- node-pg-migrate -c dev up",
+    "migrate:create": "node-pg-migrate -c dev create -l sql"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
@@ -31,6 +37,8 @@
     "@types/node": "^24.9.2",
     "@types/nodemailer": "^7.0.3",
     "@types/pg": "^8.15.6",
+    "dotenv-cli": "^7.4.1",
+    "node-pg-migrate": "^7.7.2",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
