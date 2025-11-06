@@ -7,12 +7,14 @@ import { sendMail } from "../email";
 
 const router = express.Router();
 
+type Role = "student" | "librarian" | "faculty" | "admin" | "other";
+
 type UserRow = {
   id: string;
   full_name: string;
   email: string;
   password_hash: string;
-  account_type: "student" | "other";
+  account_type: Role;
   student_id: string | null;
   course: string | null;
   year_level: string | null;
@@ -43,6 +45,10 @@ function setSessionCookie(res: express.Response, token: string) {
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
+}
+
+function clearSessionCookie(res: express.Response) {
+  res.clearCookie("bh_session", { path: "/" });
 }
 
 /** Escape minimal HTML to safely inject user-provided strings */
@@ -98,7 +104,59 @@ async function createAndSendVerifyEmail(
   });
 }
 
+// Parse and verify session cookie; returns { sub, email, role, ev } | null
+function readSession(req: express.Request): null | { sub: string; email: string; role: Role; ev: number } {
+  const token = req.cookies?.["bh_session"];
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as any;
+    return {
+      sub: String(payload.sub),
+      email: String(payload.email),
+      role: String(payload.role) as Role,
+      ev: Number(payload.ev) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // --- Routes ---
+
+// GET /api/auth/me  -> returns the current user if session cookie is valid
+router.get("/me", async (req, res, next) => {
+  try {
+    const s = readSession(req);
+    if (!s) return res.status(401).json({ ok: false, message: "Not authenticated" });
+
+    // Fetch latest user state from DB (ensures we see updated verification/role)
+    const found = await query<UserRow>(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [s.sub]);
+    if (!found.rowCount) {
+      clearSessionCookie(res);
+      return res.status(401).json({ ok: false, message: "Not authenticated" });
+    }
+    const user = found.rows[0];
+
+    return res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        accountType: user.account_type,
+        isEmailVerified: user.is_email_verified,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/logout -> clear cookie
+router.post("/logout", async (_req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true, message: "Logged out" });
+});
 
 // POST /api/auth/register
 router.post("/register", async (req, res, next) => {
@@ -127,10 +185,10 @@ router.post("/register", async (req, res, next) => {
         message: "Password must be at least 8 characters.",
       });
     }
-    if (accountType !== "student" && accountType !== "other") {
-      return res
-        .status(400)
-        .json({ ok: false, message: "Invalid account type." });
+    // Allow known roles; keep "other" as safe fallback
+    const allowed: Role[] = ["student", "librarian", "faculty", "admin", "other"];
+    if (!allowed.includes(accountType as Role)) {
+      return res.status(400).json({ ok: false, message: "Invalid account type." });
     }
 
     // Check duplicates (email)
@@ -180,7 +238,7 @@ router.post("/register", async (req, res, next) => {
         String(fullName).trim(),
         String(email).trim().toLowerCase(),
         hash,
-        accountType,
+        (accountType as Role),
         studentIdVal,
         courseVal,
         yearLevelVal,
@@ -236,6 +294,13 @@ router.post("/login", async (req, res, next) => {
       return res
         .status(401)
         .json({ ok: false, message: "Invalid email or password." });
+    }
+
+    // 🔐 Block login until email is verified
+    if (!user.is_email_verified) {
+      return res
+        .status(403)
+        .json({ ok: false, message: "Please verify your email to continue." });
     }
 
     const token = signSessionJWT({
