@@ -41,11 +41,13 @@ function setSessionCookie(res: express.Response, token: string) {
   res.cookie("bh_session", token, {
     httpOnly: true,
     secure: prod,
-    // IMPORTANT: cross-site SPA (Vercel -> Render) needs SameSite=None
     sameSite: prod ? "none" : "lax",
+    // Help with Chrome’s third-party cookie blocking (CHIPS/partitioned cookies)
+    // Supported by modern Express/cookie libs; ignored by older browsers.
+    partitioned: prod ? true : undefined,
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
+  } as any);
 }
 
 function clearSessionCookie(res: express.Response) {
@@ -55,7 +57,8 @@ function clearSessionCookie(res: express.Response) {
     httpOnly: true,
     secure: prod,
     sameSite: prod ? "none" : "lax",
-  });
+    partitioned: prod ? true : undefined,
+  } as any);
 }
 
 /** Escape minimal HTML to safely inject user-provided strings */
@@ -84,7 +87,10 @@ async function createAndSendVerifyEmail(
 
   console.log(`[verify-email] token created for user=${userId} token=${token}`);
 
-  const serverUrl = process.env.SERVER_PUBLIC_URL || "http://localhost:5000";
+  const serverUrl = (process.env.SERVER_PUBLIC_URL || "http://localhost:5000")
+    .toString()
+    .replace(/\/+$/, ""); // <— trim trailing slash
+
   const confirmUrl = `${serverUrl}/api/auth/verify-email/confirm?token=${encodeURIComponent(
     token
   )}`;
