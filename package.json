@@ -12,6 +12,7 @@
     "migrate:down": "dotenv -e .env -- node-pg-migrate --migration-filename-format utc -c dev down",
     "migrate:reset": "dotenv -e .env -- node-pg-migrate -c dev down --all && dotenv -e .env -- node-pg-migrate -c dev up",
     "migrate:create": "node-pg-migrate -c dev create -l sql",
+    "migrate:prod": "node-pg-migrate --migration-filename-format utc up",
     "postinstall": "npm run build"
   },
   "engines": {
