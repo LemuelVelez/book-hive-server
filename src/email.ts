@@ -1,21 +1,12 @@
 import * as nodemailer from "nodemailer";
 
-// Prefer HTTP email API (Resend) in production to avoid SMTP blocks.
-// Falls back to Gmail SMTP (for local dev) or JSON transport (logs only).
-
-const RESEND_API_KEY = process.env.RESEND_API_KEY?.trim();
-const RESEND_FROM =
-  process.env.RESEND_FROM?.trim() ||
-  `"JRMSU-TC Book-Hive" <onboarding@resend.dev>`; // for real prod, verify and use your domain
-
-// Read and trim Gmail creds (used only when no RESEND_API_KEY is present)
+// Read and trim Gmail creds
 const user = process.env.GMAIL_USER?.trim();
 const pass = process.env.GMAIL_APP_PASSWORD?.trim();
 
-// If no API key and no SMTP creds, we'll still operate using jsonTransport
-if (!RESEND_API_KEY && (!user || !pass)) {
+if (!user || !pass) {
   console.warn(
-    "⚠️ No RESEND_API_KEY and no GMAIL_USER/GMAIL_APP_PASSWORD. Using JSON transport (logs instead of sending)."
+    "⚠️ GMAIL_USER / GMAIL_APP_PASSWORD not set. Using JSON transport (logs instead of sending)."
   );
 }
 
@@ -34,99 +25,46 @@ function extractMessage(x: unknown, fallback = "Email send failed."): string {
   }
 }
 
-/** Send via Resend HTTP API */
-async function sendViaResend(opts: {
-  to: string;
-  subject: string;
-  text?: string;
-  html?: string;
-  attachments?: { filename: string; content: Buffer }[];
-}) {
-  const payload: any = {
-    from: RESEND_FROM,
-    to: opts.to,
-    subject: opts.subject,
-  };
-  if (opts.html) payload.html = opts.html;
-  if (opts.text) payload.text = opts.text;
+/* ---------------------- Nodemailer transport ---------------------- */
 
-  if (opts.attachments?.length) {
-    payload.attachments = opts.attachments.map((a) => ({
-      filename: a.filename,
-      content: a.content.toString("base64"),
-    }));
-  }
-
-  const resp = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!resp.ok) {
-    let msg = `Resend API error (${resp.status})`;
-    try {
-      const j: unknown = await resp.json();
-      const m =
-        typeof (j as any)?.message === "string"
-          ? (j as any).message
-          : extractMessage(j, msg);
-      msg = m || msg;
-    } catch {
-      // ignore JSON parse errors; keep default msg
-    }
-    throw new Error(msg);
-  }
-  // Resp JSON type is provider-defined; we don't rely on its shape elsewhere.
-  return resp.json();
-}
-
-/** Nodemailer transports for local/dev SMTP or logging */
-const mailer =
+export const mailer =
   user && pass
     ? nodemailer.createTransport({
         host: "smtp.gmail.com",
         port: 465,
-        secure: true,
+        secure: true, // TLS from the start
         auth: { user, pass },
       })
-    : nodemailer.createTransport({ jsonTransport: true });
+    : nodemailer.createTransport({
+        jsonTransport: true, // logs the message as JSON instead of sending
+      });
 
-/**
- * Simple wrapper to send mail.
- * Chooses Resend first (HTTP), then Gmail SMTP, then JSON logging.
- */
+/* ---------------------- Public API ---------------------- */
+
 export async function sendMail(opts: {
   to: string;
   subject: string;
   text?: string;
   html?: string;
   attachments?: { filename: string; content: Buffer }[];
+  replyTo?: string;
 }) {
-  const from = `"JRMSU-TC Book-Hive" <${user ??
-    RESEND_FROM.match(/<([^>]+)>/)?.[1] ?? "no-reply@localhost"}>`; // for SMTP we use Gmail user; for Resend we already send from RESEND_FROM
+  const from = `"JRMSU-TC Book-Hive" <${user ?? "no-reply@localhost"}>`;
 
   try {
-    if (RESEND_API_KEY) {
-      return await sendViaResend(opts);
-    }
-    // Fallback to SMTP (mostly for local dev)
     return await mailer.sendMail({ from, ...opts });
   } catch (err) {
-    // Provide a helpful error if Gmail SMTP rejects or times out
     const msg = extractMessage(err, "Email send failed.");
 
+    // Common Gmail / network cases with clearer guidance
     if (/535/i.test(msg)) {
       throw new Error(
-        "Gmail rejected the SMTP login (535). Enable 2-Step Verification and use a 16-character App Password."
+        "Gmail rejected the SMTP login (535). Enable 2-Step Verification and use a 16-character App Password for this Gmail account."
       );
     }
     if (/ETIMEDOUT|timeout/i.test(msg)) {
       throw new Error(
-        "Email send timed out. On Render, outbound SMTP is blocked—switch to RESEND_API_KEY or another HTTP email API."
+        "SMTP connection timed out. On Render free tier, outbound SMTP is blocked—upgrade the instance or use an email API."
       );
     }
     throw new Error(msg);
