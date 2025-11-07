@@ -10,28 +10,55 @@ import supportRouter from "./routes/support";
 const app = express();
 
 const dev = process.env.NODE_ENV !== "production";
-const defaultOrigin = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 
-// CORS: allow credentials and common localhost dev origins
-const allowList = new Set<string>([
-  defaultOrigin,
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-]);
+/** Normalize an origin for reliable comparisons (trim + drop trailing slashes) */
+function normalizeOrigin(o?: string | null) {
+  return (o ?? "").trim().replace(/\/+$/, "");
+}
+
+/**
+ * Build the allow list.
+ * - CLIENT_ORIGIN: single origin (optional, may include a trailing "/")
+ * - CLIENT_ORIGINS: comma-separated list of origins (optional)
+ * Always normalize everything so "https://x.com" === "https://x.com/".
+ */
+const primaryEnvOrigin = normalizeOrigin(process.env.CLIENT_ORIGIN);
+const csvEnvOrigins = (process.env.CLIENT_ORIGINS || "")
+  .split(",")
+  .map((s) => normalizeOrigin(s))
+  .filter(Boolean);
+
+// Always include the common local dev origins
+const allowList = new Set<string>(
+  [
+    ...csvEnvOrigins,
+    primaryEnvOrigin,
+    normalizeOrigin("http://localhost:5173"),
+    normalizeOrigin("http://127.0.0.1:5173"),
+  ].filter(Boolean)
+);
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow same-origin (no Origin header) and any whitelisted dev origins
+      // Allow same-origin requests without an Origin header (e.g. curl)
       if (!origin) return cb(null, true);
-      if (allowList.has(origin)) return cb(null, true);
-      // In dev, also allow any localhost:<port>
-      if (dev && /^http:\/\/localhost:\d+$/.test(origin)) return cb(null, true);
-      if (dev && /^http:\/\/127\.0\.0\.1:\d+$/.test(origin))
+
+      const incoming = normalizeOrigin(origin);
+
+      // Exact allow-list match
+      if (allowList.has(incoming)) return cb(null, true);
+
+      // During local dev, allow any localhost:<port>
+      if (dev && /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(incoming)) {
         return cb(null, true);
-      return cb(new Error(`CORS blocked for origin ${origin}`));
+      }
+
+      return cb(new Error(`CORS blocked for origin ${incoming}`));
     },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 

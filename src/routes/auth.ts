@@ -41,14 +41,21 @@ function setSessionCookie(res: express.Response, token: string) {
   res.cookie("bh_session", token, {
     httpOnly: true,
     secure: prod,
-    sameSite: "lax",
+    // IMPORTANT: cross-site SPA (Vercel -> Render) needs SameSite=None
+    sameSite: prod ? "none" : "lax",
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 }
 
 function clearSessionCookie(res: express.Response) {
-  res.clearCookie("bh_session", { path: "/" });
+  const prod = process.env.NODE_ENV === "production";
+  res.clearCookie("bh_session", {
+    path: "/",
+    httpOnly: true,
+    secure: prod,
+    sameSite: prod ? "none" : "lax",
+  });
 }
 
 /** Escape minimal HTML to safely inject user-provided strings */
@@ -75,7 +82,6 @@ async function createAndSendVerifyEmail(
     [userId, token, expiresAt]
   );
 
-  // Helpful for debugging: proves a row was written
   console.log(`[verify-email] token created for user=${userId} token=${token}`);
 
   const serverUrl = process.env.SERVER_PUBLIC_URL || "http://localhost:5000";
@@ -110,7 +116,6 @@ async function createAndSendPasswordResetEmail(
   email: string,
   fullName?: string
 ) {
-  // Invalidate any previous, unused tokens for this user (optional hygiene)
   await query(
     `UPDATE password_resets SET used_at = NOW()
      WHERE user_id = $1 AND used_at IS NULL AND expires_at < NOW()`,
@@ -131,10 +136,10 @@ async function createAndSendPasswordResetEmail(
   );
 
   const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
-  // Direct the user to your SPA page which posts the token back to /api/auth/reset-password
-  const resetUrl = `${client}/auth/reset-password?token=${encodeURIComponent(
-    token
-  )}`;
+  const resetUrl = `${client.replace(
+    /\/+$/,
+    ""
+  )}/auth/reset-password?token=${encodeURIComponent(token)}`;
 
   const safeName =
     fullName && fullName.trim().length > 0
@@ -160,7 +165,7 @@ async function createAndSendPasswordResetEmail(
 function readSession(
   req: express.Request
 ): null | { sub: string; email: string; role: Role; ev: number } {
-  const token = req.cookies?.["bh_session"];
+  const token = (req.cookies as any)?.["bh_session"];
   if (!token) return null;
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET!) as any;
@@ -177,14 +182,13 @@ function readSession(
 
 // --- Routes ---
 
-// GET /api/auth/me  -> returns the current user if session cookie is valid
+// GET /api/auth/me
 router.get("/me", async (req, res, next) => {
   try {
     const s = readSession(req);
     if (!s)
       return res.status(401).json({ ok: false, message: "Not authenticated" });
 
-    // Fetch latest user state from DB (ensures we see updated verification/role)
     const found = await query<UserRow>(
       `SELECT * FROM users WHERE id = $1 LIMIT 1`,
       [s.sub]
@@ -210,7 +214,7 @@ router.get("/me", async (req, res, next) => {
   }
 });
 
-// POST /api/auth/logout -> clear cookie
+// POST /api/auth/logout
 router.post("/logout", async (_req, res) => {
   clearSessionCookie(res);
   res.json({ ok: true, message: "Logged out" });
@@ -243,7 +247,7 @@ router.post("/register", async (req, res, next) => {
         message: "Password must be at least 8 characters.",
       });
     }
-    // Allow known roles; keep "other" as safe fallback
+
     const allowed: Role[] = [
       "student",
       "librarian",
@@ -257,10 +261,13 @@ router.post("/register", async (req, res, next) => {
         .json({ ok: false, message: "Invalid account type." });
     }
 
-    // Check duplicates (email)
     const emailDupe = await query<UserRow>(
       `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-      [email.trim().toLowerCase()]
+      [
+        String(email)
+          .trim()
+          .toLowerCase(),
+      ]
     );
     if (emailDupe.rowCount) {
       return res
@@ -268,7 +275,6 @@ router.post("/register", async (req, res, next) => {
         .json({ ok: false, message: "Email already in use." });
     }
 
-    // Student-only checks
     let studentIdVal: string | null = null;
     let courseVal: string | null = null;
     let yearLevelVal: string | null = null;
@@ -315,7 +321,6 @@ router.post("/register", async (req, res, next) => {
 
     const user = ins.rows[0];
 
-    // Send verify email (best-effort, but includes DB insert above)
     try {
       await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     } catch (e) {
@@ -368,7 +373,7 @@ router.post("/login", async (req, res, next) => {
         .json({ ok: false, message: "Invalid email or password." });
     }
 
-    // 🔐 Block login until email is verified
+    // Block login until email is verified
     if (!user.is_email_verified) {
       return res
         .status(403)
@@ -414,7 +419,6 @@ router.post("/verify-email", async (req, res, next) => {
     }
     const user = found.rows[0];
 
-    // Optional: invalidate old unused tokens (keeps table tidy)
     await query(
       `UPDATE email_verifications SET used = TRUE WHERE user_id = $1 AND used = FALSE`,
       [user.id]
@@ -427,11 +431,7 @@ router.post("/verify-email", async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/auth/verify-email/confirm
- * JSON confirm flow for SPA: { token }
- * Returns JSON instead of redirecting.
- */
+// POST /api/auth/verify-email/confirm (JSON)
 router.post("/verify-email/confirm", async (req, res, next) => {
   try {
     const token = String(req.body?.token ?? "").trim();
@@ -461,7 +461,6 @@ router.post("/verify-email/confirm", async (req, res, next) => {
       return res.status(400).json({ ok: false, message: "Token expired." });
     }
 
-    // ✅ Set both boolean + timestamp and touch updated_at
     await query(
       `UPDATE users
          SET is_email_verified = TRUE,
@@ -480,14 +479,12 @@ router.post("/verify-email/confirm", async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/auth/verify-email/confirm?token=...
- * Email link flow: verify then redirect to FE callback with status.
- */
+// GET /api/auth/verify-email/confirm?token=...
 router.get("/verify-email/confirm", async (req, res, next) => {
   try {
     const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
-    const to = (q: string) => `${client}/auth/verify-email/callback${q}`;
+    const base = client.replace(/\/+$/, "");
+    const to = (q: string) => `${base}/auth/verify-email/callback${q}`;
 
     const token = String(req.query.token || "");
     if (!token) return res.redirect(302, to(`?status=error&reason=missing`));
@@ -509,7 +506,6 @@ router.get("/verify-email/confirm", async (req, res, next) => {
       return res.redirect(302, to(`?status=error&reason=expired`));
     }
 
-    // ✅ Set both boolean + timestamp and touch updated_at
     await query(
       `UPDATE users
          SET is_email_verified = TRUE,
@@ -528,22 +524,15 @@ router.get("/verify-email/confirm", async (req, res, next) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*                          PASSWORD RESET: NEW ENDPOINTS                      */
-/* -------------------------------------------------------------------------- */
+/* --------------------------- PASSWORD RESET --------------------------- */
 
-/**
- * POST /api/auth/forgot-password
- * Body: { email }
- * Always returns 200 (to avoid account enumeration) after attempting to send.
- */
+// POST /api/auth/forgot-password
 router.post("/forgot-password", async (req, res, next) => {
   try {
     const email = String(req.body?.email ?? "")
       .trim()
       .toLowerCase();
     if (!email || !email.includes("@")) {
-      // Return 200 with generic message to avoid leaking account existence
       return res.json({
         ok: true,
         message: "If that email exists, a password reset link has been sent.",
@@ -564,7 +553,6 @@ router.post("/forgot-password", async (req, res, next) => {
           user.full_name
         );
       } catch (e) {
-        // Do not leak errors to client; log server-side and still 200 generic
         console.warn("Failed sending reset email:", e);
       }
     }
@@ -578,11 +566,7 @@ router.post("/forgot-password", async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/auth/reset-password
- * Body: { token, password }
- * Validates token & expiry, updates the user's password, consumes token.
- */
+// POST /api/auth/reset-password
 router.post("/reset-password", async (req, res, next) => {
   try {
     const token = String(req.body?.token ?? "").trim();
@@ -632,7 +616,7 @@ router.post("/reset-password", async (req, res, next) => {
       row.id,
     ]);
 
-    // Clear any current session cookie (if present) to force re-login after reset
+    // Force re-login after password reset
     clearSessionCookie(res);
 
     return res.json({ ok: true, message: "Password updated." });
