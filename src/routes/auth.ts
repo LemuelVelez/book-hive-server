@@ -104,6 +104,58 @@ async function createAndSendVerifyEmail(
   });
 }
 
+/** Create a password reset token row and email the user a link */
+async function createAndSendPasswordResetEmail(
+  userId: string,
+  email: string,
+  fullName?: string
+) {
+  // Invalidate any previous, unused tokens for this user (optional hygiene)
+  await query(
+    `UPDATE password_resets SET used_at = NOW()
+     WHERE user_id = $1 AND used_at IS NULL AND expires_at < NOW()`,
+    [userId]
+  );
+
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
+
+  await query(
+    `INSERT INTO password_resets (user_id, token, expires_at)
+     VALUES ($1,$2,$3)`,
+    [userId, token, expiresAt]
+  );
+
+  console.log(
+    `[password-reset] token created for user=${userId} token=${token}`
+  );
+
+  const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+  // Direct the user to your SPA page which posts the token back to /api/auth/reset-password
+  const resetUrl = `${client}/auth/reset-password?token=${encodeURIComponent(
+    token
+  )}`;
+
+  const safeName =
+    fullName && fullName.trim().length > 0
+      ? escapeHtml(fullName.trim())
+      : "there";
+
+  const html = `
+    <p>Hi ${safeName},</p>
+    <p>We received a request to reset your <strong>JRMSU-TC Book-Hive</strong> password.</p>
+    <p>You can set a new password by clicking the secure link below (valid for 60 minutes):</p>
+    <p><a href="${resetUrl}">${resetUrl}</a></p>
+    <p>If you didn’t request this, you can safely ignore this email.</p>
+  `;
+
+  await sendMail({
+    to: email,
+    subject: "Reset your password • JRMSU-TC Book-Hive",
+    html,
+  });
+}
+
 // Parse and verify session cookie; returns { sub, email, role, ev } | null
 function readSession(
   req: express.Request
@@ -471,6 +523,119 @@ router.get("/verify-email/confirm", async (req, res, next) => {
     ]);
 
     return res.redirect(302, to(`?status=success`));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                          PASSWORD RESET: NEW ENDPOINTS                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/auth/forgot-password
+ * Body: { email }
+ * Always returns 200 (to avoid account enumeration) after attempting to send.
+ */
+router.post("/forgot-password", async (req, res, next) => {
+  try {
+    const email = String(req.body?.email ?? "")
+      .trim()
+      .toLowerCase();
+    if (!email || !email.includes("@")) {
+      // Return 200 with generic message to avoid leaking account existence
+      return res.json({
+        ok: true,
+        message: "If that email exists, a password reset link has been sent.",
+      });
+    }
+
+    const found = await query<UserRow>(
+      `SELECT * FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
+
+    if (found.rowCount) {
+      const user = found.rows[0];
+      try {
+        await createAndSendPasswordResetEmail(
+          user.id,
+          user.email,
+          user.full_name
+        );
+      } catch (e) {
+        // Do not leak errors to client; log server-side and still 200 generic
+        console.warn("Failed sending reset email:", e);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      message: "If that email exists, a password reset link has been sent.",
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/auth/reset-password
+ * Body: { token, password }
+ * Validates token & expiry, updates the user's password, consumes token.
+ */
+router.post("/reset-password", async (req, res, next) => {
+  try {
+    const token = String(req.body?.token ?? "").trim();
+    const password = String(req.body?.password ?? "");
+
+    if (!token) {
+      return res.status(400).json({ ok: false, message: "Missing token." });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({
+        ok: false,
+        message: "Password must be at least 8 characters.",
+      });
+    }
+
+    const t = await query<{
+      id: string;
+      user_id: string;
+      token: string;
+      created_at: string;
+      expires_at: string;
+      used_at: string | null;
+    }>(`SELECT * FROM password_resets WHERE token = $1 LIMIT 1`, [token]);
+
+    if (!t.rowCount) {
+      return res.status(400).json({ ok: false, message: "Invalid token." });
+    }
+    const row = t.rows[0];
+
+    if (row.used_at) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "Token already used." });
+    }
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ ok: false, message: "Token expired." });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+
+    await query(
+      `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+      [hash, row.user_id]
+    );
+
+    await query(`UPDATE password_resets SET used_at = NOW() WHERE id = $1`, [
+      row.id,
+    ]);
+
+    // Clear any current session cookie (if present) to force re-login after reset
+    clearSessionCookie(res);
+
+    return res.json({ ok: true, message: "Password updated." });
   } catch (err) {
     next(err);
   }
