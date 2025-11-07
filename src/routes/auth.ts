@@ -105,7 +105,9 @@ async function createAndSendVerifyEmail(
 }
 
 // Parse and verify session cookie; returns { sub, email, role, ev } | null
-function readSession(req: express.Request): null | { sub: string; email: string; role: Role; ev: number } {
+function readSession(
+  req: express.Request
+): null | { sub: string; email: string; role: Role; ev: number } {
   const token = req.cookies?.["bh_session"];
   if (!token) return null;
   try {
@@ -127,10 +129,14 @@ function readSession(req: express.Request): null | { sub: string; email: string;
 router.get("/me", async (req, res, next) => {
   try {
     const s = readSession(req);
-    if (!s) return res.status(401).json({ ok: false, message: "Not authenticated" });
+    if (!s)
+      return res.status(401).json({ ok: false, message: "Not authenticated" });
 
     // Fetch latest user state from DB (ensures we see updated verification/role)
-    const found = await query<UserRow>(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [s.sub]);
+    const found = await query<UserRow>(
+      `SELECT * FROM users WHERE id = $1 LIMIT 1`,
+      [s.sub]
+    );
     if (!found.rowCount) {
       clearSessionCookie(res);
       return res.status(401).json({ ok: false, message: "Not authenticated" });
@@ -186,9 +192,17 @@ router.post("/register", async (req, res, next) => {
       });
     }
     // Allow known roles; keep "other" as safe fallback
-    const allowed: Role[] = ["student", "librarian", "faculty", "admin", "other"];
+    const allowed: Role[] = [
+      "student",
+      "librarian",
+      "faculty",
+      "admin",
+      "other",
+    ];
     if (!allowed.includes(accountType as Role)) {
-      return res.status(400).json({ ok: false, message: "Invalid account type." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Invalid account type." });
     }
 
     // Check duplicates (email)
@@ -236,9 +250,11 @@ router.post("/register", async (req, res, next) => {
        RETURNING *`,
       [
         String(fullName).trim(),
-        String(email).trim().toLowerCase(),
+        String(email)
+          .trim()
+          .toLowerCase(),
         hash,
-        (accountType as Role),
+        accountType as Role,
         studentIdVal,
         courseVal,
         yearLevelVal,
@@ -281,7 +297,11 @@ router.post("/login", async (req, res, next) => {
 
     const found = await query<UserRow>(
       `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-      [String(email).trim().toLowerCase()]
+      [
+        String(email)
+          .trim()
+          .toLowerCase(),
+      ]
     );
     if (!found.rowCount) {
       return res
@@ -343,9 +363,10 @@ router.post("/verify-email", async (req, res, next) => {
     const user = found.rows[0];
 
     // Optional: invalidate old unused tokens (keeps table tidy)
-    await query(`UPDATE email_verifications SET used = TRUE WHERE user_id = $1 AND used = FALSE`, [
-      user.id,
-    ]);
+    await query(
+      `UPDATE email_verifications SET used = TRUE WHERE user_id = $1 AND used = FALSE`,
+      [user.id]
+    );
 
     await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     res.json({ ok: true, message: "Verification email sent." });
@@ -361,7 +382,7 @@ router.post("/verify-email", async (req, res, next) => {
  */
 router.post("/verify-email/confirm", async (req, res, next) => {
   try {
-    const token = String((req.body?.token ?? "")).trim();
+    const token = String(req.body?.token ?? "").trim();
     if (!token) {
       return res.status(400).json({ ok: false, message: "Missing token." });
     }
@@ -380,15 +401,23 @@ router.post("/verify-email/confirm", async (req, res, next) => {
     const row = t.rows[0];
 
     if (row.used) {
-      return res.status(400).json({ ok: false, message: "Token already used." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Token already used." });
     }
     if (new Date(row.expires_at).getTime() < Date.now()) {
       return res.status(400).json({ ok: false, message: "Token expired." });
     }
 
-    await query(`UPDATE users SET is_email_verified = TRUE WHERE id = $1`, [
-      row.user_id,
-    ]);
+    // ✅ Set both boolean + timestamp and touch updated_at
+    await query(
+      `UPDATE users
+         SET is_email_verified = TRUE,
+             email_verified_at = COALESCE(email_verified_at, NOW()),
+             updated_at = NOW()
+       WHERE id = $1`,
+      [row.user_id]
+    );
     await query(`UPDATE email_verifications SET used = TRUE WHERE id = $1`, [
       row.id,
     ]);
@@ -419,7 +448,8 @@ router.get("/verify-email/confirm", async (req, res, next) => {
       used: boolean;
     }>(`SELECT * FROM email_verifications WHERE token = $1 LIMIT 1`, [token]);
 
-    if (!t.rowCount) return res.redirect(302, to(`?status=error&reason=invalid`));
+    if (!t.rowCount)
+      return res.redirect(302, to(`?status=error&reason=invalid`));
     const row = t.rows[0];
 
     if (row.used) return res.redirect(302, to(`?status=error&reason=used`));
@@ -427,9 +457,15 @@ router.get("/verify-email/confirm", async (req, res, next) => {
       return res.redirect(302, to(`?status=error&reason=expired`));
     }
 
-    await query(`UPDATE users SET is_email_verified = TRUE WHERE id = $1`, [
-      row.user_id,
-    ]);
+    // ✅ Set both boolean + timestamp and touch updated_at
+    await query(
+      `UPDATE users
+         SET is_email_verified = TRUE,
+             email_verified_at = COALESCE(email_verified_at, NOW()),
+             updated_at = NOW()
+       WHERE id = $1`,
+      [row.user_id]
+    );
     await query(`UPDATE email_verifications SET used = TRUE WHERE id = $1`, [
       row.id,
     ]);
