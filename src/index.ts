@@ -6,6 +6,7 @@ import cookieParser from "cookie-parser";
 import authRouter from "./routes/auth";
 import usersRouter from "./routes/users";
 import supportRouter from "./routes/support";
+import booksRouter from "./routes/books";
 
 const app = express();
 
@@ -78,6 +79,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/auth", authRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/support", supportRouter);
+app.use("/api/books", booksRouter);
 
 // 404
 app.use((_req, res) => {
