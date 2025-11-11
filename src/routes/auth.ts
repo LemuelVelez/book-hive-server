@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import express from "express";
 import * as bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -14,13 +15,48 @@ type UserRow = {
   full_name: string;
   email: string;
   password_hash: string;
+  // Newer column used by the app for routing/roles
   account_type: Role;
+  // Student metadata
   student_id: string | null;
   course: string | null;
   year_level: string | null;
+  // Email verification
   is_email_verified: boolean;
   created_at: string;
+  updated_at: string;
+  // Legacy column from the original schema (may still hold librarian/admin/etc)
+  role?: Role;
 };
+
+/**
+ * Normalize a user's role considering both the new `account_type` column
+ * and the legacy `role` column.
+ *
+ * - Prefer `account_type` if it is non-student (librarian/faculty/admin/other).
+ * - If `account_type` is still `student` but the legacy `role` column has a
+ *   non-student value (e.g. "librarian"), treat that legacy value as the
+ *   effective role.
+ * - Otherwise fall back to `account_type` (or student).
+ */
+function getEffectiveRole(user: UserRow): Role {
+  const primary = (user.account_type || "student") as Role;
+  const legacy = (user as any).role as Role | undefined;
+
+  // New-style roles (including "other") take priority
+  if (primary && primary !== "student") {
+    return primary;
+  }
+
+  // If the DB row still uses the old `role` column for a non-student,
+  // but `account_type` is stuck at the default "student", honor the legacy role.
+  if (primary === "student" && legacy && legacy !== "student") {
+    return legacy;
+  }
+
+  // Default
+  return primary || legacy || "student";
+}
 
 // --- Helpers ---
 function signSessionJWT(
@@ -204,6 +240,7 @@ router.get("/me", async (req, res, next) => {
       return res.status(401).json({ ok: false, message: "Not authenticated" });
     }
     const user = found.rows[0];
+    const accountType = getEffectiveRole(user);
 
     return res.json({
       ok: true,
@@ -211,7 +248,7 @@ router.get("/me", async (req, res, next) => {
         id: user.id,
         email: user.email,
         fullName: user.full_name,
-        accountType: user.account_type,
+        accountType,
         isEmailVerified: user.is_email_verified,
       },
     });
@@ -326,6 +363,7 @@ router.post("/register", async (req, res, next) => {
     );
 
     const user = ins.rows[0];
+    const accountTypeNormalized = getEffectiveRole(user);
 
     try {
       await createAndSendVerifyEmail(user.id, user.email, user.full_name);
@@ -339,7 +377,7 @@ router.post("/register", async (req, res, next) => {
         id: user.id,
         email: user.email,
         fullName: user.full_name,
-        accountType: user.account_type,
+        accountType: accountTypeNormalized,
         isEmailVerified: user.is_email_verified,
       },
     });
@@ -386,10 +424,12 @@ router.post("/login", async (req, res, next) => {
         .json({ ok: false, message: "Please verify your email to continue." });
     }
 
+    const accountType = getEffectiveRole(user);
+
     const token = signSessionJWT({
       id: user.id,
       email: user.email,
-      account_type: user.account_type,
+      account_type: accountType,
       is_email_verified: user.is_email_verified,
     });
     setSessionCookie(res, token);
@@ -400,7 +440,7 @@ router.post("/login", async (req, res, next) => {
         id: user.id,
         email: user.email,
         fullName: user.full_name,
-        accountType: user.account_type,
+        accountType,
         isEmailVerified: user.is_email_verified,
       },
     });
