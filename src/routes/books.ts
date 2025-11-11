@@ -25,19 +25,43 @@ type SessionPayload = {
   ev: number;
 };
 
-/* ---------------- Session helpers (cookie-based JWT, same as auth.ts) ---------------- */
+/**
+ * Minimal shape from users table for role resolution.
+ * We only need account_type + legacy role.
+ */
+type UserRoleRow = {
+  id: string;
+  account_type: Role;
+  role?: Role | null;
+};
 
-function readSession(
-  req: express.Request
-): SessionPayload | null {
+/* ---------------- Role normalization helper ---------------- */
+
+function normalizeRole(raw: unknown): Role {
+  const v = String(raw ?? "").trim().toLowerCase();
+
+  if (v === "student") return "student";
+  if (v === "librarian") return "librarian";
+  if (v === "faculty") return "faculty";
+  if (v === "admin") return "admin";
+
+  return "other";
+}
+
+/* ---------------- Session helpers (cookie-based JWT) ---------------- */
+
+function readSession(req: express.Request): SessionPayload | null {
   const token = (req.cookies as any)?.["bh_session"];
   if (!token) return null;
+
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET!) as any;
+
     return {
       sub: String(payload.sub),
       email: String(payload.email),
-      role: String(payload.role) as Role,
+      // Normalize so "Librarian", " librarian ", etc. all become "librarian"
+      role: normalizeRole(payload.role),
       ev: Number(payload.ev) || 0,
     };
   } catch {
@@ -52,14 +76,37 @@ function requireAuth(
 ) {
   const s = readSession(req);
   if (!s) {
-    return res
-      .status(401)
-      .json({ ok: false, message: "Not authenticated." });
+    return res.status(401).json({ ok: false, message: "Not authenticated." });
   }
   (req as any).sessionUser = s;
   next();
 }
 
+/**
+ * Compute the effective role using the same logic as auth.ts:
+ * - Prefer account_type if it’s non-student.
+ * - If account_type is student but legacy role is non-student, use legacy.
+ * - Otherwise fall back to account_type (or student).
+ */
+function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
+  const primary = (row.account_type || "student") as Role;
+  const legacy = (row.role as Role | null) || undefined;
+
+  if (primary && primary !== "student") {
+    return primary;
+  }
+
+  if (primary === "student" && legacy && legacy !== "student") {
+    return legacy;
+  }
+
+  return primary || legacy || "student";
+}
+
+/**
+ * Role guard that always checks the DB for the current effective role,
+ * instead of trusting whatever is in the JWT.
+ */
 function requireRole(roles: Role[]) {
   return (
     req: express.Request,
@@ -68,16 +115,50 @@ function requireRole(roles: Role[]) {
   ) => {
     const s = (req as any).sessionUser as SessionPayload | undefined;
     if (!s) {
-      return res
-        .status(401)
-        .json({ ok: false, message: "Not authenticated." });
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
     }
-    if (!roles.includes(s.role)) {
-      return res
-        .status(403)
-        .json({ ok: false, message: "Forbidden: insufficient role." });
-    }
-    next();
+
+    query<UserRoleRow>(
+      `SELECT id, account_type, role
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [s.sub]
+    )
+      .then((result) => {
+        if (!result.rowCount) {
+          return res
+            .status(401)
+            .json({ ok: false, message: "Not authenticated." });
+        }
+
+        const u = result.rows[0];
+        const effectiveRole = computeEffectiveRoleFromRow(u);
+
+        if (!roles.includes(effectiveRole)) {
+          // Helpful log while debugging roles
+          console.warn(
+            "[books] Forbidden: insufficient role",
+            {
+              userId: s.sub,
+              tokenRole: s.role,
+              effectiveRole,
+              required: roles,
+            }
+          );
+
+          return res
+            .status(403)
+            .json({ ok: false, message: "Forbidden: insufficient role." });
+        }
+
+        // Keep the effective role in req.sessionUser for downstream handlers
+        (req as any).sessionUser = { ...s, role: effectiveRole };
+        next();
+      })
+      .catch((err) => {
+        next(err);
+      });
   };
 }
 
@@ -126,14 +207,8 @@ router.post(
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
     try {
-      const {
-        title,
-        author,
-        isbn,
-        genre,
-        publicationYear,
-        available,
-      } = req.body || {};
+      const { title, author, isbn, genre, publicationYear, available } =
+        req.body || {};
 
       if (!title || !author || publicationYear === undefined) {
         return res.status(400).json({
@@ -175,8 +250,7 @@ router.post(
           // Unique violation (likely ISBN)
           return res.status(409).json({
             ok: false,
-            message:
-              "A book with that ISBN already exists in the catalog.",
+            message: "A book with that ISBN already exists in the catalog.",
           });
         }
         throw err;
@@ -198,14 +272,8 @@ router.patch(
   async (req, res, next) => {
     try {
       const { id } = req.params;
-      const {
-        title,
-        author,
-        isbn,
-        genre,
-        publicationYear,
-        available,
-      } = req.body || {};
+      const { title, author, isbn, genre, publicationYear, available } =
+        req.body || {};
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -229,11 +297,7 @@ router.patch(
       }
       if (publicationYear !== undefined) {
         const yearNum = Number(publicationYear);
-        if (
-          !Number.isFinite(yearNum) ||
-          yearNum < 1000 ||
-          yearNum > 9999
-        ) {
+        if (!Number.isFinite(yearNum) || yearNum < 1000 || yearNum > 9999) {
           return res.status(400).json({
             ok: false,
             message: "publicationYear must be a valid 4-digit year.",
@@ -278,8 +342,7 @@ router.patch(
         if (err && err.code === "23505") {
           return res.status(409).json({
             ok: false,
-            message:
-              "A book with that ISBN already exists in the catalog.",
+            message: "A book with that ISBN already exists in the catalog.",
           });
         }
         throw err;
@@ -302,10 +365,9 @@ router.delete(
     try {
       const { id } = req.params;
 
-      const result = await query(
-        `DELETE FROM books WHERE id = $1`,
-        [Number(id)]
-      );
+      const result = await query(`DELETE FROM books WHERE id = $1`, [
+        Number(id),
+      ]);
 
       if (!result.rowCount) {
         return res
