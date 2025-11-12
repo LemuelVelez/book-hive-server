@@ -1,8 +1,33 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import { query } from "../db";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
 
 const router = express.Router();
+
+/* ---------------- Upload setup ---------------- */
+const uploadRoot = path.join(process.cwd(), "uploads");
+const damageDir = path.join(uploadRoot, "damage-reports");
+fs.mkdirSync(damageDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, damageDir),
+  filename: (_req, file, cb) => {
+    const ts = Date.now();
+    const safe = file.originalname.replace(/[^a-z0-9_.-]+/gi, "_");
+    cb(null, `${ts}_${safe}`);
+  },
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  fileFilter: (_req, file, cb) => {
+    if (/^image\//i.test(file.mimetype)) return cb(null, true);
+    cb(new Error("Only image uploads are allowed."));
+  },
+});
 
 /* ---------------- Types ---------------- */
 
@@ -33,6 +58,7 @@ type DamageRowJoined = {
   status: DamageStatus;
   notes: string | null;
   reported_at: string;
+  photo_url: string | null;
 
   // joined
   email: string | null;
@@ -149,6 +175,7 @@ function toDTO(row: DamageRowJoined) {
     status: row.status,
     reportedAt: row.reported_at,
     notes: row.notes,
+    photoUrl: row.photo_url, // relative like /uploads/damage-reports/xxxxx.jpg
   };
 }
 
@@ -165,7 +192,7 @@ router.get(
   async (_req, res, next) => {
     try {
       const result = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at,
+        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
                 u.email, u.student_id, u.full_name,
                 b.title
          FROM damage_reports dr
@@ -185,13 +212,15 @@ router.get(
 /**
  * POST /api/damage-reports
  * Create a damage report – students (and staff) can submit.
- * Body: { bookId, damageType, severity ('minor'|'moderate'|'major'), fee?, notes? }
+ * Accepts multipart/form-data with optional "photo" file.
+ * Fields: { bookId, damageType, severity ('minor'|'moderate'|'major'), fee?, notes? }
  * - status defaults to 'pending'
  */
 router.post(
   "/",
   requireAuth,
   requireRole(["student", "librarian", "admin"]),
+  upload.single("photo"),
   async (req, res, next) => {
     try {
       const s = (req as any).sessionUser as SessionPayload;
@@ -214,6 +243,9 @@ router.post(
         return res.status(400).json({ ok: false, message: "fee must be a non-negative number." });
       }
 
+      const fileRel =
+        req.file ? `/uploads/damage-reports/${req.file.filename}` : null;
+
       // Ensure book exists
       const book = await query(`SELECT id FROM books WHERE id = $1 LIMIT 1`, [bid]);
       if (!book.rowCount) {
@@ -221,16 +253,16 @@ router.post(
       }
 
       const ins = await query<DamageRowJoined>(
-        `INSERT INTO damage_reports (user_id, book_id, damage_type, severity, fee, status, notes)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-         RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at,
+        `INSERT INTO damage_reports (user_id, book_id, damage_type, severity, fee, status, notes, photo_url)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+         RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at, photo_url,
                    NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name, NULL::text AS title`,
-        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null]
+        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, fileRel]
       );
 
       // Hydrate joins for DTO
       const joined = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at,
+        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
                 u.email, u.student_id, u.full_name,
                 b.title
          FROM damage_reports dr
@@ -252,12 +284,14 @@ router.post(
 /**
  * PATCH /api/damage-reports/:id
  * Update fields – librarian/admin only.
- * Body: { status?, severity?, fee?, notes?, damageType? }
+ * Accepts JSON OR multipart/form-data (if replacing photo with "photo" file).
+ * Body/Fields: { status?, severity?, fee?, notes?, damageType?, (photo?) }
  */
 router.patch(
   "/:id",
   requireAuth,
   requireRole(["librarian", "admin"]),
+  upload.single("photo"),
   async (req, res, next) => {
     try {
       const { id } = req.params;
@@ -267,6 +301,8 @@ router.patch(
       }
 
       const { status, severity, fee, notes, damageType } = req.body || {};
+      const newPhotoRel =
+        req.file ? `/uploads/damage-reports/${req.file.filename}` : undefined;
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -313,6 +349,11 @@ router.patch(
         values.push(dt);
       }
 
+      if (newPhotoRel !== undefined) {
+        updates.push(`photo_url = $${i++}`);
+        values.push(newPhotoRel);
+      }
+
       if (updates.length === 0) {
         return res.status(400).json({ ok: false, message: "No changes provided." });
       }
@@ -323,7 +364,7 @@ router.patch(
         `UPDATE damage_reports
          SET ${updates.join(", ")}
          WHERE id = $${i}
-         RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at,
+         RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at, photo_url,
                    NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name, NULL::text AS title`,
         [...values, rid]
       );
@@ -334,7 +375,7 @@ router.patch(
 
       // Hydrate joins
       const joined = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at,
+        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
                 u.email, u.student_id, u.full_name,
                 b.title
          FROM damage_reports dr

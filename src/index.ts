@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import cookieParser from "cookie-parser";
+import path from "path";
 
 import authRouter from "./routes/auth";
 import usersRouter from "./routes/users";
@@ -9,7 +10,7 @@ import supportRouter from "./routes/support";
 import booksRouter from "./routes/books";
 import borrowRecordsRouter from "./routes/borrowRecords";
 import feedbacksRouter from "./routes/feedbacks";
-import damageReportsRouter from "./routes/damageReports"; // ✅ NEW
+import damageReportsRouter from "./routes/damageReports"; // ✅
 
 const app = express();
 
@@ -62,6 +63,15 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
+/** Static files for uploaded images */
+app.use(
+  "/uploads",
+  express.static(path.join(process.cwd(), "uploads"), {
+    maxAge: "7d",
+    dotfiles: "ignore",
+  })
+);
+
 // Basic health
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -78,14 +88,14 @@ app.use("/api/support", supportRouter);
 app.use("/api/books", booksRouter);
 app.use("/api/borrow-records", borrowRecordsRouter);
 app.use("/api/feedbacks", feedbacksRouter);
-app.use("/api/damage-reports", damageReportsRouter); // ✅ NEW
+app.use("/api/damage-reports", damageReportsRouter); // ✅
 
-// 404
+/** 404 */
 app.use((_req, res) => {
   res.status(404).json({ ok: false, message: "Not found" });
 });
 
-// Global error handler
+/** Global error handler */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use(
   (
