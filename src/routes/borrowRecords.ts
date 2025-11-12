@@ -1,0 +1,371 @@
+import express from "express";
+import jwt from "jsonwebtoken";
+import { pool, query } from "../db";
+
+const router = express.Router();
+
+type Role = "student" | "librarian" | "faculty" | "admin" | "other";
+type BorrowStatus = "borrowed" | "returned";
+
+type SessionPayload = {
+    sub: string;
+    email: string;
+    role: Role;
+    ev: number;
+};
+
+type UserRoleRow = {
+    id: string;
+    account_type: Role;
+    role?: Role | null;
+};
+
+type BorrowRowJoined = {
+    id: string;
+    user_id: string;
+    book_id: string;
+    borrow_date: string; // ISO date
+    due_date: string;    // ISO date
+    return_date: string | null;
+    status: BorrowStatus;
+    // joined fields
+    email: string | null;
+    student_id: string | null;
+    full_name: string | null;
+    title: string | null;
+};
+
+function normalizeRole(raw: unknown): Role {
+    const v = String(raw ?? "").trim().toLowerCase();
+    if (v === "student") return "student";
+    if (v === "librarian") return "librarian";
+    if (v === "faculty") return "faculty";
+    if (v === "admin") return "admin";
+    return "other";
+}
+
+function readSession(req: express.Request): SessionPayload | null {
+    const token = (req.cookies as any)?.["bh_session"];
+    if (!token) return null;
+    try {
+        const payload = jwt.verify(token, process.env.JWT_SECRET!) as any;
+        return {
+            sub: String(payload.sub),
+            email: String(payload.email),
+            role: normalizeRole(payload.role),
+            ev: Number(payload.ev) || 0,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function requireAuth(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+) {
+    const s = readSession(req);
+    if (!s) {
+        return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+    (req as any).sessionUser = s;
+    next();
+}
+
+function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
+    const primary = (row.account_type || "student") as Role;
+    const legacy = (row.role as Role | null) || undefined;
+
+    if (primary && primary !== "student") return primary;
+    if (primary === "student" && legacy && legacy !== "student") return legacy;
+
+    return primary || legacy || "student";
+}
+
+function requireRole(roles: Role[]) {
+    return (
+        req: express.Request,
+        res: express.Response,
+        next: express.NextFunction
+    ) => {
+        const s = (req as any).sessionUser as SessionPayload | undefined;
+        if (!s) {
+            return res.status(401).json({ ok: false, message: "Not authenticated." });
+        }
+
+        query<UserRoleRow>(
+            `SELECT id, account_type, role
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+            [s.sub]
+        )
+            .then((result) => {
+                if (!result.rowCount) {
+                    return res
+                        .status(401)
+                        .json({ ok: false, message: "Not authenticated." });
+                }
+                const u = result.rows[0];
+                const effectiveRole = computeEffectiveRoleFromRow(u);
+                if (!roles.includes(effectiveRole)) {
+                    console.warn("[borrow-records] Forbidden", {
+                        userId: s.sub,
+                        tokenRole: s.role,
+                        effectiveRole,
+                        required: roles,
+                    });
+                    return res
+                        .status(403)
+                        .json({ ok: false, message: "Forbidden: insufficient role." });
+                }
+                (req as any).sessionUser = { ...s, role: effectiveRole };
+                next();
+            })
+            .catch((err) => next(err));
+    };
+}
+
+function toDTO(row: BorrowRowJoined, finePerDay: number) {
+    // overdue days = max(0, (return_date||today) - due_date)
+    const due = new Date(row.due_date + "T00:00:00Z");
+    const end = new Date((row.return_date || new Date().toISOString().slice(0, 10)) + "T00:00:00Z");
+    const ms = Math.max(0, end.getTime() - due.getTime());
+    const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+    const fine = days * finePerDay;
+
+    return {
+        id: String(row.id),
+        userId: String(row.user_id),
+        studentEmail: row.email,
+        studentId: row.student_id,
+        studentName: row.full_name,
+        bookId: String(row.book_id),
+        bookTitle: row.title,
+        borrowDate: row.borrow_date,
+        dueDate: row.due_date,
+        returnDate: row.return_date,
+        status: row.status,
+        fine,
+    };
+}
+
+/**
+ * GET /api/borrow-records
+ * List all borrow records (librarian/admin).
+ * Fine is computed dynamically: overdue_days * BORROW_FINE_PER_DAY (default 5).
+ */
+router.get(
+    "/",
+    requireAuth,
+    requireRole(["librarian", "admin"]),
+    async (_req, res, next) => {
+        try {
+            const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+
+            const result = await query<BorrowRowJoined>(
+                `SELECT br.id, br.user_id, br.book_id, br.borrow_date, br.due_date, br.return_date, br.status,
+                u.email, u.student_id, u.full_name,
+                b.title
+         FROM borrow_records br
+         LEFT JOIN users u ON u.id = br.user_id
+         LEFT JOIN books b ON b.id = br.book_id
+         ORDER BY br.borrow_date DESC, br.id DESC`
+            );
+
+            const records = result.rows.map((r) => toDTO(r, finePerDay));
+            res.json({ ok: true, records });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
+
+/**
+ * POST /api/borrow-records
+ * Create a borrow record and set book unavailable (transaction).
+ * Body: { userId, bookId, borrowDate?, dueDate }
+ */
+router.post(
+    "/",
+    requireAuth,
+    requireRole(["librarian", "admin"]),
+    async (req, res, next) => {
+        const client = await pool.connect();
+        try {
+            const { userId, bookId, borrowDate, dueDate } = req.body || {};
+            const uid = Number(userId);
+            const bid = Number(bookId);
+
+            if (!uid || !bid || !dueDate) {
+                return res.status(400).json({
+                    ok: false,
+                    message: "userId, bookId and dueDate are required.",
+                });
+            }
+
+            await client.query("BEGIN");
+
+            // Validate user
+            const u = await client.query(`SELECT id FROM users WHERE id=$1 LIMIT 1`, [uid]);
+            if (!u.rowCount) {
+                await client.query("ROLLBACK");
+                return res.status(404).json({ ok: false, message: "User not found." });
+            }
+
+            // Validate book availability
+            const b = await client.query(`SELECT id, available FROM books WHERE id=$1 LIMIT 1`, [bid]);
+            if (!b.rowCount) {
+                await client.query("ROLLBACK");
+                return res.status(404).json({ ok: false, message: "Book not found." });
+            }
+            if (b.rows[0].available === false) {
+                await client.query("ROLLBACK");
+                return res.status(409).json({ ok: false, message: "Book is not available." });
+            }
+
+            const ins = await client.query<BorrowRowJoined>(
+                `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
+         VALUES ($1,$2, COALESCE($3::date, CURRENT_DATE), $4::date, 'borrowed')
+         RETURNING id, user_id, book_id, borrow_date, due_date, return_date, status,
+                   NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name,
+                   NULL::text AS title`,
+                [uid, bid, borrowDate || null, dueDate]
+            );
+
+            // Set book unavailable
+            await client.query(`UPDATE books SET available = FALSE, updated_at = NOW() WHERE id = $1`, [bid]);
+
+            await client.query("COMMIT");
+
+            // Hydrate joins for DTO
+            const joined = await query<BorrowRowJoined>(
+                `SELECT br.id, br.user_id, br.book_id, br.borrow_date, br.due_date, br.return_date, br.status,
+                u.email, u.student_id, u.full_name,
+                b.title
+         FROM borrow_records br
+         LEFT JOIN users u ON u.id = br.user_id
+         LEFT JOIN books b ON b.id = br.book_id
+         WHERE br.id = $1
+         LIMIT 1`,
+                [ins.rows[0].id]
+            );
+
+            const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+            const record = toDTO(joined.rows[0], finePerDay);
+            res.status(201).json({ ok: true, record });
+        } catch (err) {
+            try { await pool.query("ROLLBACK"); } catch { }
+            next(err);
+        } finally {
+            client.release();
+        }
+    }
+);
+
+/**
+ * PATCH /api/borrow-records/:id
+ * Update status/return date (mark as returned) and set book available.
+ * Body: { status?, returnDate? }
+ */
+router.patch(
+    "/:id",
+    requireAuth,
+    requireRole(["librarian", "admin"]),
+    async (req, res, next) => {
+        const client = await pool.connect();
+        try {
+            const { id } = req.params;
+            const rid = Number(id);
+            const { status, returnDate } = req.body || {};
+
+            if (!rid) {
+                return res.status(400).json({ ok: false, message: "Invalid id." });
+            }
+
+            await client.query("BEGIN");
+
+            const cur = await client.query<{ book_id: number; status: BorrowStatus }>(
+                `SELECT book_id, status FROM borrow_records WHERE id=$1 FOR UPDATE`,
+                [rid]
+            );
+            if (!cur.rowCount) {
+                await client.query("ROLLBACK");
+                return res.status(404).json({ ok: false, message: "Record not found." });
+            }
+
+            const current = cur.rows[0];
+
+            const updates: string[] = [];
+            const values: any[] = [];
+            let i = 1;
+
+            if (status !== undefined) {
+                const s = String(status).toLowerCase();
+                if (s !== "borrowed" && s !== "returned") {
+                    await client.query("ROLLBACK");
+                    return res.status(400).json({ ok: false, message: "Invalid status." });
+                }
+                updates.push(`status = $${i++}`);
+                values.push(s);
+            }
+
+            if (returnDate !== undefined) {
+                updates.push(`return_date = $${i++}::date`);
+                values.push(returnDate ? String(returnDate) : null);
+            }
+
+            if (updates.length === 0) {
+                await client.query("ROLLBACK");
+                return res.status(400).json({ ok: false, message: "No changes provided." });
+            }
+
+            updates.push(`updated_at = NOW()`);
+
+            const upd = await client.query<BorrowRowJoined>(
+                `UPDATE borrow_records
+         SET ${updates.join(", ")}
+         WHERE id = $${i}
+         RETURNING id, user_id, book_id, borrow_date, due_date, return_date, status,
+                   NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name,
+                   NULL::text AS title`,
+                [...values, rid]
+            );
+
+            // If now returned -> free the book
+            const newStatus = (status ?? current.status) as BorrowStatus;
+            if (newStatus === "returned") {
+                await client.query(
+                    `UPDATE books SET available = TRUE, updated_at = NOW() WHERE id = $1`,
+                    [upd.rows[0].book_id]
+                );
+            }
+
+            await client.query("COMMIT");
+
+            const joined = await query<BorrowRowJoined>(
+                `SELECT br.id, br.user_id, br.book_id, br.borrow_date, br.due_date, br.return_date, br.status,
+                u.email, u.student_id, u.full_name,
+                b.title
+         FROM borrow_records br
+         LEFT JOIN users u ON u.id = br.user_id
+         LEFT JOIN books b ON b.id = br.book_id
+         WHERE br.id = $1
+         LIMIT 1`,
+                [rid]
+            );
+
+            const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+            const record = toDTO(joined.rows[0], finePerDay);
+            res.json({ ok: true, record });
+        } catch (err) {
+            try { await pool.query("ROLLBACK"); } catch { }
+            next(err);
+        } finally {
+            client.release();
+        }
+    }
+);
+
+export default router;

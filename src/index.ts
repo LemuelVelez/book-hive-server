@@ -7,6 +7,7 @@ import authRouter from "./routes/auth";
 import usersRouter from "./routes/users";
 import supportRouter from "./routes/support";
 import booksRouter from "./routes/books";
+import borrowRecordsRouter from "./routes/borrowRecords";
 
 const app = express();
 
@@ -42,19 +43,12 @@ const allowList = new Set<string>(
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow same-origin requests without an Origin header (e.g. curl)
       if (!origin) return cb(null, true);
-
       const incoming = normalizeOrigin(origin);
-
-      // Exact allow-list match
       if (allowList.has(incoming)) return cb(null, true);
-
-      // During local dev, allow any localhost:<port>
       if (dev && /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(incoming)) {
         return cb(null, true);
       }
-
       return cb(new Error(`CORS blocked for origin ${incoming}`));
     },
     credentials: true,
@@ -80,6 +74,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/support", supportRouter);
 app.use("/api/books", booksRouter);
+app.use("/api/borrow-records", borrowRecordsRouter);
 
 // 404
 app.use((_req, res) => {
