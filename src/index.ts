@@ -8,7 +8,8 @@ import usersRouter from "./routes/users";
 import supportRouter from "./routes/support";
 import booksRouter from "./routes/books";
 import borrowRecordsRouter from "./routes/borrowRecords";
-import feedbacksRouter from "./routes/feedbacks"; // ✅ NEW
+import feedbacksRouter from "./routes/feedbacks";
+import damageReportsRouter from "./routes/damageReports"; // ✅ NEW
 
 const app = express();
 
@@ -76,7 +77,8 @@ app.use("/api/users", usersRouter);
 app.use("/api/support", supportRouter);
 app.use("/api/books", booksRouter);
 app.use("/api/borrow-records", borrowRecordsRouter);
-app.use("/api/feedbacks", feedbacksRouter); // ✅ NEW
+app.use("/api/feedbacks", feedbacksRouter);
+app.use("/api/damage-reports", damageReportsRouter); // ✅ NEW
 
 // 404
 app.use((_req, res) => {
