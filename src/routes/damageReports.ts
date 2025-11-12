@@ -2,26 +2,85 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { query } from "../db";
 import multer from "multer";
-import fs from "fs";
+import crypto from "crypto";
 import path from "path";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const router = express.Router();
 
-/* ---------------- Upload setup ---------------- */
-const uploadRoot = path.join(process.cwd(), "uploads");
-const damageDir = path.join(uploadRoot, "damage-reports");
-fs.mkdirSync(damageDir, { recursive: true });
+/* ---------------- S3 setup ---------------- */
+const S3_REGION = process.env.AWS_REGION || process.env.S3_REGION || "ap-southeast-2";
+const S3_BUCKET = process.env.S3_BUCKET_NAME || "";
+const S3_PUBLIC_BASE =
+  (process.env.S3_PUBLIC_URL_BASE || "").replace(/\/+$/, ""); // optional CloudFront or custom domain
+const S3_PREFIX = (process.env.S3_PREFIX || "uploads/").replace(/^\/+|\/+$/g, ""); // no leading/trailing slash
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, damageDir),
-  filename: (_req, file, cb) => {
-    const ts = Date.now();
-    const safe = file.originalname.replace(/[^a-z0-9_.-]+/gi, "_");
-    cb(null, `${ts}_${safe}`);
-  },
+if (!S3_BUCKET) {
+  console.warn(
+    "[damage-reports] S3 bucket not set (S3_BUCKET_NAME). Image uploads will fail."
+  );
+}
+
+const s3 = new S3Client({
+  region: S3_REGION,
+  // Credentials: pulled automatically from env AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY if present,
+  // or from the hosting provider's IAM role (recommended in production).
 });
+
+function extFromMime(mime: string, fallback: string = "bin") {
+  const map: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+    "image/tiff": "tif",
+    "image/avif": "avif",
+  };
+  return map[mime.toLowerCase()] || fallback;
+}
+
+function makeObjectKey(originalName: string, mime: string) {
+  const rand = crypto.randomBytes(6).toString("hex");
+  const ts = Date.now();
+  const safeBase = path.basename(originalName).replace(/[^a-z0-9_.-]+/gi, "_");
+  const ext = extFromMime(mime, path.extname(safeBase).replace(/^\./, "") || "jpg");
+  const folder = S3_PREFIX ? `${S3_PREFIX}/damage-reports` : "damage-reports";
+  return `${folder}/${ts}_${rand}.${ext}`;
+}
+
+function publicUrlForKey(key: string) {
+  if (S3_PUBLIC_BASE) return `${S3_PUBLIC_BASE}/${key}`;
+  // Virtual-hosted–style URL
+  return `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`;
+}
+
+async function uploadBufferToS3(
+  buf: Buffer,
+  mime: string,
+  originalName: string
+): Promise<string> {
+  const Key = makeObjectKey(originalName, mime);
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key,
+      Body: buf,
+      ContentType: mime,
+      // If your bucket has Object Ownership = Bucket owner enforced (recommended),
+      // ACL is disabled and should not be set. If you still use ACLs, you can uncomment:
+      // ACL: "public-read",
+      CacheControl: "public, max-age=31536000, immutable",
+    })
+  );
+  return publicUrlForKey(Key);
+}
+
+/* ---------------- Upload (multer) ---------------- */
+// Use memory storage; we will stream to S3.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
   fileFilter: (_req, file, cb) => {
     if (/^image\//i.test(file.mimetype)) return cb(null, true);
@@ -54,7 +113,7 @@ type DamageRowJoined = {
   book_id: string;
   damage_type: string;
   severity: Severity;
-  fee: string; // NUMERIC comes back as string in node-postgres
+  fee: string; // NUMERIC comes back as string
   status: DamageStatus;
   notes: string | null;
   reported_at: string;
@@ -175,7 +234,7 @@ function toDTO(row: DamageRowJoined) {
     status: row.status,
     reportedAt: row.reported_at,
     notes: row.notes,
-    photoUrl: row.photo_url, // relative like /uploads/damage-reports/xxxxx.jpg
+    photoUrl: row.photo_url, // now absolute S3 URL (or legacy /uploads/*)
   };
 }
 
@@ -223,6 +282,10 @@ router.post(
   upload.single("photo"),
   async (req, res, next) => {
     try {
+      if (!S3_BUCKET) {
+        return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
+      }
+
       const s = (req as any).sessionUser as SessionPayload;
       const { bookId, damageType, severity, fee, notes } = req.body || {};
 
@@ -243,8 +306,10 @@ router.post(
         return res.status(400).json({ ok: false, message: "fee must be a non-negative number." });
       }
 
-      const fileRel =
-        req.file ? `/uploads/damage-reports/${req.file.filename}` : null;
+      let photoUrl: string | null = null;
+      if (req.file) {
+        photoUrl = await uploadBufferToS3(req.file.buffer, req.file.mimetype, req.file.originalname);
+      }
 
       // Ensure book exists
       const book = await query(`SELECT id FROM books WHERE id = $1 LIMIT 1`, [bid]);
@@ -257,7 +322,7 @@ router.post(
          VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
          RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at, photo_url,
                    NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name, NULL::text AS title`,
-        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, fileRel]
+        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrl]
       );
 
       // Hydrate joins for DTO
@@ -301,8 +366,14 @@ router.patch(
       }
 
       const { status, severity, fee, notes, damageType } = req.body || {};
-      const newPhotoRel =
-        req.file ? `/uploads/damage-reports/${req.file.filename}` : undefined;
+      let newPhotoUrl: string | undefined = undefined;
+
+      if (req.file) {
+        if (!S3_BUCKET) {
+          return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
+        }
+        newPhotoUrl = await uploadBufferToS3(req.file.buffer, req.file.mimetype, req.file.originalname);
+      }
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -349,9 +420,9 @@ router.patch(
         values.push(dt);
       }
 
-      if (newPhotoRel !== undefined) {
+      if (newPhotoUrl !== undefined) {
         updates.push(`photo_url = $${i++}`);
-        values.push(newPhotoRel);
+        values.push(newPhotoUrl);
       }
 
       if (updates.length === 0) {
