@@ -175,6 +175,38 @@ router.get(
 );
 
 /**
+ * GET /api/feedbacks/my
+ * List feedbacks submitted by the current authenticated user (any role).
+ */
+router.get(
+  "/my",
+  requireAuth,
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
+      const userId = Number(s.sub);
+
+      const result = await query<FeedbackRowJoined>(
+        `SELECT f.id, f.user_id, f.book_id, f.rating, f.comment, f.created_at,
+                u.email, u.student_id, u.full_name,
+                b.title
+         FROM feedbacks f
+         LEFT JOIN users u ON u.id = f.user_id
+         LEFT JOIN books b ON b.id = f.book_id
+         WHERE f.user_id = $1
+         ORDER BY f.created_at DESC, f.id DESC`,
+        [userId]
+      );
+
+      const feedbacks = result.rows.map(toDTO);
+      res.json({ ok: true, feedbacks });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * POST /api/feedbacks
  * Create a feedback – students (and optionally staff) can submit.
  * Body: { bookId, rating (1..5), comment? }

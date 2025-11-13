@@ -220,6 +220,25 @@ function requireRole(roles: Role[]) {
 /* ---------------- mapping ---------------- */
 
 function toDTO(row: DamageRowJoined) {
+  let photoUrls: string[] = [];
+  if (row.photo_url) {
+    try {
+      const parsed = JSON.parse(row.photo_url);
+      if (Array.isArray(parsed)) {
+        photoUrls = parsed
+          .map((v) => (typeof v === "string" ? v : null))
+          .filter((v): v is string => !!v);
+      } else if (typeof parsed === "string") {
+        photoUrls = [parsed];
+      } else {
+        photoUrls = [String(row.photo_url)];
+      }
+    } catch {
+      // Legacy: plain URL string
+      photoUrls = [row.photo_url];
+    }
+  }
+
   return {
     id: String(row.id),
     userId: String(row.user_id),
@@ -234,7 +253,7 @@ function toDTO(row: DamageRowJoined) {
     status: row.status,
     reportedAt: row.reported_at,
     notes: row.notes,
-    photoUrl: row.photo_url, // now absolute S3 URL (or legacy /uploads/*)
+    photoUrls,
   };
 }
 
@@ -269,9 +288,41 @@ router.get(
 );
 
 /**
+ * GET /api/damage-reports/my
+ * List damage reports submitted by the current authenticated user.
+ */
+router.get(
+  "/my",
+  requireAuth,
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
+      const userId = Number(s.sub);
+
+      const result = await query<DamageRowJoined>(
+        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
+                u.email, u.student_id, u.full_name,
+                b.title
+         FROM damage_reports dr
+         LEFT JOIN users u ON u.id = dr.user_id
+         LEFT JOIN books b ON b.id = dr.book_id
+         WHERE dr.user_id = $1
+         ORDER BY dr.reported_at DESC, dr.id DESC`,
+        [userId]
+      );
+
+      const reports = result.rows.map(toDTO);
+      res.json({ ok: true, reports });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * POST /api/damage-reports
  * Create a damage report – students (and staff) can submit.
- * Accepts multipart/form-data with optional "photo" file.
+ * Accepts multipart/form-data with optional "photos" files (max 3).
  * Fields: { bookId, damageType, severity ('minor'|'moderate'|'major'), fee?, notes? }
  * - status defaults to 'pending'
  */
@@ -279,7 +330,7 @@ router.post(
   "/",
   requireAuth,
   requireRole(["student", "librarian", "admin"]),
-  upload.single("photo"),
+  upload.array("photos", 3),
   async (req, res, next) => {
     try {
       if (!S3_BUCKET) {
@@ -306,10 +357,15 @@ router.post(
         return res.status(400).json({ ok: false, message: "fee must be a non-negative number." });
       }
 
-      let photoUrl: string | null = null;
-      if (req.file) {
-        photoUrl = await uploadBufferToS3(req.file.buffer, req.file.mimetype, req.file.originalname);
+      const files = (req.files as Express.Multer.File[]) || [];
+      const uploadedUrls: string[] = [];
+
+      for (const file of files) {
+        const url = await uploadBufferToS3(file.buffer, file.mimetype, file.originalname);
+        uploadedUrls.push(url);
       }
+
+      const photoUrlJson = uploadedUrls.length ? JSON.stringify(uploadedUrls) : null;
 
       // Ensure book exists
       const book = await query(`SELECT id FROM books WHERE id = $1 LIMIT 1`, [bid]);
@@ -322,7 +378,7 @@ router.post(
          VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
          RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at, photo_url,
                    NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name, NULL::text AS title`,
-        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrl]
+        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrlJson]
       );
 
       // Hydrate joins for DTO
@@ -372,6 +428,7 @@ router.patch(
         if (!S3_BUCKET) {
           return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
         }
+        // For PATCH we still allow a single replacement image
         newPhotoUrl = await uploadBufferToS3(req.file.buffer, req.file.mimetype, req.file.originalname);
       }
 
@@ -421,8 +478,10 @@ router.patch(
       }
 
       if (newPhotoUrl !== undefined) {
+        // Store as a JSON array with a single entry for consistency
+        const json = JSON.stringify([newPhotoUrl]);
         updates.push(`photo_url = $${i++}`);
-        values.push(newPhotoUrl);
+        values.push(json);
       }
 
       if (updates.length === 0) {
