@@ -434,11 +434,12 @@ router.post(
  * PATCH /api/borrow-records/:id
  * Update status/return date (mark as returned) and set book available.
  * Body: { status?, returnDate? }
+ * - Librarian/Admin can update any record.
+ * - The student who owns the record can update *their own* record.
  */
 router.patch(
     "/:id",
     requireAuth,
-    requireRole(["librarian", "admin"]),
     async (req, res, next) => {
         const client = await pool.connect();
         try {
@@ -450,12 +451,22 @@ router.patch(
                 return res.status(400).json({ ok: false, message: "Invalid id." });
             }
 
+            const session = (req as any).sessionUser as SessionPayload;
+
             await client.query("BEGIN");
 
-            const cur = await client.query<{ book_id: number; status: BorrowStatus }>(
-                `SELECT book_id, status FROM borrow_records WHERE id=$1 FOR UPDATE`,
+            const cur = await client.query<{
+                book_id: number;
+                status: BorrowStatus;
+                user_id: number;
+            }>(
+                `SELECT book_id, status, user_id
+           FROM borrow_records
+           WHERE id=$1
+           FOR UPDATE`,
                 [rid]
             );
+
             if (!cur.rowCount) {
                 await client.query("ROLLBACK");
                 return res.status(404).json({ ok: false, message: "Record not found." });
@@ -463,18 +474,47 @@ router.patch(
 
             const current = cur.rows[0];
 
+            // Determine effective role from DB (same logic as other routes)
+            let effectiveRole: Role = session.role;
+            try {
+                const roleResult = await query<UserRoleRow>(
+                    `SELECT id, account_type, role
+             FROM users
+             WHERE id = $1
+             LIMIT 1`,
+                    [session.sub]
+                );
+                if (roleResult.rowCount) {
+                    effectiveRole = computeEffectiveRoleFromRow(roleResult.rows[0]);
+                }
+            } catch {
+                // If this fails, we just fall back to token role
+            }
+
+            const isOwner = Number(current.user_id) === Number(session.sub);
+            const isAdminLike =
+                effectiveRole === "librarian" || effectiveRole === "admin";
+
+            if (!isOwner && !isAdminLike) {
+                await client.query("ROLLBACK");
+                return res.status(403).json({
+                    ok: false,
+                    message: "Forbidden: cannot modify this borrow record.",
+                });
+            }
+
             const updates: string[] = [];
             const values: any[] = [];
             let i = 1;
 
             if (status !== undefined) {
-                const s = String(status).toLowerCase();
-                if (s !== "borrowed" && s !== "returned") {
+                const sVal = String(status).toLowerCase();
+                if (sVal !== "borrowed" && sVal !== "returned") {
                     await client.query("ROLLBACK");
                     return res.status(400).json({ ok: false, message: "Invalid status." });
                 }
                 updates.push(`status = $${i++}`);
-                values.push(s);
+                values.push(sVal);
             }
 
             if (returnDate !== undefined) {
