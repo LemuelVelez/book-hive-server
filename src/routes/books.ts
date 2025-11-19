@@ -14,6 +14,7 @@ type BookRow = {
   genre: string | null;
   publication_year: number;
   available: boolean;
+  borrow_duration_days: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -27,7 +28,6 @@ type SessionPayload = {
 
 /**
  * Minimal shape from users table for role resolution.
- * We only need account_type + legacy role.
  */
 type UserRoleRow = {
   id: string;
@@ -83,10 +83,7 @@ function requireAuth(
 }
 
 /**
- * Compute the effective role using the same logic as auth.ts:
- * - Prefer account_type if it’s non-student.
- * - If account_type is student but legacy role is non-student, use legacy.
- * - Otherwise fall back to account_type (or student).
+ * Compute the effective role using the same logic as auth.ts
  */
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
   const primary = (row.account_type || "student") as Role;
@@ -104,8 +101,7 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
 }
 
 /**
- * Role guard that always checks the DB for the current effective role,
- * instead of trusting whatever is in the JWT.
+ * Role guard that always checks the DB for the current effective role.
  */
 function requireRole(roles: Role[]) {
   return (
@@ -136,23 +132,18 @@ function requireRole(roles: Role[]) {
         const effectiveRole = computeEffectiveRoleFromRow(u);
 
         if (!roles.includes(effectiveRole)) {
-          // Helpful log while debugging roles
-          console.warn(
-            "[books] Forbidden: insufficient role",
-            {
-              userId: s.sub,
-              tokenRole: s.role,
-              effectiveRole,
-              required: roles,
-            }
-          );
+          console.warn("[books] Forbidden: insufficient role", {
+            userId: s.sub,
+            tokenRole: s.role,
+            effectiveRole,
+            required: roles,
+          });
 
           return res
             .status(403)
             .json({ ok: false, message: "Forbidden: insufficient role." });
         }
 
-        // Keep the effective role in req.sessionUser for downstream handlers
         (req as any).sessionUser = { ...s, role: effectiveRole };
         next();
       })
@@ -173,6 +164,10 @@ function toDTO(row: BookRow) {
     genre: row.genre ?? "",
     publicationYear: row.publication_year,
     available: row.available,
+    borrowDurationDays:
+      typeof row.borrow_duration_days === "number"
+        ? row.borrow_duration_days
+        : null,
   };
 }
 
@@ -185,7 +180,16 @@ function toDTO(row: BookRow) {
 router.get("/", async (_req, res, next) => {
   try {
     const result = await query<BookRow>(
-      `SELECT id, title, author, isbn, genre, publication_year, available, created_at, updated_at
+      `SELECT id,
+              title,
+              author,
+              isbn,
+              genre,
+              publication_year,
+              available,
+              borrow_duration_days,
+              created_at,
+              updated_at
        FROM books
        ORDER BY created_at DESC, id DESC`
     );
@@ -207,8 +211,15 @@ router.post(
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
     try {
-      const { title, author, isbn, genre, publicationYear, available } =
-        req.body || {};
+      const {
+        title,
+        author,
+        isbn,
+        genre,
+        publicationYear,
+        available,
+        borrowDurationDays,
+      } = req.body || {};
 
       if (!title || !author || publicationYear === undefined) {
         return res.status(400).json({
@@ -225,14 +236,41 @@ router.post(
         });
       }
 
+      const defaultBorrowDays = Number(process.env.BORROW_DAYS || 7);
+      let borrowDurationVal: number;
+      if (borrowDurationDays === undefined || borrowDurationDays === null) {
+        borrowDurationVal =
+          Number.isFinite(defaultBorrowDays) && defaultBorrowDays > 0
+            ? Math.floor(defaultBorrowDays)
+            : 7;
+      } else {
+        const parsed = Number(borrowDurationDays);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          return res.status(400).json({
+            ok: false,
+            message: "borrowDurationDays must be a positive number of days.",
+          });
+        }
+        borrowDurationVal = Math.floor(parsed);
+      }
+
       const availableVal =
         typeof available === "boolean" ? available : true;
 
       try {
         const ins = await query<BookRow>(
-          `INSERT INTO books (title, author, isbn, genre, publication_year, available)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           RETURNING id, title, author, isbn, genre, publication_year, available, created_at, updated_at`,
+          `INSERT INTO books (title, author, isbn, genre, publication_year, available, borrow_duration_days)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           RETURNING id,
+                     title,
+                     author,
+                     isbn,
+                     genre,
+                     publication_year,
+                     available,
+                     borrow_duration_days,
+                     created_at,
+                     updated_at`,
           [
             String(title).trim(),
             String(author).trim(),
@@ -240,6 +278,7 @@ router.post(
             genre ? String(genre).trim() : null,
             yearNum,
             availableVal,
+            borrowDurationVal,
           ]
         );
 
@@ -272,8 +311,15 @@ router.patch(
   async (req, res, next) => {
     try {
       const { id } = req.params;
-      const { title, author, isbn, genre, publicationYear, available } =
-        req.body || {};
+      const {
+        title,
+        author,
+        isbn,
+        genre,
+        publicationYear,
+        available,
+        borrowDurationDays,
+      } = req.body || {};
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -310,6 +356,17 @@ router.patch(
         updates.push(`available = $${idx++}`);
         values.push(Boolean(available));
       }
+      if (borrowDurationDays !== undefined) {
+        const parsed = Number(borrowDurationDays);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          return res.status(400).json({
+            ok: false,
+            message: "borrowDurationDays must be a positive number of days.",
+          });
+        }
+        updates.push(`borrow_duration_days = $${idx++}`);
+        values.push(Math.floor(parsed));
+      }
 
       if (updates.length === 0) {
         return res.status(400).json({
@@ -324,7 +381,16 @@ router.patch(
         UPDATE books
         SET ${updates.join(", ")}
         WHERE id = $${idx}
-        RETURNING id, title, author, isbn, genre, publication_year, available, created_at, updated_at
+        RETURNING id,
+                  title,
+                  author,
+                  isbn,
+                  genre,
+                  publication_year,
+                  available,
+                  borrow_duration_days,
+                  created_at,
+                  updated_at
       `;
       values.push(Number(id));
 

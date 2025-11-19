@@ -362,7 +362,7 @@ router.post(
  * Body: { bookId }
  * - userId is taken from the session.
  * - borrow_date = today
- * - due_date = today + BORROW_DAYS (default 7)
+ * - due_date = today + per-book borrow_duration_days (fallback BORROW_DAYS, default 7)
  * - ✅ marks the book as unavailable (available = FALSE)
  */
 router.post(
@@ -382,14 +382,6 @@ router.post(
 
         const client = await pool.connect();
         try {
-            const borrowDays = Number(process.env.BORROW_DAYS || 7);
-            const today = new Date();
-            const due = new Date(today);
-            due.setDate(due.getDate() + borrowDays);
-
-            const borrowDateStr = today.toISOString().slice(0, 10);
-            const dueDateStr = due.toISOString().slice(0, 10);
-
             await client.query("BEGIN");
 
             // Validate user exists
@@ -399,14 +391,19 @@ router.post(
             );
             if (!u.rowCount) {
                 await client.query("ROLLBACK");
-                return res
-                    .status(404)
-                    .json({ ok: false, message: "User not found." });
+                return res.status(404).json({ ok: false, message: "User not found." });
             }
 
-            // Validate book availability
-            const b = await client.query<{ id: number; available: boolean }>(
-                `SELECT id, available FROM books WHERE id=$1 LIMIT 1`,
+            // Validate book availability + get per-book duration
+            const b = await client.query<{
+                id: number;
+                available: boolean;
+                borrow_duration_days: number | null;
+            }>(
+                `SELECT id, available, borrow_duration_days
+         FROM books
+         WHERE id = $1
+         LIMIT 1`,
                 [bid]
             );
             if (!b.rowCount) {
@@ -421,6 +418,25 @@ router.post(
                     .status(409)
                     .json({ ok: false, message: "Book is not available." });
             }
+
+            const today = new Date();
+
+            let borrowDays = Number(
+                b.rows[0].borrow_duration_days ??
+                process.env.BORROW_DAYS ??
+                7
+            );
+            if (!Number.isFinite(borrowDays) || borrowDays <= 0) {
+                borrowDays = 7;
+            } else {
+                borrowDays = Math.floor(borrowDays);
+            }
+
+            const due = new Date(today);
+            due.setDate(due.getDate() + borrowDays);
+
+            const borrowDateStr = today.toISOString().slice(0, 10);
+            const dueDateStr = due.toISOString().slice(0, 10);
 
             const ins = await client.query<{ id: string }>(
                 `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
@@ -477,13 +493,11 @@ router.post(
 
 /**
  * PATCH /api/borrow-records/:id
- * Update status/return date.
- * Body: { status?, returnDate? }
- * - Librarian/Admin can set status to "borrowed" | "pending" | "returned"
- *   and set the return date.
+ * Update status/return date/due date/fine.
+ * - Librarian/Admin can set status, return date, due date, and final fine.
  * - The student who owns the record can only move their own record
  *   from "borrowed" to "pending" (online return request).
- * - When a record is set to "returned", we compute and persist the fine.
+ * - When a record is set to "returned", we compute and/or persist the fine.
  */
 router.patch(
     "/:id",
@@ -493,7 +507,7 @@ router.patch(
         try {
             const { id } = req.params;
             const rid = Number(id);
-            const { status, returnDate } = req.body || {};
+            const { status, returnDate, dueDate, fine } = req.body || {};
 
             if (!rid) {
                 return res.status(400).json({ ok: false, message: "Invalid id." });
@@ -540,7 +554,8 @@ router.patch(
             }
 
             const isOwner = Number(current.user_id) === Number(session.sub);
-            const isAdminLike = effectiveRole === "librarian" || effectiveRole === "admin";
+            const isAdminLike =
+                effectiveRole === "librarian" || effectiveRole === "admin";
 
             if (!isOwner && !isAdminLike) {
                 await client.query("ROLLBACK");
@@ -550,7 +565,7 @@ router.patch(
                 });
             }
 
-            // Extra safety: students cannot finalize returns or set return_date
+            // Extra safety: students cannot finalize returns or set return/due date or fine
             if (!isAdminLike) {
                 const desiredStatus =
                     status !== undefined ? String(status).toLowerCase() : undefined;
@@ -569,6 +584,15 @@ router.patch(
                     return res.status(403).json({
                         ok: false,
                         message: "Only librarians can set the return date.",
+                    });
+                }
+
+                if (dueDate !== undefined || fine !== undefined) {
+                    await client.query("ROLLBACK");
+                    return res.status(403).json({
+                        ok: false,
+                        message:
+                            "Only librarians can change the due date or finalize the fine amount.",
                     });
                 }
             }
@@ -592,6 +616,17 @@ router.patch(
             if (returnDate !== undefined) {
                 updates.push(`return_date = $${i++}::date`);
                 values.push(returnDate ? String(returnDate) : null);
+            }
+
+            if (dueDate !== undefined) {
+                if (!dueDate) {
+                    await client.query("ROLLBACK");
+                    return res
+                        .status(400)
+                        .json({ ok: false, message: "dueDate cannot be empty." });
+                }
+                updates.push(`due_date = $${i++}::date`);
+                values.push(String(dueDate));
             }
 
             if (updates.length === 0) {
@@ -638,23 +673,30 @@ router.patch(
                     [updatedRow.book_id]
                 );
 
-                // Compute and store the fine at the time of return
                 const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
 
                 const due = new Date(updatedRow.due_date + "T00:00:00Z");
                 const end = new Date(
-                    (updatedRow.return_date || new Date().toISOString().slice(0, 10)) +
-                    "T00:00:00Z"
+                    (updatedRow.return_date ||
+                        new Date().toISOString().slice(0, 10)) + "T00:00:00Z"
                 );
                 const ms = Math.max(0, end.getTime() - due.getTime());
                 const days = Math.floor(ms / (1000 * 60 * 60 * 24));
-                const fineValue = days * finePerDay;
+                const computedFine = days * finePerDay;
+
+                let finalFine = computedFine;
+                if (fine !== undefined) {
+                    const parsedFine = Number(fine);
+                    if (!Number.isNaN(parsedFine) && parsedFine >= 0) {
+                        finalFine = parsedFine;
+                    }
+                }
 
                 await client.query(
                     `UPDATE borrow_records
              SET fine = $1, updated_at = NOW()
            WHERE id = $2`,
-                    [fineValue, rid]
+                    [finalFine, rid]
                 );
             }
 
