@@ -1,6 +1,9 @@
 import express from "express";
 import jwt from "jsonwebtoken";
+import multer from "multer";
+import path from "path";
 import { query } from "../db";
+import { uploadImageToS3 } from "../s3";
 
 const router = express.Router();
 
@@ -42,6 +45,30 @@ type FineRowJoined = {
   student_id: string | null;
   full_name: string | null;
 };
+
+type PaymentConfigRow = {
+  id: string;
+  e_wallet_phone: string | null;
+  qr_code_url: string | null;
+};
+
+type FineProofRow = {
+  id: string;
+  fine_id: string;
+  image_url: string;
+  uploaded_by: string | null;
+  kind: string;
+  created_at: string;
+};
+
+/* ---------------- multer (for image uploads) ---------------- */
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 8 * 1024 * 1024, // 8MB max per image
+  },
+});
 
 /* ---------------- helpers ---------------- */
 
@@ -163,6 +190,16 @@ function fineToDTO(row: FineRowJoined) {
   };
 }
 
+function proofToDTO(row: FineProofRow) {
+  return {
+    id: String(row.id),
+    fineId: String(row.fine_id),
+    imageUrl: row.image_url,
+    kind: row.kind,
+    uploadedAt: row.created_at,
+  };
+}
+
 const BASE_SELECT = `
   SELECT
     f.id,
@@ -274,6 +311,253 @@ router.get(
 
       const fines = result.rows.map(fineToDTO);
       res.json({ ok: true, fines });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/* ---------- Global payment config (e-wallet phone + QR) ---------- */
+
+/**
+ * GET /api/fines/payment-config
+ * Any authenticated user can read the current library payment settings.
+ */
+router.get(
+  "/payment-config",
+  requireAuth,
+  async (_req, res, next) => {
+    try {
+      const result = await query<PaymentConfigRow>(
+        `SELECT id, e_wallet_phone, qr_code_url
+         FROM library_payment_settings
+         ORDER BY id ASC
+         LIMIT 1`
+      );
+
+      const row = result.rows[0];
+      const config = row
+        ? {
+          eWalletPhone: row.e_wallet_phone,
+          qrCodeUrl: row.qr_code_url,
+        }
+        : null;
+
+      res.json({ ok: true, config });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/fines/payment-config
+ * Librarian/admin: update global e-wallet number and/or QR code image.
+ * Body (multipart/form-data):
+ *   - eWalletPhone (string)
+ *   - qrCode (file)
+ */
+router.post(
+  "/payment-config",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  upload.single("qrCode"),
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
+      const userId = Number(s.sub) || null;
+
+      const rawPhone = typeof req.body?.eWalletPhone === "string"
+        ? req.body.eWalletPhone
+        : "";
+      const phoneNormalized = rawPhone.trim() || null;
+
+      let qrUrl: string | undefined;
+      const file = req.file;
+
+      if (file) {
+        const ext = path.extname(file.originalname || "").toLowerCase() || undefined;
+        qrUrl = await uploadImageToS3({
+          buffer: file.buffer,
+          contentType: file.mimetype || "image/png",
+          folder: "payment-qr",
+          extension: ext,
+        });
+      }
+
+      const existing = await query<PaymentConfigRow>(
+        `SELECT id, e_wallet_phone, qr_code_url
+         FROM library_payment_settings
+         ORDER BY id ASC
+         LIMIT 1`
+      );
+
+      let row: PaymentConfigRow;
+
+      if (!existing.rowCount) {
+        const insert = await query<PaymentConfigRow>(
+          `INSERT INTO library_payment_settings (e_wallet_phone, qr_code_url, created_by, updated_by)
+           VALUES ($1, $2, $3, $3)
+           RETURNING id, e_wallet_phone, qr_code_url`,
+          [phoneNormalized, qrUrl ?? null, userId, userId]
+        );
+        row = insert.rows[0];
+      } else {
+        const current = existing.rows[0];
+        const nextPhone =
+          phoneNormalized !== null ? phoneNormalized : current.e_wallet_phone;
+        const nextQr =
+          qrUrl !== undefined ? qrUrl : current.qr_code_url;
+
+        const update = await query<PaymentConfigRow>(
+          `UPDATE library_payment_settings
+           SET e_wallet_phone = $1,
+               qr_code_url = $2,
+               updated_by = $3,
+               updated_at = NOW()
+           WHERE id = $4
+           RETURNING id, e_wallet_phone, qr_code_url`,
+          [nextPhone, nextQr, userId, current.id]
+        );
+        row = update.rows[0];
+      }
+
+      const config = {
+        eWalletPhone: row.e_wallet_phone,
+        qrCodeUrl: row.qr_code_url,
+      };
+
+      res.json({ ok: true, config });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/* ---------- Fine proofs: student payment screenshots ---------- */
+
+/**
+ * GET /api/fines/:id/proofs
+ * List proof images for a fine.
+ * - Allowed for the fine owner (student) or librarian/admin.
+ */
+router.get(
+  "/:id/proofs",
+  requireAuth,
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const fid = Number(id);
+      if (!fid) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
+
+      const s = (req as any).sessionUser as SessionPayload;
+      const userId = Number(s.sub);
+
+      const fineResult = await query<{ user_id: string }>(
+        `SELECT user_id FROM fines WHERE id = $1 LIMIT 1`,
+        [fid]
+      );
+
+      if (!fineResult.rowCount) {
+        return res.status(404).json({ ok: false, message: "Fine not found." });
+      }
+
+      const fineOwnerId = Number(fineResult.rows[0].user_id);
+      const role = normalizeRole(s.role);
+
+      const isOwner = fineOwnerId === userId;
+      const isStaff = role === "librarian" || role === "admin";
+
+      if (!isOwner && !isStaff) {
+        return res.status(403).json({ ok: false, message: "Forbidden." });
+      }
+
+      const proofsResult = await query<FineProofRow>(
+        `SELECT id, fine_id, image_url, uploaded_by, kind, created_at
+         FROM fine_proofs
+         WHERE fine_id = $1
+         ORDER BY created_at ASC`,
+        [fid]
+      );
+
+      const proofs = proofsResult.rows.map(proofToDTO);
+      res.json({ ok: true, proofs });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/fines/:id/proofs
+ * Upload a proof image (student payment screenshot).
+ * - Allowed for the fine owner (student) or librarian/admin.
+ * - Uses Amazon S3 for storage.
+ */
+router.post(
+  "/:id/proofs",
+  requireAuth,
+  upload.single("image"),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const fid = Number(id);
+      if (!fid) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
+
+      const file = req.file;
+      if (!file) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "No image file provided." });
+      }
+
+      const s = (req as any).sessionUser as SessionPayload;
+      const userId = Number(s.sub);
+
+      const fineResult = await query<{ user_id: string }>(
+        `SELECT user_id FROM fines WHERE id = $1 LIMIT 1`,
+        [fid]
+      );
+
+      if (!fineResult.rowCount) {
+        return res.status(404).json({ ok: false, message: "Fine not found." });
+      }
+
+      const fineOwnerId = Number(fineResult.rows[0].user_id);
+      const role = normalizeRole(s.role);
+
+      const isOwner = fineOwnerId === userId;
+      const isStaff = role === "librarian" || role === "admin";
+
+      if (!isOwner && !isStaff) {
+        return res.status(403).json({ ok: false, message: "Forbidden." });
+      }
+
+      const kindRaw =
+        typeof req.body?.kind === "string" ? req.body.kind.trim() : "";
+      const kind = kindRaw || "student_payment";
+
+      const ext = path.extname(file.originalname || "").toLowerCase() || undefined;
+      const imageUrl = await uploadImageToS3({
+        buffer: file.buffer,
+        contentType: file.mimetype || "image/png",
+        folder: "fines/proofs",
+        extension: ext,
+      });
+
+      const insert = await query<FineProofRow>(
+        `INSERT INTO fine_proofs (fine_id, image_url, uploaded_by, kind)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, fine_id, image_url, uploaded_by, kind, created_at`,
+        [fid, imageUrl, Number.isFinite(userId) ? userId : null, kind]
+      );
+
+      const proof = proofToDTO(insert.rows[0]);
+      res.json({ ok: true, proof });
     } catch (err) {
       next(err);
     }
