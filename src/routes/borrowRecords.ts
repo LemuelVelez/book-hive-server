@@ -498,6 +498,7 @@ router.post(
  * - The student who owns the record can only move their own record
  *   from "borrowed" to "pending" (online return request).
  * - When a record is set to "returned", we compute and/or persist the fine.
+ *   We also create/update a corresponding fine in the `fines` table.
  */
 router.patch(
     "/:id",
@@ -524,7 +525,7 @@ router.patch(
             }>(
                 `SELECT book_id, status, user_id
            FROM borrow_records
-           WHERE id=$1
+           WHERE id = $1
            FOR UPDATE`,
                 [rid]
             );
@@ -666,6 +667,7 @@ router.patch(
                     : current.status;
 
             // If now returned -> free the book AND compute & persist fine
+            // and create/update an active Fine record.
             if (newStatus === "returned") {
                 // Mark the book as available
                 await client.query(
@@ -692,12 +694,45 @@ router.patch(
                     }
                 }
 
+                // Persist final fine on the borrow record
                 await client.query(
                     `UPDATE borrow_records
              SET fine = $1, updated_at = NOW()
            WHERE id = $2`,
                     [finalFine, rid]
                 );
+
+                // Manage fines table:
+                // - finalFine > 0  => active fine (student is liable)
+                // - finalFine = 0  => cancel any existing fine for this borrow
+                if (finalFine > 0) {
+                    await client.query(
+                        `INSERT INTO fines (user_id, borrow_record_id, amount, status, reason)
+                         VALUES ($1, $2, $3, 'active', $4)
+                         ON CONFLICT (borrow_record_id) WHERE borrow_record_id IS NOT NULL DO UPDATE
+                           SET amount = EXCLUDED.amount,
+                               status = 'active',
+                               reason = EXCLUDED.reason,
+                               resolved_at = NULL,
+                               updated_at = NOW()`,
+                        [
+                            current.user_id,
+                            rid,
+                            finalFine,
+                            `Overdue fine for borrow record #${rid}`,
+                        ]
+                    );
+                } else {
+                    await client.query(
+                        `UPDATE fines
+                           SET amount = 0,
+                               status = 'cancelled',
+                               resolved_at = NOW(),
+                               updated_at = NOW()
+                         WHERE borrow_record_id = $1`,
+                        [rid]
+                    );
+                }
             }
 
             await client.query("COMMIT");

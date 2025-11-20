@@ -11,6 +11,7 @@ import booksRouter from "./routes/books";
 import borrowRecordsRouter from "./routes/borrowRecords";
 import feedbacksRouter from "./routes/feedbacks";
 import damageReportsRouter from "./routes/damageReports"; // ✅
+import finesRouter from "./routes/fines"; // ✅ NEW
 
 const app = express();
 
@@ -89,6 +90,7 @@ app.use("/api/books", booksRouter);
 app.use("/api/borrow-records", borrowRecordsRouter);
 app.use("/api/feedbacks", feedbacksRouter);
 app.use("/api/damage-reports", damageReportsRouter); // ✅
+app.use("/api/fines", finesRouter); // ✅ NEW
 
 /** 404 */
 app.use((_req, res) => {
