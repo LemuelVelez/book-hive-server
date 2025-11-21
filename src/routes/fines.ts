@@ -364,19 +364,18 @@ router.post(
   upload.single("qrCode"),
   async (req, res, next) => {
     try {
-      const s = (req as any).sessionUser as SessionPayload;
-      const userId = Number(s.sub) || null;
-
-      const rawPhone = typeof req.body?.eWalletPhone === "string"
-        ? req.body.eWalletPhone
-        : "";
+      const rawPhone =
+        typeof req.body?.eWalletPhone === "string"
+          ? req.body.eWalletPhone
+          : "";
       const phoneNormalized = rawPhone.trim() || null;
 
       let qrUrl: string | undefined;
       const file = req.file;
 
       if (file) {
-        const ext = path.extname(file.originalname || "").toLowerCase() || undefined;
+        const ext =
+          path.extname(file.originalname || "").toLowerCase() || undefined;
         qrUrl = await uploadImageToS3({
           buffer: file.buffer,
           contentType: file.mimetype || "image/png",
@@ -395,11 +394,12 @@ router.post(
       let row: PaymentConfigRow;
 
       if (!existing.rowCount) {
+        // INSERT: 2 placeholders, 2 parameters ✅
         const insert = await query<PaymentConfigRow>(
-          `INSERT INTO library_payment_settings (e_wallet_phone, qr_code_url, created_by, updated_by)
-           VALUES ($1, $2, $3, $3)
+          `INSERT INTO library_payment_settings (e_wallet_phone, qr_code_url)
+           VALUES ($1, $2)
            RETURNING id, e_wallet_phone, qr_code_url`,
-          [phoneNormalized, qrUrl ?? null, userId, userId]
+          [phoneNormalized, qrUrl ?? null]
         );
         row = insert.rows[0];
       } else {
@@ -409,15 +409,15 @@ router.post(
         const nextQr =
           qrUrl !== undefined ? qrUrl : current.qr_code_url;
 
+        // UPDATE: 3 placeholders, 3 parameters ✅
         const update = await query<PaymentConfigRow>(
           `UPDATE library_payment_settings
            SET e_wallet_phone = $1,
                qr_code_url = $2,
-               updated_by = $3,
                updated_at = NOW()
-           WHERE id = $4
+           WHERE id = $3
            RETURNING id, e_wallet_phone, qr_code_url`,
-          [nextPhone, nextQr, userId, current.id]
+          [nextPhone, nextQr, current.id]
         );
         row = update.rows[0];
       }
@@ -541,7 +541,8 @@ router.post(
         typeof req.body?.kind === "string" ? req.body.kind.trim() : "";
       const kind = kindRaw || "student_payment";
 
-      const ext = path.extname(file.originalname || "").toLowerCase() || undefined;
+      const ext =
+        path.extname(file.originalname || "").toLowerCase() || undefined;
       const imageUrl = await uploadImageToS3({
         buffer: file.buffer,
         contentType: file.mimetype || "image/png",

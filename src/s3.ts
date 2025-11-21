@@ -9,20 +9,30 @@ if (!BUCKET) {
     throw new Error("S3_BUCKET_NAME is not set in environment variables.");
 }
 
+// Optional path prefix inside the bucket (e.g. "uploads")
 const PREFIX = (process.env.S3_PREFIX || "")
     .trim()
     .replace(/^\/+|\/+$/g, "");
 
+// Optional public URL base (e.g. CloudFront or custom domain)
+// If set, uploaded keys will be appended to this instead of the raw S3 URL.
 const PUBLIC_BASE = (process.env.S3_PUBLIC_URL_BASE || "")
     .trim()
     .replace(/\/+$/g, "");
 
+// S3 client uses standard AWS credential resolution (env vars, instance role, etc.)
 const s3 = new S3Client({
     region: REGION,
 });
 
 /**
  * Upload an image buffer to S3 and return a public URL.
+ *
+ * NOTE:
+ * - We DO NOT set an ACL here, to be compatible with buckets that have
+ *   ObjectOwnership = BucketOwnerEnforced (ACLs disabled).
+ * - Ensure your bucket policy or CloudFront distribution allows public
+ *   read access to the key prefix used here if students need to view images.
  */
 export async function uploadImageToS3(opts: {
     buffer: Buffer;
@@ -49,7 +59,7 @@ export async function uploadImageToS3(opts: {
             Key: key,
             Body: buffer,
             ContentType: contentType || "application/octet-stream",
-            ACL: "public-read",
+            // ❌ ACL removed to avoid "The bucket does not allow ACLs"
         })
     );
 
@@ -57,6 +67,7 @@ export async function uploadImageToS3(opts: {
         return `${PUBLIC_BASE}/${key}`;
     }
 
+    // Default to plain S3 URL
     return `https://${BUCKET}.s3.${REGION}.amazonaws.com/${key}`;
 }
 
