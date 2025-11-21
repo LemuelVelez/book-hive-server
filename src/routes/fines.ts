@@ -28,6 +28,7 @@ type FineRowJoined = {
   id: string;
   user_id: string;
   borrow_record_id: string | null;
+  damage_report_id: string | null;
   amount: string;
   status: FineStatus;
   reason: string | null;
@@ -171,6 +172,9 @@ function fineToDTO(row: FineRowJoined) {
     borrowRecordId: row.borrow_record_id
       ? String(row.borrow_record_id)
       : null,
+    damageReportId: row.damage_report_id
+      ? String(row.damage_report_id)
+      : null,
     amount: Number(row.amount || 0),
     status: row.status,
     reason: row.reason,
@@ -205,6 +209,7 @@ const BASE_SELECT = `
     f.id,
     f.user_id,
     f.borrow_record_id,
+    f.damage_report_id,
     f.amount,
     f.status,
     f.reason,
@@ -721,7 +726,16 @@ router.patch(
         `UPDATE fines
          SET ${updates.join(", ")}
          WHERE id = $${i}
-         RETURNING id, user_id, borrow_record_id, amount, status, reason, created_at, updated_at, resolved_at,
+         RETURNING id,
+                   user_id,
+                   borrow_record_id,
+                   damage_report_id,
+                   amount,
+                   status,
+                   reason,
+                   created_at,
+                   updated_at,
+                   resolved_at,
                    NULL::text AS borrow_status,
                    NULL::date AS borrow_due_date,
                    NULL::date AS borrow_return_date,

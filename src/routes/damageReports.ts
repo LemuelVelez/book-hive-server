@@ -93,6 +93,7 @@ const upload = multer({
 type Role = "student" | "librarian" | "faculty" | "admin" | "other";
 type DamageStatus = "pending" | "assessed" | "paid";
 type Severity = "minor" | "moderate" | "major";
+type FineStatus = "active" | "pending_verification" | "paid" | "cancelled";
 
 type SessionPayload = {
   sub: string;
@@ -257,6 +258,93 @@ function toDTO(row: DamageRowJoined) {
   };
 }
 
+/* ---------------- fine sync helper ---------------- */
+
+/**
+ * Ensure that each assessed/paid damage report with a positive fee
+ * has a matching row in the `fines` table.
+ *
+ * Linking is now done primarily using `damage_report_id`, with the
+ * legacy "Damage report #<id>: ..." reason prefix as a fallback
+ * for older rows that don't yet have damage_report_id populated.
+ *
+ * Behaviour:
+ * - If status is "pending" or fee <= 0  -> delete any existing fine.
+ * - If status is "assessed"            -> create/update fine with status "active".
+ * - If status is "paid"                -> create/update fine with status "paid".
+ */
+async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
+  const damageIdStr = String(row.id);
+  const damageIdNum = Number(row.id);
+  const userIdNum = Number(row.user_id);
+  const feeNum = Number(row.fee || 0);
+  const hasPositiveFee = Number.isFinite(feeNum) && feeNum > 0;
+  const status = row.status; // "pending" | "assessed" | "paid"
+
+  const prefix = `Damage report #${damageIdStr}:`;
+
+  // If no fine should exist, delete any previous record for this damage report.
+  if (!hasPositiveFee || status === "pending") {
+    await query(
+      `DELETE FROM fines
+       WHERE damage_report_id = $1
+          OR (damage_report_id IS NULL AND user_id = $2 AND reason LIKE $3)`,
+      [damageIdNum, userIdNum, `${prefix}%`]
+    );
+    return;
+  }
+
+  let fineStatus: FineStatus = "active";
+  if (status === "paid") {
+    fineStatus = "paid";
+  }
+
+  const details: string[] = [];
+  if (row.damage_type) details.push(row.damage_type);
+  if (row.notes) details.push(row.notes);
+  const detailStr = details.join(" – ");
+  const reason =
+    detailStr.length > 0 ? `${prefix} ${detailStr}` : `${prefix}`;
+
+  const resolvedAt =
+    fineStatus === "paid" ? new Date() : null;
+
+  // Check if a fine already exists for this damage report
+  // Prefer the explicit damage_report_id link, but fall back to legacy prefix match.
+  const existing = await query<{ id: string }>(
+    `SELECT id
+     FROM fines
+     WHERE damage_report_id = $1
+        OR (damage_report_id IS NULL AND user_id = $2 AND reason LIKE $3)
+     ORDER BY created_at ASC
+     LIMIT 1`,
+    [damageIdNum, userIdNum, `${prefix}%`]
+  );
+
+  if (!existing.rowCount) {
+    // Insert new fine with a proper damage_report_id link
+    await query(
+      `INSERT INTO fines (user_id, borrow_record_id, damage_report_id, amount, status, reason, resolved_at)
+       VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
+      [userIdNum, damageIdNum, feeNum, fineStatus, reason, resolvedAt]
+    );
+  } else {
+    // Update existing fine and ensure damage_report_id is set
+    const fid = Number(existing.rows[0].id);
+    await query(
+      `UPDATE fines
+       SET damage_report_id = $1,
+           amount = $2,
+           status = $3,
+           reason = $4,
+           resolved_at = $5,
+           updated_at = NOW()
+       WHERE id = $6`,
+      [damageIdNum, feeNum, fineStatus, reason, resolvedAt, fid]
+    );
+  }
+}
+
 /* ---------------- routes ---------------- */
 
 /**
@@ -407,6 +495,9 @@ router.post(
  * Update fields – librarian/admin only.
  * Accepts JSON OR multipart/form-data (if replacing photo with "photo" file).
  * Body/Fields: { status?, severity?, fee?, notes?, damageType?, (photo?) }
+ *
+ * When this is used via "Assess & set fine", we also sync a matching
+ * row in the `fines` table based on the updated fee + status.
  */
 router.patch(
   "/:id",
@@ -516,7 +607,21 @@ router.patch(
         [rid]
       );
 
-      const report = toDTO(joined.rows[0]);
+      if (!joined.rowCount) {
+        return res.status(404).json({ ok: false, message: "Damage report not found." });
+      }
+
+      const joinedRow = joined.rows[0];
+
+      // 🔗 keep a matching fine row in sync with this damage report
+      try {
+        await syncFineForDamageReport(joinedRow);
+      } catch (syncErr) {
+        console.error("[damage-reports] Failed to sync fine:", syncErr);
+        // Do not block the main response if fine sync fails
+      }
+
+      const report = toDTO(joinedRow);
       res.json({ ok: true, report });
     } catch (err) {
       next(err);
@@ -539,6 +644,15 @@ router.delete(
       if (!rid) {
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
+
+      // Also remove any associated fine(s)
+      const prefix = `Damage report #${rid}:`;
+      await query(
+        `DELETE FROM fines
+         WHERE damage_report_id = $1
+            OR reason LIKE $2`,
+        [rid, `${prefix}%`]
+      );
 
       const del = await query(`DELETE FROM damage_reports WHERE id = $1`, [rid]);
       if (!del.rowCount) {
