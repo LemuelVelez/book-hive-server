@@ -123,11 +123,13 @@ async function createAndSendVerifyEmail(
 
   console.log(`[verify-email] token created for user=${userId} token=${token}`);
 
-  const serverUrl = (process.env.SERVER_PUBLIC_URL || "http://localhost:5000")
+  // ✅ Use CLIENT_ORIGIN (frontend) for the link shown to users
+  const client = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
     .toString()
-    .replace(/\/+$/, ""); // <— trim trailing slash
+    .replace(/\/+$/, "");
 
-  const confirmUrl = `${serverUrl}/api/auth/verify-email/confirm?token=${encodeURIComponent(
+  // The React page /auth/verify-email/callback will read ?token= and POST to /api/auth/verify-email/confirm
+  const confirmUrl = `${client}/auth/verify-email/callback?token=${encodeURIComponent(
     token
   )}`;
 
@@ -525,6 +527,7 @@ router.post("/verify-email/confirm", async (req, res, next) => {
 });
 
 // GET /api/auth/verify-email/confirm?token=...
+// (kept for compatibility, but new emails will no longer point here directly)
 router.get("/verify-email/confirm", async (req, res, next) => {
   try {
     const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
