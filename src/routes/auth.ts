@@ -397,19 +397,22 @@ router.post("/login", async (req, res, next) => {
         .json({ ok: false, message: "Email and password are required." });
     }
 
+    const normalizedEmail = String(email).trim().toLowerCase();
+
     const found = await query<UserRow>(
       `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-      [
-        String(email)
-          .trim()
-          .toLowerCase(),
-      ]
+      [normalizedEmail]
     );
+
     if (!found.rowCount) {
-      return res
-        .status(401)
-        .json({ ok: false, message: "Invalid email or password." });
+      // ✅ Explicit "user not found" for login
+      return res.status(404).json({
+        ok: false,
+        message:
+          "We couldn't find an account with that email. Please check for typos or register first.",
+      });
     }
+
     const user = found.rows[0];
     const ok = await bcrypt.compare(String(password), user.password_hash);
     if (!ok) {
@@ -577,13 +580,13 @@ router.get("/verify-email/confirm", async (req, res, next) => {
 // POST /api/auth/forgot-password
 router.post("/forgot-password", async (req, res, next) => {
   try {
-    const email = String(req.body?.email ?? "")
-      .trim()
-      .toLowerCase();
+    const emailRaw = String(req.body?.email ?? "").trim();
+    const email = emailRaw.toLowerCase();
+
     if (!email || !email.includes("@")) {
-      return res.json({
-        ok: true,
-        message: "If that email exists, a password reset link has been sent.",
+      return res.status(400).json({
+        ok: false,
+        message: "Please enter a valid email address.",
       });
     }
 
@@ -592,22 +595,31 @@ router.post("/forgot-password", async (req, res, next) => {
       [email]
     );
 
-    if (found.rowCount) {
-      const user = found.rows[0];
-      try {
-        await createAndSendPasswordResetEmail(
-          user.id,
-          user.email,
-          user.full_name
-        );
-      } catch (e) {
-        console.warn("Failed sending reset email:", e);
-      }
+    if (!found.rowCount) {
+      // ✅ Explicit "user not found" for forgot-password flow
+      return res.status(404).json({
+        ok: false,
+        message:
+          "We couldn't find an account with that email. Please double-check or register first.",
+      });
+    }
+
+    const user = found.rows[0];
+
+    try {
+      await createAndSendPasswordResetEmail(
+        user.id,
+        user.email,
+        user.full_name
+      );
+    } catch (e) {
+      console.warn("Failed sending reset email:", e);
     }
 
     return res.json({
       ok: true,
-      message: "If that email exists, a password reset link has been sent.",
+      message:
+        "We emailed you a password reset link. Please check your inbox and spam folder.",
     });
   } catch (err) {
     next(err);
