@@ -365,11 +365,10 @@ router.post("/register", async (req, res, next) => {
     const user = ins.rows[0];
     const accountTypeNormalized = getEffectiveRole(user);
 
-    try {
-      await createAndSendVerifyEmail(user.id, user.email, user.full_name);
-    } catch (e) {
+    // 💡 Fire-and-forget: don't block the HTTP response on SMTP latency
+    createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((e) => {
       console.warn("Failed creating/sending verification email:", e);
-    }
+    });
 
     return res.status(201).json({
       ok: true,
