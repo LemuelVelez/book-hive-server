@@ -43,7 +43,7 @@
   },
   "devDependencies": {
     "dotenv-cli": "^7.4.4",
-    "node-pg-migrate": "^7.7.2",
+    "node-pg-migrate": "^7.9.1",
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.2"
   }
