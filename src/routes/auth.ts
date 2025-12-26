@@ -15,16 +15,23 @@ type UserRow = {
   full_name: string;
   email: string;
   password_hash: string;
+
   // Newer column used by the app for routing/roles
   account_type: Role;
+
   // Student metadata
   student_id: string | null;
   course: string | null;
   year_level: string | null;
+
+  // ✅ NEW: optional avatar URL
+  avatar_url: string | null;
+
   // Email verification
   is_email_verified: boolean;
   created_at: string;
   updated_at: string;
+
   // Legacy column from the original schema (may still hold librarian/admin/etc)
   role?: Role;
 };
@@ -241,6 +248,7 @@ router.get("/me", async (req, res, next) => {
       clearSessionCookie(res);
       return res.status(401).json({ ok: false, message: "Not authenticated" });
     }
+
     const user = found.rows[0];
     const accountType = getEffectiveRole(user);
 
@@ -252,6 +260,14 @@ router.get("/me", async (req, res, next) => {
         fullName: user.full_name,
         accountType,
         isEmailVerified: user.is_email_verified,
+
+        // ✅ include registration/profile info (helps settings page)
+        studentId: user.student_id,
+        course: user.course,
+        yearLevel: user.year_level,
+
+        // ✅ NEW: avatar url
+        avatarUrl: user.avatar_url,
       },
     });
   } catch (err) {
@@ -276,6 +292,7 @@ router.post("/register", async (req, res, next) => {
       studentId,
       course,
       yearLevel,
+      avatarUrl, // ✅ optional
     } = req.body || {};
 
     if (!fullName || !email || !password || !accountType) {
@@ -304,6 +321,18 @@ router.post("/register", async (req, res, next) => {
       return res
         .status(400)
         .json({ ok: false, message: "Invalid account type." });
+    }
+
+    // Validate avatarUrl if provided
+    let avatarUrlVal: string | null = null;
+    if (avatarUrl !== undefined && avatarUrl !== null) {
+      if (typeof avatarUrl !== "string") {
+        return res
+          .status(400)
+          .json({ ok: false, message: "avatarUrl must be a string." });
+      }
+      const trimmed = avatarUrl.trim();
+      avatarUrlVal = trimmed.length ? trimmed : null;
     }
 
     const emailDupe = await query<UserRow>(
@@ -348,8 +377,8 @@ router.post("/register", async (req, res, next) => {
 
     const ins = await query<UserRow>(
       `INSERT INTO users
-       (full_name, email, password_hash, account_type, student_id, course, year_level)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       (full_name, email, password_hash, account_type, student_id, course, year_level, avatar_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        RETURNING *`,
       [
         String(fullName).trim(),
@@ -361,6 +390,7 @@ router.post("/register", async (req, res, next) => {
         studentIdVal,
         courseVal,
         yearLevelVal,
+        avatarUrlVal,
       ]
     );
 
@@ -380,6 +410,14 @@ router.post("/register", async (req, res, next) => {
         fullName: user.full_name,
         accountType: accountTypeNormalized,
         isEmailVerified: user.is_email_verified,
+
+        // ✅ include registration/profile info
+        studentId: user.student_id,
+        course: user.course,
+        yearLevel: user.year_level,
+
+        // ✅ NEW
+        avatarUrl: user.avatar_url,
       },
     });
   } catch (err) {
@@ -446,6 +484,14 @@ router.post("/login", async (req, res, next) => {
         fullName: user.full_name,
         accountType,
         isEmailVerified: user.is_email_verified,
+
+        // ✅ include registration/profile info
+        studentId: user.student_id,
+        course: user.course,
+        yearLevel: user.year_level,
+
+        // ✅ NEW
+        avatarUrl: user.avatar_url,
       },
     });
   } catch (err) {
