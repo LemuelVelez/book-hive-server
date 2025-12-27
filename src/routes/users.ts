@@ -3,6 +3,9 @@ import jwt from "jsonwebtoken";
 import { query } from "../db";
 import multer from "multer";
 import { uploadImageToS3 } from "../s3";
+import * as bcrypt from "bcryptjs";
+import crypto from "crypto";
+import { sendMail } from "../email";
 
 const router = express.Router();
 
@@ -32,6 +35,20 @@ type UserRow = {
   /** optional timestamps */
   created_at?: string;
   updated_at?: string;
+};
+
+type UserAuthRow = {
+  id: string;
+  email: string;
+  full_name: string;
+  password_hash: string;
+  account_type: Role;
+  role?: Role | null;
+  student_id?: string | null;
+  course?: string | null;
+  year_level?: string | null;
+  is_email_verified?: boolean;
+  avatar_url?: string | null;
 };
 
 type SessionPayload = {
@@ -121,7 +138,9 @@ function requireRole(roles: Role[]) {
         [s.sub]
       );
       if (!r.rowCount) {
-        return res.status(401).json({ ok: false, message: "Not authenticated." });
+        return res
+          .status(401)
+          .json({ ok: false, message: "Not authenticated." });
       }
       const effective = computeEffectiveRoleFromRow(r.rows[0]);
       if (!roles.includes(effective)) {
@@ -144,6 +163,67 @@ function cleanOptionalText(v: unknown): string | null {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
   return s.length ? s : null;
+}
+
+function isValidEmail(email: string) {
+  const s = String(email || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+function escapeHtml(input: string) {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function invalidateEmailVerificationTokens(userId: string) {
+  // Mark all unused tokens used so only the newest can be used.
+  await query(
+    `UPDATE email_verifications
+     SET used = TRUE
+     WHERE user_id = $1 AND used = FALSE`,
+    [userId]
+  );
+}
+
+async function createAndSendVerifyEmail(userId: string, email: string, fullName?: string) {
+  // Invalidate existing unused tokens first
+  await invalidateEmailVerificationTokens(userId);
+
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+
+  await query(
+    `INSERT INTO email_verifications (user_id, token, expires_at)
+     VALUES ($1, $2, $3)`,
+    [userId, token, expiresAt]
+  );
+
+  const client = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .toString()
+    .replace(/\/+$/, "");
+
+  const confirmUrl = `${client}/auth/verify-email/callback?token=${encodeURIComponent(token)}`;
+
+  const safeName =
+    fullName && fullName.trim().length > 0 ? escapeHtml(fullName.trim()) : "there";
+
+  const html = `
+    <p>Hi ${safeName},</p>
+    <p>Please verify your email for <strong>JRMSU-TC Book-Hive</strong> by clicking the link below:</p>
+    <p><a href="${confirmUrl}">${confirmUrl}</a></p>
+    <hr/>
+    <p>If you didn’t request this, please ignore this message.</p>
+  `;
+
+  await sendMail({
+    to: email,
+    subject: "Verify your email • JRMSU-TC Book-Hive",
+    html,
+  });
 }
 
 function toMeDTO(row: UserRow) {
@@ -174,6 +254,19 @@ async function fetchMeRow(userId: string) {
   );
 }
 
+async function fetchMeAuthRow(userId: string) {
+  return await query<UserAuthRow>(
+    `SELECT id, email, full_name, password_hash, account_type, role,
+            student_id, course, year_level,
+            is_email_verified,
+            avatar_url
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+}
+
 /* ---------------- Avatar upload (multer) ---------------- */
 
 const avatarUpload = multer({
@@ -190,11 +283,12 @@ const avatarUpload = multer({
 /**
  * PATCH /api/users/me
  * Update personal info for the current user.
- * Body: { fullName?, course?, yearLevel? }
+ * Body: { fullName?, email?, course?, yearLevel? }
  *
- * Notes:
- * - Email is not editable here.
- * - studentId is NOT editable here (safer due to uniqueness + audit).
+ * IMPORTANT CHANGE:
+ * ✅ We NO LONGER auto-send verification email here (prevents duplicates).
+ * ✅ We only mark email unverified + invalidate old tokens.
+ * Verification email is now MANUAL via POST /api/users/me/verify-email.
  */
 router.patch("/me", requireAuth, async (req, res, next) => {
   try {
@@ -209,12 +303,15 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     const effectiveRole = computeEffectiveRoleFromRow(row);
 
     const fullNameRaw = req.body?.fullName;
+    const emailRaw = req.body?.email;
     const courseRaw = req.body?.course;
     const yearLevelRaw = req.body?.yearLevel;
 
     const updates: string[] = [];
     const values: any[] = [];
     let i = 1;
+
+    let emailChanged = false;
 
     if (fullNameRaw !== undefined) {
       const fullName = String(fullNameRaw || "").trim();
@@ -223,6 +320,37 @@ router.patch("/me", requireAuth, async (req, res, next) => {
       }
       updates.push(`full_name = $${i++}`);
       values.push(fullName);
+    }
+
+    if (emailRaw !== undefined) {
+      const nextEmailRaw = String(emailRaw || "").trim();
+      if (!nextEmailRaw) {
+        return res.status(400).json({ ok: false, message: "email cannot be empty." });
+      }
+      if (!isValidEmail(nextEmailRaw)) {
+        return res.status(400).json({ ok: false, message: "Invalid email address." });
+      }
+
+      const nextEmail = nextEmailRaw.toLowerCase();
+      const currentEmail = String(row.email || "").trim().toLowerCase();
+
+      if (nextEmail !== currentEmail) {
+        const dupe = await query(
+          `SELECT 1 FROM users WHERE email = $1 AND id <> $2 LIMIT 1`,
+          [nextEmail, s.sub]
+        );
+        if (dupe.rowCount) {
+          return res.status(409).json({ ok: false, message: "Email already in use." });
+        }
+
+        emailChanged = true;
+        updates.push(`email = $${i++}`);
+        values.push(nextEmail);
+
+        // mark unverified + clear verified timestamp
+        updates.push(`is_email_verified = FALSE`);
+        updates.push(`email_verified_at = NULL`);
+      }
     }
 
     if (courseRaw !== undefined) {
@@ -255,13 +383,90 @@ router.patch("/me", requireAuth, async (req, res, next) => {
       `UPDATE users
        SET ${updates.join(", ")}
        WHERE id = $${i}`,
-      [...values, Number(s.sub)]
+      [...values, s.sub]
     );
+
+    // If email changed: invalidate all old tokens (so only future sends are valid)
+    if (emailChanged) {
+      await invalidateEmailVerificationTokens(s.sub);
+    }
 
     const refreshed = await fetchMeRow(s.sub);
     const updated = refreshed.rows[0];
 
     return res.json({ ok: true, user: toMeDTO(updated) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/users/me/verify-email
+ * Manually send a verification email for the currently logged-in user.
+ * (This prevents duplicate sends and avoids sending to arbitrary emails.)
+ */
+router.post("/me/verify-email", requireAuth, async (req, res, next) => {
+  try {
+    const s = (req as any).sessionUser as SessionPayload;
+
+    const meRow = await fetchMeRow(s.sub);
+    if (!meRow.rowCount) {
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+    const user = meRow.rows[0];
+
+    if (user.is_email_verified) {
+      return res.json({ ok: true, message: "Email is already verified." });
+    }
+
+    await createAndSendVerifyEmail(user.id, user.email, user.full_name);
+
+    return res.json({ ok: true, message: "Verification email sent." });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /api/users/me/password
+ * Change password for the current user.
+ * Body: { currentPassword, newPassword }
+ */
+router.patch("/me/password", requireAuth, async (req, res, next) => {
+  try {
+    const s = (req as any).sessionUser as SessionPayload;
+
+    const currentPassword = String(req.body?.currentPassword ?? "");
+    const newPassword = String(req.body?.newPassword ?? "");
+
+    if (!currentPassword.trim()) {
+      return res.status(400).json({ ok: false, message: "Current password is required." });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ ok: false, message: "New password must be at least 8 characters." });
+    }
+
+    const meRow = await fetchMeAuthRow(s.sub);
+    if (!meRow.rowCount) {
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+
+    const user = meRow.rows[0];
+    const ok = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ ok: false, message: "Current password is incorrect." });
+    }
+
+    const hash = await bcrypt.hash(newPassword, 10);
+
+    await query(
+      `UPDATE users
+       SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [hash, s.sub]
+    );
+
+    return res.json({ ok: true, message: "Password updated." });
   } catch (err) {
     next(err);
   }
@@ -284,7 +489,6 @@ router.post(
         return res.status(400).json({ ok: false, message: "Missing avatar file." });
       }
 
-      // Upload to S3 (folder: avatars)
       const url = await uploadImageToS3({
         buffer: req.file.buffer,
         contentType: req.file.mimetype,
@@ -295,7 +499,7 @@ router.post(
         `UPDATE users
          SET avatar_url = $1, updated_at = NOW()
          WHERE id = $2`,
-        [url, Number(s.sub)]
+        [url, s.sub]
       );
 
       const refreshed = await fetchMeRow(s.sub);
@@ -322,7 +526,7 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
       `UPDATE users
        SET avatar_url = NULL, updated_at = NOW()
        WHERE id = $1`,
-      [Number(s.sub)]
+      [s.sub]
     );
 
     const refreshed = await fetchMeRow(s.sub);
@@ -339,7 +543,6 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
 /**
  * GET /api/users
  * Read-only list of users (librarian/admin).
- * Returns: { ok:true, users: Array<{ id, email, fullName, accountType, avatarUrl }> }
  */
 router.get(
   "/",
@@ -370,7 +573,6 @@ router.get(
 
 /**
  * GET /api/users/check-student-id?studentId=...
- * (existing endpoint kept as-is)
  */
 router.get("/check-student-id", async (req, res, next) => {
   try {
