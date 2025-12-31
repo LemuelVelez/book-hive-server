@@ -570,7 +570,9 @@ router.post(
 
       const refreshed = await fetchMeRow(s.sub);
       if (!refreshed.rowCount) {
-        return res.status(401).json({ ok: false, message: "Not authenticated." });
+        return res
+          .status(401)
+          .json({ ok: false, message: "Not authenticated." });
       }
 
       return res.json({ ok: true, user: toMeDTO(refreshed.rows[0]) });
@@ -730,6 +732,65 @@ router.patch(
 );
 
 /**
+ * PATCH /api/users/:id/disapprove
+ * Disapprove a user (set to pending) so they cannot log in (librarian/admin).
+ */
+router.patch(
+  "/:id/disapprove",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const targetId = String(req.params.id || "").trim();
+
+      if (!/^\d+$/.test(targetId)) {
+        return res.status(400).json({ ok: false, message: "Invalid user id." });
+      }
+
+      const found = await query<UserRow>(
+        `SELECT id, email, full_name, account_type, role, is_approved
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [targetId]
+      );
+
+      if (!found.rowCount) {
+        return res.status(404).json({ ok: false, message: "User not found." });
+      }
+
+      const row = found.rows[0];
+      const effRole = computeEffectiveRoleFromRow(row);
+
+      if (isExemptFromApproval(effRole)) {
+        return res.status(400).json({
+          ok: false,
+          message: "This user role is exempt from approval.",
+        });
+      }
+
+      if (!row.is_approved) {
+        return res.json({ ok: true, message: "User is already pending." });
+      }
+
+      await query(
+        `UPDATE users
+         SET is_approved = FALSE,
+             approved_at = NULL,
+             approved_by = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [targetId]
+      );
+
+      return res.json({ ok: true, message: "User disapproved." });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * DELETE /api/users/:id
  * Librarian: can delete ONLY newly registered users (not approved yet) and not librarian/admin.
  * Admin: can delete any user except self (and still cannot delete self).
@@ -773,7 +834,8 @@ router.delete(
         if (row.is_approved) {
           return res.status(403).json({
             ok: false,
-            message: "Librarian can only delete newly registered (not approved) users.",
+            message:
+              "Librarian can only delete newly registered (not approved) users.",
           });
         }
         if (isExemptFromApproval(effRole)) {
