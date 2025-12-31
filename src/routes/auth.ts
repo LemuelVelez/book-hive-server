@@ -24,11 +24,17 @@ type UserRow = {
   course: string | null;
   year_level: string | null;
 
-  // ✅ NEW: optional avatar URL
+  // ✅ optional avatar URL
   avatar_url: string | null;
 
   // Email verification
   is_email_verified: boolean;
+
+  // ✅ NEW: librarian approval
+  is_approved?: boolean;
+  approved_at?: string | null;
+  approved_by?: string | null;
+
   created_at: string;
   updated_at: string;
 
@@ -231,6 +237,10 @@ function readSession(
   }
 }
 
+function isExemptFromApproval(role: Role) {
+  return role === "librarian" || role === "admin";
+}
+
 // --- Routes ---
 
 // GET /api/auth/me
@@ -261,12 +271,16 @@ router.get("/me", async (req, res, next) => {
         accountType,
         isEmailVerified: user.is_email_verified,
 
+        // ✅ NEW: approval status
+        isApproved: Boolean(user.is_approved),
+        approvedAt: user.approved_at ?? null,
+
         // ✅ include registration/profile info (helps settings page)
         studentId: user.student_id,
         course: user.course,
         yearLevel: user.year_level,
 
-        // ✅ NEW: avatar url
+        // ✅ avatar url
         avatarUrl: user.avatar_url,
       },
     });
@@ -375,10 +389,14 @@ router.post("/register", async (req, res, next) => {
 
     const hash = await bcrypt.hash(String(password), 10);
 
+    // ✅ NEW: approval logic
+    const roleForApproval = accountType as Role;
+    const approved = isExemptFromApproval(roleForApproval);
+
     const ins = await query<UserRow>(
       `INSERT INTO users
-       (full_name, email, password_hash, account_type, student_id, course, year_level, avatar_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       (full_name, email, password_hash, account_type, student_id, course, year_level, avatar_url, is_approved, approved_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        RETURNING *`,
       [
         String(fullName).trim(),
@@ -391,6 +409,8 @@ router.post("/register", async (req, res, next) => {
         courseVal,
         yearLevelVal,
         avatarUrlVal,
+        approved,
+        approved ? new Date() : null,
       ]
     );
 
@@ -410,6 +430,10 @@ router.post("/register", async (req, res, next) => {
         fullName: user.full_name,
         accountType: accountTypeNormalized,
         isEmailVerified: user.is_email_verified,
+
+        // ✅ NEW
+        isApproved: Boolean(user.is_approved),
+        approvedAt: user.approved_at ?? null,
 
         // ✅ include registration/profile info
         studentId: user.student_id,
@@ -468,6 +492,16 @@ router.post("/login", async (req, res, next) => {
 
     const accountType = getEffectiveRole(user);
 
+    // ✅ NEW: Block login until librarian approves (EXCEPT librarian/admin)
+    const approved = Boolean((user as any).is_approved);
+    if (!isExemptFromApproval(accountType) && !approved) {
+      return res.status(403).json({
+        ok: false,
+        message:
+          "Your account is pending librarian approval. Please wait for approval to log in.",
+      });
+    }
+
     const token = signSessionJWT({
       id: user.id,
       email: user.email,
@@ -484,6 +518,10 @@ router.post("/login", async (req, res, next) => {
         fullName: user.full_name,
         accountType,
         isEmailVerified: user.is_email_verified,
+
+        // ✅ NEW
+        isApproved: Boolean((user as any).is_approved),
+        approvedAt: (user as any).approved_at ?? null,
 
         // ✅ include registration/profile info
         studentId: user.student_id,

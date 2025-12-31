@@ -29,6 +29,11 @@ type UserRow = {
   // ✅ email verified (for /me response)
   is_email_verified?: boolean;
 
+  // ✅ NEW: approval
+  is_approved?: boolean;
+  approved_at?: string | null;
+  approved_by?: string | null;
+
   /** legacy column if still present in your schema */
   role?: Role | null;
 
@@ -49,6 +54,11 @@ type UserAuthRow = {
   year_level?: string | null;
   is_email_verified?: boolean;
   avatar_url?: string | null;
+
+  // ✅ NEW: approval
+  is_approved?: boolean;
+  approved_at?: string | null;
+  approved_by?: string | null;
 };
 
 type SessionPayload = {
@@ -83,6 +93,10 @@ function computeEffectiveRoleFromRow(
   if (primary && primary !== "student") return primary;
   if (primary === "student" && legacy && legacy !== "student") return legacy;
   return primary || legacy || "student";
+}
+
+function isExemptFromApproval(role: Role) {
+  return role === "librarian" || role === "admin";
 }
 
 /* ---------------- Session / guards ---------------- */
@@ -189,7 +203,11 @@ async function invalidateEmailVerificationTokens(userId: string) {
   );
 }
 
-async function createAndSendVerifyEmail(userId: string, email: string, fullName?: string) {
+async function createAndSendVerifyEmail(
+  userId: string,
+  email: string,
+  fullName?: string
+) {
   // Invalidate existing unused tokens first
   await invalidateEmailVerificationTokens(userId);
 
@@ -206,10 +224,14 @@ async function createAndSendVerifyEmail(userId: string, email: string, fullName?
     .toString()
     .replace(/\/+$/, "");
 
-  const confirmUrl = `${client}/auth/verify-email/callback?token=${encodeURIComponent(token)}`;
+  const confirmUrl = `${client}/auth/verify-email/callback?token=${encodeURIComponent(
+    token
+  )}`;
 
   const safeName =
-    fullName && fullName.trim().length > 0 ? escapeHtml(fullName.trim()) : "there";
+    fullName && fullName.trim().length > 0
+      ? escapeHtml(fullName.trim())
+      : "there";
 
   const html = `
     <p>Hi ${safeName},</p>
@@ -234,10 +256,31 @@ function toMeDTO(row: UserRow) {
     fullName: row.full_name,
     accountType,
     isEmailVerified: Boolean(row.is_email_verified),
+
+    // ✅ NEW
+    isApproved: Boolean(row.is_approved),
+    approvedAt: row.approved_at ?? null,
+
     studentId: row.student_id ?? null,
     course: row.course ?? null,
     yearLevel: row.year_level ?? null,
     avatarUrl: row.avatar_url ?? null,
+  };
+}
+
+function toUserListDTO(row: UserRow) {
+  const accountType = computeEffectiveRoleFromRow(row);
+  return {
+    id: String(row.id),
+    email: row.email,
+    fullName: row.full_name,
+    accountType,
+    avatarUrl: row.avatar_url ?? null,
+
+    // ✅ NEW
+    isApproved: Boolean(row.is_approved),
+    approvedAt: row.approved_at ?? null,
+    createdAt: row.created_at ?? null,
   };
 }
 
@@ -246,7 +289,8 @@ async function fetchMeRow(userId: string) {
     `SELECT id, email, full_name, account_type, role,
             student_id, course, year_level,
             is_email_verified,
-            avatar_url
+            avatar_url,
+            is_approved, approved_at, approved_by
      FROM users
      WHERE id = $1
      LIMIT 1`,
@@ -259,7 +303,8 @@ async function fetchMeAuthRow(userId: string) {
     `SELECT id, email, full_name, password_hash, account_type, role,
             student_id, course, year_level,
             is_email_verified,
-            avatar_url
+            avatar_url,
+            is_approved, approved_at, approved_by
      FROM users
      WHERE id = $1
      LIMIT 1`,
@@ -316,7 +361,9 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (fullNameRaw !== undefined) {
       const fullName = String(fullNameRaw || "").trim();
       if (!fullName) {
-        return res.status(400).json({ ok: false, message: "fullName cannot be empty." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "fullName cannot be empty." });
       }
       updates.push(`full_name = $${i++}`);
       values.push(fullName);
@@ -325,10 +372,14 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (emailRaw !== undefined) {
       const nextEmailRaw = String(emailRaw || "").trim();
       if (!nextEmailRaw) {
-        return res.status(400).json({ ok: false, message: "email cannot be empty." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "email cannot be empty." });
       }
       if (!isValidEmail(nextEmailRaw)) {
-        return res.status(400).json({ ok: false, message: "Invalid email address." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid email address." });
       }
 
       const nextEmail = nextEmailRaw.toLowerCase();
@@ -340,7 +391,9 @@ router.patch("/me", requireAuth, async (req, res, next) => {
           [nextEmail, s.sub]
         );
         if (dupe.rowCount) {
-          return res.status(409).json({ ok: false, message: "Email already in use." });
+          return res
+            .status(409)
+            .json({ ok: false, message: "Email already in use." });
         }
 
         emailChanged = true;
@@ -356,7 +409,9 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (courseRaw !== undefined) {
       const course = cleanOptionalText(courseRaw);
       if (effectiveRole === "student" && !course) {
-        return res.status(400).json({ ok: false, message: "course is required for students." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "course is required for students." });
       }
       updates.push(`course = $${i++}`);
       values.push(course);
@@ -374,7 +429,9 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({ ok: false, message: "No changes provided." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "No changes provided." });
     }
 
     updates.push(`updated_at = NOW()`);
@@ -440,10 +497,15 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
     const newPassword = String(req.body?.newPassword ?? "");
 
     if (!currentPassword.trim()) {
-      return res.status(400).json({ ok: false, message: "Current password is required." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Current password is required." });
     }
     if (newPassword.length < 8) {
-      return res.status(400).json({ ok: false, message: "New password must be at least 8 characters." });
+      return res.status(400).json({
+        ok: false,
+        message: "New password must be at least 8 characters.",
+      });
     }
 
     const meRow = await fetchMeAuthRow(s.sub);
@@ -454,7 +516,9 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
     const user = meRow.rows[0];
     const ok = await bcrypt.compare(currentPassword, user.password_hash);
     if (!ok) {
-      return res.status(401).json({ ok: false, message: "Current password is incorrect." });
+      return res
+        .status(401)
+        .json({ ok: false, message: "Current password is incorrect." });
     }
 
     const hash = await bcrypt.hash(newPassword, 10);
@@ -486,7 +550,9 @@ router.post(
       const s = (req as any).sessionUser as SessionPayload;
 
       if (!req.file) {
-        return res.status(400).json({ ok: false, message: "Missing avatar file." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "Missing avatar file." });
       }
 
       const url = await uploadImageToS3({
@@ -543,6 +609,7 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
 /**
  * GET /api/users
  * Read-only list of users (librarian/admin).
+ * ✅ Includes approval info to manage pending accounts.
  */
 router.get(
   "/",
@@ -551,20 +618,175 @@ router.get(
   async (_req, res, next) => {
     try {
       const result = await query<UserRow>(
-        `SELECT id, email, full_name, account_type, role, avatar_url
+        `SELECT id, email, full_name, account_type, role, avatar_url,
+                is_approved, approved_at, approved_by,
+                created_at
          FROM users
          ORDER BY created_at DESC, id DESC`
       );
 
-      const users = result.rows.map((row) => ({
-        id: String(row.id),
-        email: row.email,
-        fullName: row.full_name,
-        accountType: computeEffectiveRoleFromRow(row),
-        avatarUrl: row.avatar_url,
-      }));
+      const users = result.rows.map(toUserListDTO);
 
       res.json({ ok: true, users });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * GET /api/users/pending
+ * List users awaiting approval (librarian/admin).
+ */
+router.get(
+  "/pending",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (_req, res, next) => {
+    try {
+      const result = await query<UserRow>(
+        `SELECT id, email, full_name, account_type, role, avatar_url,
+                is_approved, approved_at, approved_by,
+                created_at
+         FROM users
+         WHERE is_approved = FALSE
+         ORDER BY created_at DESC, id DESC`
+      );
+
+      const pending = result.rows
+        .map((r) => {
+          const eff = computeEffectiveRoleFromRow(r);
+          // Don’t show exempt roles as "pending" even if data is weird
+          if (isExemptFromApproval(eff)) return null;
+          return toUserListDTO(r);
+        })
+        .filter(Boolean);
+
+      res.json({ ok: true, users: pending });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * PATCH /api/users/:id/approve
+ * Approve a user so they can log in (librarian/admin).
+ */
+router.patch(
+  "/:id/approve",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
+      const targetId = String(req.params.id || "").trim();
+
+      if (!/^\d+$/.test(targetId)) {
+        return res.status(400).json({ ok: false, message: "Invalid user id." });
+      }
+
+      const found = await query<UserRow>(
+        `SELECT id, email, full_name, account_type, role, is_approved
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [targetId]
+      );
+
+      if (!found.rowCount) {
+        return res.status(404).json({ ok: false, message: "User not found." });
+      }
+
+      const row = found.rows[0];
+      const effRole = computeEffectiveRoleFromRow(row);
+
+      if (isExemptFromApproval(effRole)) {
+        return res.status(400).json({
+          ok: false,
+          message: "This user role is exempt from approval.",
+        });
+      }
+
+      if (row.is_approved) {
+        return res.json({ ok: true, message: "User is already approved." });
+      }
+
+      await query(
+        `UPDATE users
+         SET is_approved = TRUE,
+             approved_at = NOW(),
+             approved_by = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [s.sub, targetId]
+      );
+
+      return res.json({ ok: true, message: "User approved." });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * DELETE /api/users/:id
+ * Librarian: can delete ONLY newly registered users (not approved yet) and not librarian/admin.
+ * Admin: can delete any user except self (and still cannot delete self).
+ */
+router.delete(
+  "/:id",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
+      const targetId = String(req.params.id || "").trim();
+
+      if (!/^\d+$/.test(targetId)) {
+        return res.status(400).json({ ok: false, message: "Invalid user id." });
+      }
+
+      if (String(s.sub) === targetId) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "You cannot delete your own account." });
+      }
+
+      const found = await query<UserRow>(
+        `SELECT id, email, full_name, account_type, role, is_approved
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [targetId]
+      );
+
+      if (!found.rowCount) {
+        return res.status(404).json({ ok: false, message: "User not found." });
+      }
+
+      const row = found.rows[0];
+      const effRole = computeEffectiveRoleFromRow(row);
+
+      // Librarian restriction: only delete NOT approved + NOT exempt
+      if (s.role === "librarian") {
+        if (row.is_approved) {
+          return res.status(403).json({
+            ok: false,
+            message: "Librarian can only delete newly registered (not approved) users.",
+          });
+        }
+        if (isExemptFromApproval(effRole)) {
+          return res.status(403).json({
+            ok: false,
+            message: "Cannot delete librarian/admin accounts.",
+          });
+        }
+      }
+
+      await query(`DELETE FROM users WHERE id = $1`, [targetId]);
+
+      return res.json({ ok: true, message: "User deleted." });
     } catch (err) {
       next(err);
     }
