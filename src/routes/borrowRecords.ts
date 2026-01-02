@@ -1,3 +1,4 @@
+// src/routes/borrowRecords.ts
 import express from "express";
 import jwt from "jsonwebtoken";
 import { pool, query } from "../db";
@@ -23,8 +24,8 @@ type SessionPayload = {
 
 type UserRoleRow = {
   id: string;
-  account_type: Role;
-  role?: Role | null;
+  account_type: any;
+  role?: any | null;
 };
 
 type BorrowRowJoined = {
@@ -92,14 +93,34 @@ function requireAuth(
   next();
 }
 
+/**
+ * ✅ FIX: normalize role strings coming from DB (account_type / role)
+ * so values like "Student" / "Faculty" / "Guest" don't break authorization.
+ */
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
-  const primary = (row.account_type || "student") as Role;
-  const legacy = (row.role as Role | null) || undefined;
+  const primary = normalizeRole(row.account_type ?? "student");
+  const legacy = row.role != null ? normalizeRole(row.role) : undefined;
 
-  if (primary && primary !== "student") return primary;
-  if (primary === "student" && legacy && legacy !== "student") return legacy;
+  // Prefer a non-student, non-other primary role (e.g. faculty/guest/librarian/admin)
+  if (primary !== "student" && primary !== "other") return primary;
 
-  return primary || legacy || "student";
+  // If primary is student, allow legacy to elevate (e.g. legacy faculty/guest)
+  if (
+    primary === "student" &&
+    legacy &&
+    legacy !== "student" &&
+    legacy !== "other"
+  ) {
+    return legacy;
+  }
+
+  // If primary is "other" but legacy is valid, prefer legacy (safety for messy DB values)
+  if (primary === "other" && legacy && legacy !== "other") {
+    return legacy;
+  }
+
+  // Default
+  return primary !== "other" ? primary : "student";
 }
 
 function requireRole(roles: Role[]) {
@@ -202,8 +223,7 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
 
     // ✅ Extension info
     extensionCount:
-      typeof row.extension_count === "number" &&
-        Number.isFinite(row.extension_count)
+      typeof row.extension_count === "number" && Number.isFinite(row.extension_count)
         ? row.extension_count
         : 0,
     extensionTotalDays:
@@ -419,7 +439,7 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       });
     }
 
-    // ✅ Check "returned/pending_return" BEFORE narrowing to "borrowed" (fixes TS2367)
+    // ✅ Check "returned/pending_return" BEFORE narrowing to "borrowed"
     if (current.return_date || current.status === "returned") {
       await client.query("ROLLBACK");
       return res.status(409).json({
@@ -463,12 +483,18 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       });
     }
 
+    /**
+     * ✅ FIX (YOUR 500 ERROR):
+     * Postgres can treat $1 as "unknown", and for `date + unknown` there are multiple
+     * candidate operators (date+int, date+interval) -> "operator is not unique".
+     * We force the parameter type using ::int.
+     */
     await client.query(
       `UPDATE borrow_records
-         SET due_date = due_date + $1,
+         SET due_date = due_date + ($1::int),
              extension_count = extension_count + 1,
-             extension_total_days = extension_total_days + $1,
-             last_extension_days = $1,
+             extension_total_days = extension_total_days + ($1::int),
+             last_extension_days = ($1::int),
              last_extended_at = NOW(),
              last_extension_reason = $2,
              updated_at = NOW()
@@ -950,8 +976,8 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
 
       const due = new Date(updatedRow.due_date + "T00:00:00Z");
       const end = new Date(
-        (updatedRow.return_date ||
-          new Date().toISOString().slice(0, 10)) + "T00:00:00Z"
+        (updatedRow.return_date || new Date().toISOString().slice(0, 10)) +
+        "T00:00:00Z"
       );
       const ms = Math.max(0, end.getTime() - due.getTime());
       const days = Math.floor(ms / (1000 * 60 * 60 * 24));
