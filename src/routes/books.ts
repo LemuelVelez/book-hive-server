@@ -65,6 +65,9 @@ type BookRow = {
   volume_number: string | null;
   library_area: LibraryArea | null;
 
+  // ✅ NEW: total number of copies for this title
+  number_of_copies: number;
+
   publication_year: number;
   available: boolean;
   borrow_duration_days: number | null;
@@ -288,6 +291,12 @@ function toDTO(row: BookRow) {
     copyNumber: typeof row.copy_number === "number" ? row.copy_number : null,
     volumeNumber: row.volume_number ?? "",
     libraryArea: row.library_area ?? null,
+
+    // ✅ NEW
+    numberOfCopies:
+      typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
+        ? row.number_of_copies
+        : 1,
   };
 }
 
@@ -326,6 +335,7 @@ router.get("/", async (_req, res, next) => {
               copy_number,
               volume_number,
               library_area,
+              number_of_copies,
               available,
               borrow_duration_days,
               created_at,
@@ -382,6 +392,9 @@ router.post(
         copyNumber,
         volumeNumber,
         libraryArea,
+
+        // ✅ NEW
+        numberOfCopies,
       } = req.body || {};
 
       // Map OPAC-like inputs to required legacy fields where helpful:
@@ -414,7 +427,9 @@ router.post(
       }
 
       const copyrightNum =
-        copyrightYear !== undefined && copyrightYear !== null && copyrightYear !== ""
+        copyrightYear !== undefined &&
+          copyrightYear !== null &&
+          copyrightYear !== ""
           ? Number(copyrightYear)
           : yearNum;
 
@@ -451,6 +466,19 @@ router.post(
         return res.status(400).json({
           ok: false,
           message: "copyNumber must be a positive number.",
+        });
+      }
+
+      // ✅ NEW: total number of copies for this title
+      const copiesTotal =
+        numberOfCopies !== undefined && numberOfCopies !== null && numberOfCopies !== ""
+          ? Math.floor(Number(numberOfCopies))
+          : 1;
+
+      if (!Number.isFinite(copiesTotal) || copiesTotal <= 0) {
+        return res.status(400).json({
+          ok: false,
+          message: "numberOfCopies must be a positive number.",
         });
       }
 
@@ -519,13 +547,14 @@ router.post(
              copy_number,
              volume_number,
              library_area,
+             number_of_copies,
              available,
              borrow_duration_days
            )
            VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
              $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,$25,$26,$27
+             $21,$22,$23,$24,$25,$26,$27,$28
            )
            RETURNING id,
                      title,
@@ -553,6 +582,7 @@ router.post(
                      copy_number,
                      volume_number,
                      library_area,
+                     number_of_copies,
                      available,
                      borrow_duration_days,
                      created_at,
@@ -585,6 +615,7 @@ router.post(
             copyNum,
             volumeNumber ? String(volumeNumber).trim() : null,
             libArea,
+            copiesTotal,
             availableVal,
             borrowDurationVal,
           ]
@@ -602,6 +633,80 @@ router.post(
         }
         throw err;
       }
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/books/:id/copies
+ * Add additional copies to an existing title – librarian/admin only.
+ * Body: { count: number } (also accepts copiesToAdd / numberOfCopies)
+ */
+router.post(
+  "/:id/copies",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const { count, copiesToAdd, numberOfCopies } = req.body || {};
+
+      const raw = count ?? copiesToAdd ?? numberOfCopies;
+      const inc = Math.floor(Number(raw));
+
+      if (!Number.isFinite(inc) || inc <= 0) {
+        return res.status(400).json({
+          ok: false,
+          message: "count must be a positive number.",
+        });
+      }
+
+      const result = await query<BookRow>(
+        `UPDATE books
+         SET number_of_copies = number_of_copies + $1,
+             updated_at = NOW()
+         WHERE id = $2
+         RETURNING id,
+                   title,
+                   subtitle,
+                   author,
+                   statement_of_responsibility,
+                   edition,
+                   isbn,
+                   issn,
+                   accession_number,
+                   genre,
+                   category,
+                   place_of_publication,
+                   publisher,
+                   publication_year,
+                   copyright_year,
+                   pages,
+                   physical_details,
+                   dimensions,
+                   notes,
+                   series,
+                   added_entries,
+                   barcode,
+                   call_number,
+                   copy_number,
+                   volume_number,
+                   library_area,
+                   number_of_copies,
+                   available,
+                   borrow_duration_days,
+                   created_at,
+                   updated_at`,
+        [inc, Number(id)]
+      );
+
+      if (!result.rowCount) {
+        return res.status(404).json({ ok: false, message: "Book not found." });
+      }
+
+      res.json({ ok: true, book: toDTO(result.rows[0]) });
     } catch (err) {
       next(err);
     }
@@ -651,7 +756,18 @@ router.patch(
         copyNumber,
         volumeNumber,
         libraryArea,
+
+        // ✅ NEW
+        numberOfCopies,
+        copiesToAdd,
       } = req.body || {};
+
+      if (numberOfCopies !== undefined && copiesToAdd !== undefined) {
+        return res.status(400).json({
+          ok: false,
+          message: "Provide either numberOfCopies OR copiesToAdd, not both.",
+        });
+      }
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -846,6 +962,32 @@ router.patch(
         values.push(libArea);
       }
 
+      // ✅ NEW: set total copies directly
+      if (numberOfCopies !== undefined) {
+        const copiesTotal = Math.floor(Number(numberOfCopies));
+        if (!Number.isFinite(copiesTotal) || copiesTotal <= 0) {
+          return res.status(400).json({
+            ok: false,
+            message: "numberOfCopies must be a positive number.",
+          });
+        }
+        updates.push(`number_of_copies = $${idx++}`);
+        values.push(copiesTotal);
+      }
+
+      // ✅ NEW: add copies incrementally
+      if (copiesToAdd !== undefined) {
+        const inc = Math.floor(Number(copiesToAdd));
+        if (!Number.isFinite(inc) || inc <= 0) {
+          return res.status(400).json({
+            ok: false,
+            message: "copiesToAdd must be a positive number.",
+          });
+        }
+        updates.push(`number_of_copies = number_of_copies + $${idx++}`);
+        values.push(inc);
+      }
+
       if (available !== undefined) {
         updates.push(`available = $${idx++}`);
         values.push(Boolean(available));
@@ -902,6 +1044,7 @@ router.patch(
                   copy_number,
                   volume_number,
                   library_area,
+                  number_of_copies,
                   available,
                   borrow_duration_days,
                   created_at,
