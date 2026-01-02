@@ -15,6 +15,8 @@ type BorrowStatus =
   | "pending_return"
   | "returned";
 
+type ExtensionRequestStatus = "none" | "pending" | "approved" | "disapproved";
+
 type SessionPayload = {
   sub: string;
   email: string;
@@ -38,12 +40,21 @@ type BorrowRowJoined = {
   status: BorrowStatus;
   fine: string | null; // NUMERIC from Postgres comes back as string
 
-  // ✅ Extension tracking
+  // ✅ Extension tracking (approved extensions)
   extension_count: number;
   extension_total_days: number;
   last_extension_days: number | null;
   last_extended_at: string | null; // timestamptz from PG -> ISO string
   last_extension_reason: string | null;
+
+  // ✅ Extension approval workflow (requested extensions)
+  extension_request_status: ExtensionRequestStatus;
+  extension_requested_days: number | null;
+  extension_requested_at: string | null;
+  extension_requested_reason: string | null;
+  extension_decided_at: string | null;
+  extension_decided_by: number | null;
+  extension_decision_note: string | null;
 
   // joined fields
   email: string | null;
@@ -185,6 +196,48 @@ async function getEffectiveRole(userId: string, fallback: Role): Promise<Role> {
   return fallback;
 }
 
+async function fetchBorrowRecordJoined(
+  recordId: number
+): Promise<BorrowRowJoined | null> {
+  const joined = await query<BorrowRowJoined>(
+    `SELECT br.id,
+            br.user_id,
+            br.book_id,
+            br.borrow_date,
+            br.due_date,
+            br.return_date,
+            br.status,
+            br.fine,
+
+            br.extension_count,
+            br.extension_total_days,
+            br.last_extension_days,
+            br.last_extended_at,
+            br.last_extension_reason,
+
+            br.extension_request_status,
+            br.extension_requested_days,
+            br.extension_requested_at,
+            br.extension_requested_reason,
+            br.extension_decided_at,
+            br.extension_decided_by,
+            br.extension_decision_note,
+
+            u.email,
+            u.student_id,
+            u.full_name,
+            b.title
+     FROM borrow_records br
+     LEFT JOIN users u ON u.id = br.user_id
+     LEFT JOIN books b ON b.id = br.book_id
+     WHERE br.id = $1
+     LIMIT 1`,
+    [recordId]
+  );
+
+  return joined.rowCount ? joined.rows[0] : null;
+}
+
 /**
  * Convert a DB row into the DTO the client expects.
  * - For borrowed/pending records: fine is computed dynamically from due_date and today.
@@ -207,6 +260,14 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     fine = computedFine;
   }
 
+  const safeReqStatus = ((): ExtensionRequestStatus => {
+    const v = String(row.extension_request_status ?? "none").toLowerCase();
+    if (v === "pending") return "pending";
+    if (v === "approved") return "approved";
+    if (v === "disapproved") return "disapproved";
+    return "none";
+  })();
+
   return {
     id: String(row.id),
     userId: String(row.user_id),
@@ -221,9 +282,10 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     status: row.status,
     fine,
 
-    // ✅ Extension info
+    // ✅ Approved extension info
     extensionCount:
-      typeof row.extension_count === "number" && Number.isFinite(row.extension_count)
+      typeof row.extension_count === "number" &&
+        Number.isFinite(row.extension_count)
         ? row.extension_count
         : 0,
     extensionTotalDays:
@@ -238,6 +300,23 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
         : null,
     lastExtendedAt: row.last_extended_at ?? null,
     lastExtensionReason: row.last_extension_reason ?? null,
+
+    // ✅ Extension request workflow info
+    extensionRequestStatus: safeReqStatus,
+    extensionRequestedDays:
+      typeof row.extension_requested_days === "number" &&
+        Number.isFinite(row.extension_requested_days)
+        ? row.extension_requested_days
+        : null,
+    extensionRequestedAt: row.extension_requested_at ?? null,
+    extensionRequestedReason: row.extension_requested_reason ?? null,
+    extensionDecidedAt: row.extension_decided_at ?? null,
+    extensionDecidedBy:
+      typeof row.extension_decided_by === "number" &&
+        Number.isFinite(row.extension_decided_by)
+        ? row.extension_decided_by
+        : null,
+    extensionDecisionNote: row.extension_decision_note ?? null,
   };
 }
 
@@ -264,11 +343,21 @@ router.get(
                 br.return_date,
                 br.status,
                 br.fine,
+
                 br.extension_count,
                 br.extension_total_days,
                 br.last_extension_days,
                 br.last_extended_at,
                 br.last_extension_reason,
+
+                br.extension_request_status,
+                br.extension_requested_days,
+                br.extension_requested_at,
+                br.extension_requested_reason,
+                br.extension_decided_at,
+                br.extension_decided_by,
+                br.extension_decision_note,
+
                 u.email,
                 u.student_id,
                 u.full_name,
@@ -306,11 +395,21 @@ router.get("/my", requireAuth, async (req, res, next) => {
               br.return_date,
               br.status,
               br.fine,
+
               br.extension_count,
               br.extension_total_days,
               br.last_extension_days,
               br.last_extended_at,
               br.last_extension_reason,
+
+              br.extension_request_status,
+              br.extension_requested_days,
+              br.extension_requested_at,
+              br.extension_requested_reason,
+              br.extension_decided_at,
+              br.extension_decided_by,
+              br.extension_decision_note,
+
               u.email,
               u.student_id,
               u.full_name,
@@ -332,8 +431,10 @@ router.get("/my", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/borrow-records/:id/extend
- * Student/Guest/Faculty can request an extension (self-service) that immediately
- * extends the due date by N days.
+ *
+ * ✅ NEW BEHAVIOR:
+ * - student/guest/faculty: creates an extension REQUEST (pending) for librarian/admin approval.
+ * - librarian/admin: can directly extend immediately (auto-approved).
  *
  * Body: { days: number, reason?: string }
  * Also accepts: { extendDays } / { additionalDays }
@@ -342,6 +443,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
  * - Must be the owner of the borrow record (unless librarian/admin).
  * - Only allowed when status is "borrowed".
  * - Cannot extend returned / pending_return records.
+ * - Cannot create a new request if one is already pending.
  * - Optional caps:
  *   - BORROW_EXTENSION_MAX_DAYS_PER_REQUEST (default 30)
  *   - BORROW_EXTENSION_MAX_TOTAL_DAYS (default 30)
@@ -351,6 +453,7 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
   try {
     const session = (req as any).sessionUser as SessionPayload;
     const effectiveRole = await getEffectiveRole(session.sub, session.role);
+    const isAdminLike = effectiveRole === "librarian" || effectiveRole === "admin";
 
     const { id } = req.params;
     const rid = Number(id);
@@ -364,7 +467,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       (req.body || {}).additionalDays;
 
     const daysToExtend = Math.floor(Number(rawDays));
-
     if (!Number.isFinite(daysToExtend) || daysToExtend <= 0) {
       return res.status(400).json({
         ok: false,
@@ -403,8 +505,14 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       status: BorrowStatus;
       return_date: string | null;
       extension_total_days: number;
+      extension_request_status: ExtensionRequestStatus | null;
     }>(
-      `SELECT id, user_id, status, return_date, extension_total_days
+      `SELECT id,
+              user_id,
+              status,
+              return_date,
+              extension_total_days,
+              extension_request_status
          FROM borrow_records
          WHERE id = $1
          FOR UPDATE`,
@@ -417,27 +525,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
     }
 
     const current = cur.rows[0];
-
-    const isOwner = Number(current.user_id) === Number(session.sub);
-    const isAdminLike = effectiveRole === "librarian" || effectiveRole === "admin";
-
-    // Only student/guest/faculty can self-request (adminlike can do anything)
-    const allowedSelfRoles: Role[] = ["student", "guest", "faculty"];
-    if (!isAdminLike && !allowedSelfRoles.includes(effectiveRole)) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({
-        ok: false,
-        message: "Forbidden: your role cannot request a due date extension.",
-      });
-    }
-
-    if (!isAdminLike && !isOwner) {
-      await client.query("ROLLBACK");
-      return res.status(403).json({
-        ok: false,
-        message: "Forbidden: cannot extend a record you do not own.",
-      });
-    }
 
     // ✅ Check "returned/pending_return" BEFORE narrowing to "borrowed"
     if (current.return_date || current.status === "returned") {
@@ -456,7 +543,7 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       });
     }
 
-    // Only borrowed can be extended
+    // Only borrowed can be extended / requested
     if (current.status !== "borrowed") {
       await client.query("ROLLBACK");
       return res.status(409).json({
@@ -483,11 +570,73 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       });
     }
 
+    const isOwner = Number(current.user_id) === Number(session.sub);
+
+    if (!isAdminLike) {
+      // Only student/guest/faculty can request
+      const allowedSelfRoles: Role[] = ["student", "guest", "faculty"];
+      if (!allowedSelfRoles.includes(effectiveRole)) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message: "Forbidden: your role cannot request a due date extension.",
+        });
+      }
+
+      if (!isOwner) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message: "Forbidden: cannot extend a record you do not own.",
+        });
+      }
+
+      const reqStatus = String(current.extension_request_status ?? "none").toLowerCase();
+      if (reqStatus === "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "An extension request is already pending for this record.",
+        });
+      }
+
+      // Create/overwrite a request as pending
+      await client.query(
+        `UPDATE borrow_records
+           SET extension_request_status = 'pending',
+               extension_requested_days = ($1::int),
+               extension_requested_at = NOW(),
+               extension_requested_reason = $2,
+               extension_decided_at = NULL,
+               extension_decided_by = NULL,
+               extension_decision_note = NULL,
+               updated_at = NOW()
+         WHERE id = $3`,
+        [daysToExtend, reason, rid]
+      );
+
+      await client.query("COMMIT");
+
+      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const joinedRow = await fetchBorrowRecordJoined(rid);
+      if (!joinedRow) {
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+      const record = toDTO(joinedRow, finePerDay);
+      return res.json({
+        ok: true,
+        record,
+        message: "Extension request submitted for approval.",
+      });
+    }
+
+    // librarian/admin: immediate extend (auto-approved)
+    const decidedByNum = Number(session.sub);
+    const decidedBy = Number.isFinite(decidedByNum) ? decidedByNum : null;
+
     /**
-     * ✅ FIX (YOUR 500 ERROR):
-     * Postgres can treat $1 as "unknown", and for `date + unknown` there are multiple
-     * candidate operators (date+int, date+interval) -> "operator is not unique".
-     * We force the parameter type using ::int.
+     * ✅ FIX (avoid "operator is not unique"):
+     * Force param type using ::int for date + int
      */
     await client.query(
       `UPDATE borrow_records
@@ -497,42 +646,29 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
              last_extension_days = ($1::int),
              last_extended_at = NOW(),
              last_extension_reason = $2,
+
+             extension_request_status = 'approved',
+             extension_requested_days = ($1::int),
+             extension_requested_at = NOW(),
+             extension_requested_reason = $2,
+             extension_decided_at = NOW(),
+             extension_decided_by = $4,
+             extension_decision_note = $5,
+
              updated_at = NOW()
        WHERE id = $3`,
-      [daysToExtend, reason, rid]
+      [daysToExtend, reason, rid, decidedBy, "Approved (direct extension)"]
     );
 
     await client.query("COMMIT");
 
     const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-    const joined = await query<BorrowRowJoined>(
-      `SELECT br.id,
-              br.user_id,
-              br.book_id,
-              br.borrow_date,
-              br.due_date,
-              br.return_date,
-              br.status,
-              br.fine,
-              br.extension_count,
-              br.extension_total_days,
-              br.last_extension_days,
-              br.last_extended_at,
-              br.last_extension_reason,
-              u.email,
-              u.student_id,
-              u.full_name,
-              b.title
-       FROM borrow_records br
-       LEFT JOIN users u ON u.id = br.user_id
-       LEFT JOIN books b ON b.id = br.book_id
-       WHERE br.id = $1
-       LIMIT 1`,
-      [rid]
-    );
-
-    const record = toDTO(joined.rows[0], finePerDay);
-    res.json({ ok: true, record });
+    const joinedRow = await fetchBorrowRecordJoined(rid);
+    if (!joinedRow) {
+      return res.status(404).json({ ok: false, message: "Record not found." });
+    }
+    const record = toDTO(joinedRow, finePerDay);
+    return res.json({ ok: true, record });
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -544,6 +680,290 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
     client.release();
   }
 });
+
+/**
+ * POST /api/borrow-records/:id/extend/approve
+ * librarian/admin approves a pending extension request.
+ *
+ * Body: { note?: string }
+ */
+router.post(
+  "/:id/extend/approve",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      const session = (req as any).sessionUser as SessionPayload;
+
+      const { id } = req.params;
+      const rid = Number(id);
+      if (!rid) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
+
+      const note =
+        (req.body || {}).note !== undefined && (req.body || {}).note !== null
+          ? String((req.body || {}).note).trim()
+          : null;
+
+      const maxPerRequest = Math.floor(
+        Number(process.env.BORROW_EXTENSION_MAX_DAYS_PER_REQUEST ?? 30)
+      );
+      const maxTotal = Math.floor(
+        Number(process.env.BORROW_EXTENSION_MAX_TOTAL_DAYS ?? 30)
+      );
+
+      await client.query("BEGIN");
+
+      const cur = await client.query<{
+        id: number;
+        user_id: number;
+        status: BorrowStatus;
+        return_date: string | null;
+        extension_total_days: number;
+        extension_request_status: ExtensionRequestStatus | null;
+        extension_requested_days: number | null;
+      }>(
+        `SELECT id,
+                user_id,
+                status,
+                return_date,
+                extension_total_days,
+                extension_request_status,
+                extension_requested_days
+           FROM borrow_records
+           WHERE id = $1
+           FOR UPDATE`,
+        [rid]
+      );
+
+      if (!cur.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+
+      const current = cur.rows[0];
+
+      if (current.return_date || current.status === "returned") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "Cannot approve an extension for a returned record.",
+        });
+      }
+
+      if (current.status === "pending_return") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "Cannot approve an extension for a record pending return.",
+        });
+      }
+
+      if (current.status !== "borrowed") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "Only records with status 'borrowed' can be extended.",
+        });
+      }
+
+      const reqStatus = String(current.extension_request_status ?? "none").toLowerCase();
+      if (reqStatus !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "No pending extension request to approve for this record.",
+        });
+      }
+
+      const requestedDays = Number(current.extension_requested_days);
+      if (!Number.isFinite(requestedDays) || requestedDays <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          message: "Invalid requested extension days on this record.",
+        });
+      }
+
+      if (
+        Number.isFinite(maxPerRequest) &&
+        maxPerRequest > 0 &&
+        requestedDays > maxPerRequest
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          message: `Requested days cannot exceed ${maxPerRequest} per request.`,
+        });
+      }
+
+      const prevTotal =
+        typeof current.extension_total_days === "number" &&
+          Number.isFinite(current.extension_total_days)
+          ? current.extension_total_days
+          : 0;
+
+      if (
+        Number.isFinite(maxTotal) &&
+        maxTotal > 0 &&
+        prevTotal + requestedDays > maxTotal
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          message: `Total extensions cannot exceed ${maxTotal} days.`,
+        });
+      }
+
+      const decidedByNum = Number(session.sub);
+      const decidedBy = Number.isFinite(decidedByNum) ? decidedByNum : null;
+
+      await client.query(
+        `UPDATE borrow_records
+           SET due_date = due_date + ($1::int),
+               extension_count = extension_count + 1,
+               extension_total_days = extension_total_days + ($1::int),
+               last_extension_days = ($1::int),
+               last_extended_at = NOW(),
+               last_extension_reason = extension_requested_reason,
+
+               extension_request_status = 'approved',
+               extension_decided_at = NOW(),
+               extension_decided_by = $2,
+               extension_decision_note = $3,
+
+               updated_at = NOW()
+         WHERE id = $4`,
+        [requestedDays, decidedBy, note, rid]
+      );
+
+      await client.query("COMMIT");
+
+      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const joinedRow = await fetchBorrowRecordJoined(rid);
+      if (!joinedRow) {
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+      const record = toDTO(joinedRow, finePerDay);
+      return res.json({ ok: true, record });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * POST /api/borrow-records/:id/extend/disapprove
+ * librarian/admin disapproves a pending extension request.
+ *
+ * Body: { note?: string }
+ */
+router.post(
+  "/:id/extend/disapprove",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      const session = (req as any).sessionUser as SessionPayload;
+
+      const { id } = req.params;
+      const rid = Number(id);
+      if (!rid) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
+
+      const note =
+        (req.body || {}).note !== undefined && (req.body || {}).note !== null
+          ? String((req.body || {}).note).trim()
+          : null;
+
+      await client.query("BEGIN");
+
+      const cur = await client.query<{
+        id: number;
+        status: BorrowStatus;
+        return_date: string | null;
+        extension_request_status: ExtensionRequestStatus | null;
+      }>(
+        `SELECT id,
+                status,
+                return_date,
+                extension_request_status
+           FROM borrow_records
+           WHERE id = $1
+           FOR UPDATE`,
+        [rid]
+      );
+
+      if (!cur.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+
+      const current = cur.rows[0];
+
+      if (current.return_date || current.status === "returned") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "Cannot disapprove an extension for a returned record.",
+        });
+      }
+
+      const reqStatus = String(current.extension_request_status ?? "none").toLowerCase();
+      if (reqStatus !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "No pending extension request to disapprove for this record.",
+        });
+      }
+
+      const decidedByNum = Number(session.sub);
+      const decidedBy = Number.isFinite(decidedByNum) ? decidedByNum : null;
+
+      await client.query(
+        `UPDATE borrow_records
+           SET extension_request_status = 'disapproved',
+               extension_decided_at = NOW(),
+               extension_decided_by = $1,
+               extension_decision_note = $2,
+               updated_at = NOW()
+         WHERE id = $3`,
+        [decidedBy, note, rid]
+      );
+
+      await client.query("COMMIT");
+
+      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const joinedRow = await fetchBorrowRecordJoined(rid);
+      if (!joinedRow) {
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+      const record = toDTO(joinedRow, finePerDay);
+      return res.json({ ok: true, record });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
 
 /**
  * POST /api/borrow-records
@@ -615,33 +1035,11 @@ router.post(
 
       // Hydrate joins for DTO
       const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-      const joined = await query<BorrowRowJoined>(
-        `SELECT br.id,
-                br.user_id,
-                br.book_id,
-                br.borrow_date,
-                br.due_date,
-                br.return_date,
-                br.status,
-                br.fine,
-                br.extension_count,
-                br.extension_total_days,
-                br.last_extension_days,
-                br.last_extended_at,
-                br.last_extension_reason,
-                u.email,
-                u.student_id,
-                u.full_name,
-                b.title
-         FROM borrow_records br
-         LEFT JOIN users u ON u.id = br.user_id
-         LEFT JOIN books b ON b.id = br.book_id
-         WHERE br.id = $1
-         LIMIT 1`,
-        [ins.rows[0].id]
-      );
-
-      const record = toDTO(joined.rows[0], finePerDay);
+      const joinedRow = await fetchBorrowRecordJoined(Number(ins.rows[0].id));
+      if (!joinedRow) {
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+      const record = toDTO(joinedRow, finePerDay);
       res.status(201).json({ ok: true, record });
     } catch (err) {
       try {
@@ -746,33 +1144,11 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
     // Hydrate joins for DTO
     const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-    const joined = await query<BorrowRowJoined>(
-      `SELECT br.id,
-              br.user_id,
-              br.book_id,
-              br.borrow_date,
-              br.due_date,
-              br.return_date,
-              br.status,
-              br.fine,
-              br.extension_count,
-              br.extension_total_days,
-              br.last_extension_days,
-              br.last_extended_at,
-              br.last_extension_reason,
-              u.email,
-              u.student_id,
-              u.full_name,
-              b.title
-       FROM borrow_records br
-       LEFT JOIN users u ON u.id = br.user_id
-       LEFT JOIN books b ON b.id = br.book_id
-       WHERE br.id = $1
-       LIMIT 1`,
-      [ins.rows[0].id]
-    );
-
-    const record = toDTO(joined.rows[0], finePerDay);
+    const joinedRow = await fetchBorrowRecordJoined(Number(ins.rows[0].id));
+    if (!joinedRow) {
+      return res.status(404).json({ ok: false, message: "Record not found." });
+    }
+    const record = toDTO(joinedRow, finePerDay);
     res.status(201).json({ ok: true, record });
   } catch (err) {
     try {
@@ -947,11 +1323,21 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
                    return_date,
                    status,
                    fine,
+
                    extension_count,
                    extension_total_days,
                    last_extension_days,
                    last_extended_at,
                    last_extension_reason,
+
+                   extension_request_status,
+                   extension_requested_days,
+                   extension_requested_at,
+                   extension_requested_reason,
+                   extension_decided_at,
+                   extension_decided_by,
+                   extension_decision_note,
+
                    NULL::text AS email,
                    NULL::text AS student_id,
                    NULL::text AS full_name,
@@ -1031,33 +1417,11 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     await client.query("COMMIT");
 
     const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-    const joined = await query<BorrowRowJoined>(
-      `SELECT br.id,
-              br.user_id,
-              br.book_id,
-              br.borrow_date,
-              br.due_date,
-              br.return_date,
-              br.status,
-              br.fine,
-              br.extension_count,
-              br.extension_total_days,
-              br.last_extension_days,
-              br.last_extended_at,
-              br.last_extension_reason,
-              u.email,
-              u.student_id,
-              u.full_name,
-              b.title
-       FROM borrow_records br
-       LEFT JOIN users u ON u.id = br.user_id
-       LEFT JOIN books b ON b.id = br.book_id
-       WHERE br.id = $1
-       LIMIT 1`,
-      [rid]
-    );
-
-    const record = toDTO(joined.rows[0], finePerDay);
+    const joinedRow = await fetchBorrowRecordJoined(rid);
+    if (!joinedRow) {
+      return res.status(404).json({ ok: false, message: "Record not found." });
+    }
+    const record = toDTO(joinedRow, finePerDay);
     res.json({ ok: true, record });
   } catch (err) {
     try {
