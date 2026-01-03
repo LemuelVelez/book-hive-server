@@ -157,8 +157,14 @@ function toDTO(row: FeedbackRowJoined) {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+
+    // keep existing fields
     studentEmail: row.email,
     studentId: row.student_id,
+
+    // ✅ ADD THIS: so the UI can show full name instead of email
+    studentName: row.full_name,
+
     bookId: String(row.book_id),
     bookTitle: row.title,
     rating: Number(row.rating),
