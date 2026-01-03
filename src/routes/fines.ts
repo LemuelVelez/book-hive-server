@@ -1,15 +1,19 @@
 import express from "express";
 import jwt from "jsonwebtoken";
-import multer from "multer";
-import path from "path";
 import { query } from "../db";
-import { uploadImageToS3 } from "../s3";
 
 const router = express.Router();
 
 type Role = "student" | "librarian" | "faculty" | "admin" | "other";
 type BorrowStatus = "borrowed" | "pending" | "returned";
-type FineStatus = "active" | "pending_verification" | "paid" | "cancelled";
+
+/**
+ * Over-the-counter only:
+ * - Removed: e-wallet payment config, QR uploads, and proof uploads
+ * - Removed: student "pay" request flow (pending_verification)
+ * - Staff (librarian/admin) marks fines as paid via PATCH /api/fines/:id
+ */
+type FineStatus = "active" | "paid" | "cancelled";
 
 type SessionPayload = {
   sub: string;
@@ -46,30 +50,6 @@ type FineRowJoined = {
   student_id: string | null;
   full_name: string | null;
 };
-
-type PaymentConfigRow = {
-  id: string;
-  e_wallet_phone: string | null;
-  qr_code_url: string | null;
-};
-
-type FineProofRow = {
-  id: string;
-  fine_id: string;
-  image_url: string;
-  uploaded_by: string | null;
-  kind: string;
-  created_at: string;
-};
-
-/* ---------------- multer (for image uploads) ---------------- */
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 8 * 1024 * 1024, // 8MB max per image
-  },
-});
 
 /* ---------------- helpers ---------------- */
 
@@ -194,16 +174,6 @@ function fineToDTO(row: FineRowJoined) {
   };
 }
 
-function proofToDTO(row: FineProofRow) {
-  return {
-    id: String(row.id),
-    fineId: String(row.fine_id),
-    imageUrl: row.image_url,
-    kind: row.kind,
-    uploadedAt: row.created_at,
-  };
-}
-
 const BASE_SELECT = `
   SELECT
     f.id,
@@ -236,35 +206,31 @@ const BASE_SELECT = `
  * GET /api/fines/my
  * List fines for the current authenticated user.
  */
-router.get(
-  "/my",
-  requireAuth,
-  async (req, res, next) => {
-    try {
-      const s = (req as any).sessionUser as SessionPayload;
-      const userId = Number(s.sub);
+router.get("/my", requireAuth, async (req, res, next) => {
+  try {
+    const s = (req as any).sessionUser as SessionPayload;
+    const userId = Number(s.sub);
 
-      const result = await query<FineRowJoined>(
-        `${BASE_SELECT}
-         WHERE f.user_id = $1
-         ORDER BY f.status, f.created_at DESC`,
-        [userId]
-      );
+    const result = await query<FineRowJoined>(
+      `${BASE_SELECT}
+       WHERE f.user_id = $1
+       ORDER BY f.status, f.created_at DESC`,
+      [userId]
+    );
 
-      const fines = result.rows.map(fineToDTO);
-      res.json({ ok: true, fines });
-    } catch (err) {
-      next(err);
-    }
+    const fines = result.rows.map(fineToDTO);
+    res.json({ ok: true, fines });
+  } catch (err) {
+    next(err);
   }
-);
+});
 
 /**
  * GET /api/fines
  * List fines (librarian/admin).
  * Optional query params:
  *   - userId: filter by user
- *   - status: active | pending_verification | paid | cancelled
+ *   - status: active | paid | cancelled
  */
 router.get(
   "/",
@@ -288,17 +254,11 @@ router.get(
 
       if (status) {
         const st = String(status).toLowerCase();
-        const allowed: FineStatus[] = [
-          "active",
-          "pending_verification",
-          "paid",
-          "cancelled",
-        ];
+        const allowed: FineStatus[] = ["active", "paid", "cancelled"];
         if (!allowed.includes(st as FineStatus)) {
           return res.status(400).json({
             ok: false,
-            message:
-              "Invalid status. Use one of: active, pending_verification, paid, cancelled.",
+            message: "Invalid status. Use one of: active, paid, cancelled.",
           });
         }
         where.push(`f.status = $${i++}`);
@@ -322,330 +282,11 @@ router.get(
   }
 );
 
-/* ---------- Global payment config (e-wallet phone + QR) ---------- */
-
-/**
- * GET /api/fines/payment-config
- * Any authenticated user can read the current library payment settings.
- */
-router.get(
-  "/payment-config",
-  requireAuth,
-  async (_req, res, next) => {
-    try {
-      const result = await query<PaymentConfigRow>(
-        `SELECT id, e_wallet_phone, qr_code_url
-         FROM library_payment_settings
-         ORDER BY id ASC
-         LIMIT 1`
-      );
-
-      const row = result.rows[0];
-      const config = row
-        ? {
-          eWalletPhone: row.e_wallet_phone,
-          qrCodeUrl: row.qr_code_url,
-        }
-        : null;
-
-      res.json({ ok: true, config });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-/**
- * POST /api/fines/payment-config
- * Librarian/admin: update global e-wallet number and/or QR code image.
- * Body (multipart/form-data):
- *   - eWalletPhone (string)
- *   - qrCode (file)
- */
-router.post(
-  "/payment-config",
-  requireAuth,
-  requireRole(["librarian", "admin"]),
-  upload.single("qrCode"),
-  async (req, res, next) => {
-    try {
-      const rawPhone =
-        typeof req.body?.eWalletPhone === "string"
-          ? req.body.eWalletPhone
-          : "";
-      const phoneNormalized = rawPhone.trim() || null;
-
-      let qrUrl: string | undefined;
-      const file = req.file;
-
-      if (file) {
-        const ext =
-          path.extname(file.originalname || "").toLowerCase() || undefined;
-        qrUrl = await uploadImageToS3({
-          buffer: file.buffer,
-          contentType: file.mimetype || "image/png",
-          folder: "payment-qr",
-          extension: ext,
-        });
-      }
-
-      const existing = await query<PaymentConfigRow>(
-        `SELECT id, e_wallet_phone, qr_code_url
-         FROM library_payment_settings
-         ORDER BY id ASC
-         LIMIT 1`
-      );
-
-      let row: PaymentConfigRow;
-
-      if (!existing.rowCount) {
-        // INSERT: 2 placeholders, 2 parameters ✅
-        const insert = await query<PaymentConfigRow>(
-          `INSERT INTO library_payment_settings (e_wallet_phone, qr_code_url)
-           VALUES ($1, $2)
-           RETURNING id, e_wallet_phone, qr_code_url`,
-          [phoneNormalized, qrUrl ?? null]
-        );
-        row = insert.rows[0];
-      } else {
-        const current = existing.rows[0];
-        const nextPhone =
-          phoneNormalized !== null ? phoneNormalized : current.e_wallet_phone;
-        const nextQr =
-          qrUrl !== undefined ? qrUrl : current.qr_code_url;
-
-        // UPDATE: 3 placeholders, 3 parameters ✅
-        const update = await query<PaymentConfigRow>(
-          `UPDATE library_payment_settings
-           SET e_wallet_phone = $1,
-               qr_code_url = $2,
-               updated_at = NOW()
-           WHERE id = $3
-           RETURNING id, e_wallet_phone, qr_code_url`,
-          [nextPhone, nextQr, current.id]
-        );
-        row = update.rows[0];
-      }
-
-      const config = {
-        eWalletPhone: row.e_wallet_phone,
-        qrCodeUrl: row.qr_code_url,
-      };
-
-      res.json({ ok: true, config });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-/* ---------- Fine proofs: student payment screenshots ---------- */
-
-/**
- * GET /api/fines/:id/proofs
- * List proof images for a fine.
- * - Allowed for the fine owner (student) or librarian/admin.
- */
-router.get(
-  "/:id/proofs",
-  requireAuth,
-  async (req, res, next) => {
-    try {
-      const { id } = req.params;
-      const fid = Number(id);
-      if (!fid) {
-        return res.status(400).json({ ok: false, message: "Invalid id." });
-      }
-
-      const s = (req as any).sessionUser as SessionPayload;
-      const userId = Number(s.sub);
-
-      const fineResult = await query<{ user_id: string }>(
-        `SELECT user_id FROM fines WHERE id = $1 LIMIT 1`,
-        [fid]
-      );
-
-      if (!fineResult.rowCount) {
-        return res.status(404).json({ ok: false, message: "Fine not found." });
-      }
-
-      const fineOwnerId = Number(fineResult.rows[0].user_id);
-      const role = normalizeRole(s.role);
-
-      const isOwner = fineOwnerId === userId;
-      const isStaff = role === "librarian" || role === "admin";
-
-      if (!isOwner && !isStaff) {
-        return res.status(403).json({ ok: false, message: "Forbidden." });
-      }
-
-      const proofsResult = await query<FineProofRow>(
-        `SELECT id, fine_id, image_url, uploaded_by, kind, created_at
-         FROM fine_proofs
-         WHERE fine_id = $1
-         ORDER BY created_at ASC`,
-        [fid]
-      );
-
-      const proofs = proofsResult.rows.map(proofToDTO);
-      res.json({ ok: true, proofs });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-/**
- * POST /api/fines/:id/proofs
- * Upload a proof image (student payment screenshot).
- * - Allowed for the fine owner (student) or librarian/admin.
- * - Uses Amazon S3 for storage.
- */
-router.post(
-  "/:id/proofs",
-  requireAuth,
-  upload.single("image"),
-  async (req, res, next) => {
-    try {
-      const { id } = req.params;
-      const fid = Number(id);
-      if (!fid) {
-        return res.status(400).json({ ok: false, message: "Invalid id." });
-      }
-
-      const file = req.file;
-      if (!file) {
-        return res
-          .status(400)
-          .json({ ok: false, message: "No image file provided." });
-      }
-
-      const s = (req as any).sessionUser as SessionPayload;
-      const userId = Number(s.sub);
-
-      const fineResult = await query<{ user_id: string }>(
-        `SELECT user_id FROM fines WHERE id = $1 LIMIT 1`,
-        [fid]
-      );
-
-      if (!fineResult.rowCount) {
-        return res.status(404).json({ ok: false, message: "Fine not found." });
-      }
-
-      const fineOwnerId = Number(fineResult.rows[0].user_id);
-      const role = normalizeRole(s.role);
-
-      const isOwner = fineOwnerId === userId;
-      const isStaff = role === "librarian" || role === "admin";
-
-      if (!isOwner && !isStaff) {
-        return res.status(403).json({ ok: false, message: "Forbidden." });
-      }
-
-      const kindRaw =
-        typeof req.body?.kind === "string" ? req.body.kind.trim() : "";
-      const kind = kindRaw || "student_payment";
-
-      const ext =
-        path.extname(file.originalname || "").toLowerCase() || undefined;
-      const imageUrl = await uploadImageToS3({
-        buffer: file.buffer,
-        contentType: file.mimetype || "image/png",
-        folder: "fines/proofs",
-        extension: ext,
-      });
-
-      const insert = await query<FineProofRow>(
-        `INSERT INTO fine_proofs (fine_id, image_url, uploaded_by, kind)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, fine_id, image_url, uploaded_by, kind, created_at`,
-        [fid, imageUrl, Number.isFinite(userId) ? userId : null, kind]
-      );
-
-      const proof = proofToDTO(insert.rows[0]);
-      res.json({ ok: true, proof });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-/**
- * POST /api/fines/:id/pay
- * Student action: request payment of their own active fine.
- * - Only the fine owner can call this.
- * - Only works when status === 'active'.
- * - Sets status to 'pending_verification'.
- */
-router.post(
-  "/:id/pay",
-  requireAuth,
-  async (req, res, next) => {
-    try {
-      const { id } = req.params;
-      const fid = Number(id);
-      if (!fid) {
-        return res.status(400).json({ ok: false, message: "Invalid id." });
-      }
-
-      const s = (req as any).sessionUser as SessionPayload;
-      const userId = Number(s.sub);
-
-      // Ensure fine exists and belongs to user
-      const existing = await query<FineRowJoined>(
-        `${BASE_SELECT}
-         WHERE f.id = $1 AND f.user_id = $2
-         LIMIT 1`,
-        [fid, userId]
-      );
-
-      if (!existing.rowCount) {
-        return res.status(404).json({ ok: false, message: "Fine not found." });
-      }
-
-      const row = existing.rows[0];
-      if (row.status !== "active") {
-        return res.status(400).json({
-          ok: false,
-          message: "Only active fines can be paid.",
-        });
-      }
-
-      // Update status to pending_verification
-      await query(
-        `UPDATE fines
-         SET status = 'pending_verification',
-             updated_at = NOW(),
-             resolved_at = NULL
-         WHERE id = $1 AND user_id = $2`,
-        [fid, userId]
-      );
-
-      // Hydrate with joins and return DTO
-      const joined = await query<FineRowJoined>(
-        `${BASE_SELECT}
-         WHERE f.id = $1
-         LIMIT 1`,
-        [fid]
-      );
-
-      if (!joined.rowCount) {
-        return res.status(404).json({ ok: false, message: "Fine not found." });
-      }
-
-      const fine = fineToDTO(joined.rows[0]);
-      res.json({ ok: true, fine });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
 /**
  * PATCH /api/fines/:id
  * Update a fine (librarian/admin).
  * Body: { status?, amount?, reason? }
- * - status: active | pending_verification | paid | cancelled
+ * - status: active | paid | cancelled
  * - amount: updated fine amount (>= 0)
  * - reason: optional description / note
  *
@@ -690,17 +331,11 @@ router.patch(
 
       if (status !== undefined) {
         const st = String(status).toLowerCase();
-        const allowed: FineStatus[] = [
-          "active",
-          "pending_verification",
-          "paid",
-          "cancelled",
-        ];
+        const allowed: FineStatus[] = ["active", "paid", "cancelled"];
         if (!allowed.includes(st as FineStatus)) {
           return res.status(400).json({
             ok: false,
-            message:
-              "Invalid status. Use one of: active, pending_verification, paid, cancelled.",
+            message: "Invalid status. Use one of: active, paid, cancelled.",
           });
         }
         normalizedStatus = st as FineStatus;
