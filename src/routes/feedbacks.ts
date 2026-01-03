@@ -15,8 +15,8 @@ type SessionPayload = {
 
 type UserRoleRow = {
   id: string;
-  account_type: Role;
-  role?: Role | null;
+  account_type: Role | string | null;
+  role?: Role | string | null;
 };
 
 type FeedbackRowJoined = {
@@ -38,10 +38,18 @@ type FeedbackRowJoined = {
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
+
+  // Common/expected
   if (v === "student") return "student";
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
+
+  // Common synonyms / legacy values
+  if (v === "administrator") return "admin";
+  if (v === "staff") return "librarian";
+  if (v === "teacher" || v === "professor" || v === "lecturer") return "faculty";
+
   return "other";
 }
 
@@ -75,16 +83,28 @@ function requireAuth(
 }
 
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
-  const primary = (row.account_type || "student") as Role;
-  const legacy = (row.role as Role | null) || undefined;
+  const primary = normalizeRole(row.account_type);
+  const legacy = row.role != null ? normalizeRole(row.role) : undefined;
 
-  if (primary && primary !== "student") return primary;
-  if (primary === "student" && legacy && legacy !== "student") return legacy;
+  // If primary is student/other but legacy has an elevated role, honor legacy.
+  if (legacy && legacy !== "student" && (primary === "student" || primary === "other")) {
+    return legacy;
+  }
 
-  return primary || legacy || "student";
+  // Prefer primary if it’s a recognized role (student/librarian/faculty/admin)
+  if (primary !== "other") return primary;
+
+  // Fall back to legacy if it’s known
+  if (legacy) return legacy;
+
+  // Default to student (matches your previous behavior when account_type was missing)
+  return "student";
 }
 
 function requireRole(roles: Role[]) {
+  // Normalize required roles too (defensive, avoids case issues if ever passed in)
+  const required = roles.map(normalizeRole);
+
   return (
     req: express.Request,
     res: express.Response,
@@ -108,19 +128,22 @@ function requireRole(roles: Role[]) {
             .status(401)
             .json({ ok: false, message: "Not authenticated." });
         }
+
         const u = result.rows[0];
         const effectiveRole = computeEffectiveRoleFromRow(u);
-        if (!roles.includes(effectiveRole)) {
+
+        if (!required.includes(effectiveRole)) {
           console.warn("[feedbacks] Forbidden", {
             userId: s.sub,
             tokenRole: s.role,
             effectiveRole,
-            required: roles,
+            required,
           });
           return res
             .status(403)
             .json({ ok: false, message: "Forbidden: insufficient role." });
         }
+
         (req as any).sessionUser = { ...s, role: effectiveRole };
         next();
       })
@@ -208,13 +231,13 @@ router.get(
 
 /**
  * POST /api/feedbacks
- * Create a feedback – students (and optionally staff) can submit.
+ * Create a feedback – students (and staff) can submit.
  * Body: { bookId, rating (1..5), comment? }
  */
 router.post(
   "/",
   requireAuth,
-  requireRole(["student", "librarian", "admin"]),
+  requireRole(["student", "faculty", "librarian", "admin"]),
   async (req, res, next) => {
     try {
       const s = (req as any).sessionUser as SessionPayload;

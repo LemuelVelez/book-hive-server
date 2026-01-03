@@ -23,8 +23,6 @@ if (!S3_BUCKET) {
 
 const s3 = new S3Client({
   region: S3_REGION,
-  // Credentials: pulled automatically from env AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY if present,
-  // or from the hosting provider's IAM role (recommended in production).
 });
 
 function extFromMime(mime: string, fallback: string = "bin") {
@@ -52,7 +50,6 @@ function makeObjectKey(originalName: string, mime: string) {
 
 function publicUrlForKey(key: string) {
   if (S3_PUBLIC_BASE) return `${S3_PUBLIC_BASE}/${key}`;
-  // Virtual-hosted–style URL
   return `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`;
 }
 
@@ -68,9 +65,6 @@ async function uploadBufferToS3(
       Key,
       Body: buf,
       ContentType: mime,
-      // If your bucket has Object Ownership = Bucket owner enforced (recommended),
-      // ACL is disabled and should not be set. If you still use ACLs, you can uncomment:
-      // ACL: "public-read",
       CacheControl: "public, max-age=31536000, immutable",
     })
   );
@@ -78,7 +72,6 @@ async function uploadBufferToS3(
 }
 
 /* ---------------- Upload (multer) ---------------- */
-// Use memory storage; we will stream to S3.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
@@ -104,8 +97,8 @@ type SessionPayload = {
 
 type UserRoleRow = {
   id: string;
-  account_type: Role;
-  role?: Role | null;
+  account_type: Role | string | null;
+  role?: Role | string | null;
 };
 
 type DamageRowJoined = {
@@ -131,10 +124,17 @@ type DamageRowJoined = {
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
+
   if (v === "student") return "student";
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
+
+  // Synonyms / legacy
+  if (v === "administrator") return "admin";
+  if (v === "staff") return "librarian";
+  if (v === "teacher" || v === "professor" || v === "lecturer") return "faculty";
+
   return "other";
 }
 
@@ -168,14 +168,22 @@ function requireAuth(
 }
 
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
-  const primary = (row.account_type || "student") as Role;
-  const legacy = (row.role as Role | null) || undefined;
-  if (primary && primary !== "student") return primary;
-  if (primary === "student" && legacy && legacy !== "student") return legacy;
-  return primary || legacy || "student";
+  const primary = normalizeRole(row.account_type);
+  const legacy = row.role != null ? normalizeRole(row.role) : undefined;
+
+  if (legacy && legacy !== "student" && (primary === "student" || primary === "other")) {
+    return legacy;
+  }
+
+  if (primary !== "other") return primary;
+  if (legacy) return legacy;
+
+  return "student";
 }
 
 function requireRole(roles: Role[]) {
+  const required = roles.map(normalizeRole);
+
   return (
     req: express.Request,
     res: express.Response,
@@ -200,12 +208,12 @@ function requireRole(roles: Role[]) {
         }
         const u = result.rows[0];
         const effectiveRole = computeEffectiveRoleFromRow(u);
-        if (!roles.includes(effectiveRole)) {
+        if (!required.includes(effectiveRole)) {
           console.warn("[damage-reports] Forbidden", {
             userId: s.sub,
             tokenRole: s.role,
             effectiveRole,
-            required: roles,
+            required,
           });
           return res
             .status(403)
@@ -235,7 +243,6 @@ function toDTO(row: DamageRowJoined) {
         photoUrls = [String(row.photo_url)];
       }
     } catch {
-      // Legacy: plain URL string
       photoUrls = [row.photo_url];
     }
   }
@@ -260,30 +267,16 @@ function toDTO(row: DamageRowJoined) {
 
 /* ---------------- fine sync helper ---------------- */
 
-/**
- * Ensure that each assessed/paid damage report with a positive fee
- * has a matching row in the `fines` table.
- *
- * Linking is now done primarily using `damage_report_id`, with the
- * legacy "Damage report #<id>: ..." reason prefix as a fallback
- * for older rows that don't yet have damage_report_id populated.
- *
- * Behaviour:
- * - If status is "pending" or fee <= 0  -> delete any existing fine.
- * - If status is "assessed"            -> create/update fine with status "active".
- * - If status is "paid"                -> create/update fine with status "paid".
- */
 async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
   const damageIdStr = String(row.id);
   const damageIdNum = Number(row.id);
   const userIdNum = Number(row.user_id);
   const feeNum = Number(row.fee || 0);
   const hasPositiveFee = Number.isFinite(feeNum) && feeNum > 0;
-  const status = row.status; // "pending" | "assessed" | "paid"
+  const status = row.status;
 
   const prefix = `Damage report #${damageIdStr}:`;
 
-  // If no fine should exist, delete any previous record for this damage report.
   if (!hasPositiveFee || status === "pending") {
     await query(
       `DELETE FROM fines
@@ -295,22 +288,16 @@ async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
   }
 
   let fineStatus: FineStatus = "active";
-  if (status === "paid") {
-    fineStatus = "paid";
-  }
+  if (status === "paid") fineStatus = "paid";
 
   const details: string[] = [];
   if (row.damage_type) details.push(row.damage_type);
   if (row.notes) details.push(row.notes);
   const detailStr = details.join(" – ");
-  const reason =
-    detailStr.length > 0 ? `${prefix} ${detailStr}` : `${prefix}`;
+  const reason = detailStr.length > 0 ? `${prefix} ${detailStr}` : `${prefix}`;
 
-  const resolvedAt =
-    fineStatus === "paid" ? new Date() : null;
+  const resolvedAt = fineStatus === "paid" ? new Date() : null;
 
-  // Check if a fine already exists for this damage report
-  // Prefer the explicit damage_report_id link, but fall back to legacy prefix match.
   const existing = await query<{ id: string }>(
     `SELECT id
      FROM fines
@@ -322,14 +309,12 @@ async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
   );
 
   if (!existing.rowCount) {
-    // Insert new fine with a proper damage_report_id link
     await query(
       `INSERT INTO fines (user_id, borrow_record_id, damage_report_id, amount, status, reason, resolved_at)
        VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
       [userIdNum, damageIdNum, feeNum, fineStatus, reason, resolvedAt]
     );
   } else {
-    // Update existing fine and ensure damage_report_id is set
     const fid = Number(existing.rows[0].id);
     await query(
       `UPDATE fines
@@ -410,14 +395,11 @@ router.get(
 /**
  * POST /api/damage-reports
  * Create a damage report – students (and staff) can submit.
- * Accepts multipart/form-data with optional "photos" files (max 3).
- * Fields: { bookId, damageType, severity ('minor'|'moderate'|'major'), fee?, notes? }
- * - status defaults to 'pending'
  */
 router.post(
   "/",
   requireAuth,
-  requireRole(["student", "librarian", "admin"]),
+  requireRole(["student", "faculty", "librarian", "admin"]),
   upload.array("photos", 3),
   async (req, res, next) => {
     try {
@@ -455,7 +437,6 @@ router.post(
 
       const photoUrlJson = uploadedUrls.length ? JSON.stringify(uploadedUrls) : null;
 
-      // Ensure book exists
       const book = await query(`SELECT id FROM books WHERE id = $1 LIMIT 1`, [bid]);
       if (!book.rowCount) {
         return res.status(404).json({ ok: false, message: "Book not found." });
@@ -469,7 +450,6 @@ router.post(
         [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrlJson]
       );
 
-      // Hydrate joins for DTO
       const joined = await query<DamageRowJoined>(
         `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
                 u.email, u.student_id, u.full_name,
@@ -493,11 +473,6 @@ router.post(
 /**
  * PATCH /api/damage-reports/:id
  * Update fields – librarian/admin only.
- * Accepts JSON OR multipart/form-data (if replacing photo with "photo" file).
- * Body/Fields: { status?, severity?, fee?, notes?, damageType?, (photo?) }
- *
- * When this is used via "Assess & set fine", we also sync a matching
- * row in the `fines` table based on the updated fee + status.
  */
 router.patch(
   "/:id",
@@ -519,7 +494,6 @@ router.patch(
         if (!S3_BUCKET) {
           return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
         }
-        // For PATCH we still allow a single replacement image
         newPhotoUrl = await uploadBufferToS3(req.file.buffer, req.file.mimetype, req.file.originalname);
       }
 
@@ -569,7 +543,6 @@ router.patch(
       }
 
       if (newPhotoUrl !== undefined) {
-        // Store as a JSON array with a single entry for consistency
         const json = JSON.stringify([newPhotoUrl]);
         updates.push(`photo_url = $${i++}`);
         values.push(json);
@@ -594,7 +567,6 @@ router.patch(
         return res.status(404).json({ ok: false, message: "Damage report not found." });
       }
 
-      // Hydrate joins
       const joined = await query<DamageRowJoined>(
         `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
                 u.email, u.student_id, u.full_name,
@@ -613,12 +585,10 @@ router.patch(
 
       const joinedRow = joined.rows[0];
 
-      // 🔗 keep a matching fine row in sync with this damage report
       try {
         await syncFineForDamageReport(joinedRow);
       } catch (syncErr) {
         console.error("[damage-reports] Failed to sync fine:", syncErr);
-        // Do not block the main response if fine sync fails
       }
 
       const report = toDTO(joinedRow);
@@ -645,7 +615,6 @@ router.delete(
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
-      // Also remove any associated fine(s)
       const prefix = `Damage report #${rid}:`;
       await query(
         `DELETE FROM fines
