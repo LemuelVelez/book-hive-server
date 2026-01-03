@@ -1,6 +1,6 @@
 import express from "express";
 import jwt from "jsonwebtoken";
-import { query } from "../db";
+import { pool, query } from "../db"; // ✅ import pool for transactions
 
 const router = express.Router();
 
@@ -38,10 +38,8 @@ type BookRow = {
   isbn: string | null;
   issn: string | null;
 
-  // Existing field in your API (kept)
   genre: string | null;
 
-  // Newly added fields from the OPAC form
   accession_number: string | null;
   subtitle: string | null;
   statement_of_responsibility: string | null;
@@ -52,7 +50,7 @@ type BookRow = {
   copyright_year: number | null;
 
   pages: number | null;
-  physical_details: string | null; // "Other Details" in the form
+  physical_details: string | null;
   dimensions: string | null;
   notes: string | null;
   series: string | null;
@@ -65,7 +63,6 @@ type BookRow = {
   volume_number: string | null;
   library_area: LibraryArea | null;
 
-  // ✅ NEW: total number of copies for this title
   number_of_copies: number;
 
   publication_year: number;
@@ -76,6 +73,12 @@ type BookRow = {
   updated_at: string;
 };
 
+type BookRowWithCounts = BookRow & {
+  active_count?: number | null;
+  available_copies?: number | null;
+  computed_available?: boolean | null;
+};
+
 type SessionPayload = {
   sub: string;
   email: string;
@@ -83,14 +86,32 @@ type SessionPayload = {
   ev: number;
 };
 
-/**
- * Minimal shape from users table for role resolution.
- */
 type UserRoleRow = {
   id: string;
   account_type: Role;
   role?: Role | null;
 };
+
+/* ---------------- ✅ FIX TS2347: Typed DB wrappers ---------------- */
+
+type DBQueryResult<T> = { rowCount: number; rows: T[] };
+type DBQueryFn = <T = any>(
+  text: string,
+  params?: any[]
+) => Promise<DBQueryResult<T>>;
+
+type DBClient = {
+  query: DBQueryFn;
+  release: () => void;
+};
+
+type DBPool = {
+  connect: () => Promise<DBClient>;
+};
+
+// Cast untyped imports into typed wrappers (prevents TS2347)
+const dbQuery = query as unknown as DBQueryFn;
+const dbPool = pool as unknown as DBPool;
 
 /* ---------------- Role normalization helper ---------------- */
 
@@ -113,10 +134,8 @@ function normalizeLibraryArea(raw: unknown): LibraryArea | null {
   const v = String(raw).trim().toLowerCase();
   if (!v) return null;
 
-  // Accept canonical values directly
   if (LIBRARY_AREAS.has(v as LibraryArea)) return v as LibraryArea;
 
-  // Accept human labels from the screenshot UI
   const compact = v.replace(/\./g, "").replace(/\s+/g, " ").trim();
 
   if (compact.includes("general circulation")) return "general_circulation";
@@ -153,7 +172,6 @@ function readSession(req: express.Request): SessionPayload | null {
     return {
       sub: String(payload.sub),
       email: String(payload.email),
-      // Normalize so "Librarian", " librarian ", etc. all become "librarian"
       role: normalizeRole(payload.role),
       ev: Number(payload.ev) || 0,
     };
@@ -175,9 +193,6 @@ function requireAuth(
   next();
 }
 
-/**
- * Compute the effective role using the same logic as auth.ts
- */
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
   const primary = (row.account_type || "student") as Role;
   const legacy = (row.role as Role | null) || undefined;
@@ -193,9 +208,6 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
   return primary || legacy || "student";
 }
 
-/**
- * Role guard that always checks the DB for the current effective role.
- */
 function requireRole(roles: Role[]) {
   return (
     req: express.Request,
@@ -207,7 +219,7 @@ function requireRole(roles: Role[]) {
       return res.status(401).json({ ok: false, message: "Not authenticated." });
     }
 
-    query<UserRoleRow>(
+    dbQuery<UserRoleRow>(
       `SELECT id, account_type, role
        FROM users
        WHERE id = $1
@@ -240,19 +252,89 @@ function requireRole(roles: Role[]) {
         (req as any).sessionUser = { ...s, role: effectiveRole };
         next();
       })
-      .catch((err) => {
-        next(err);
-      });
+      .catch((err) => next(err));
+  };
+}
+
+/* ---------------- Copy counting helpers ---------------- */
+
+/**
+ * activeCount = borrow_records where status <> 'returned'
+ * remainingCopies = max(totalCopies - activeCount, 0)
+ * available = remainingCopies > 0
+ */
+async function computeCopyStateForBook(
+  client: DBClient,
+  bookId: number,
+  copiesTotal?: number
+): Promise<{
+  totalCopies: number;
+  activeCount: number;
+  remainingCopies: number;
+  available: boolean;
+}> {
+  const copies =
+    typeof copiesTotal === "number" &&
+      Number.isFinite(copiesTotal) &&
+      copiesTotal > 0
+      ? Math.floor(copiesTotal)
+      : 1;
+
+  const activeRes = await client.query<{ active_count: number }>(
+    `SELECT COUNT(*)::int AS active_count
+       FROM borrow_records
+       WHERE book_id = $1
+         AND status <> 'returned'`,
+    [bookId]
+  );
+
+  const active =
+    typeof activeRes.rows[0]?.active_count === "number" &&
+      Number.isFinite(activeRes.rows[0].active_count)
+      ? activeRes.rows[0].active_count
+      : 0;
+
+  const remaining = Math.max(0, copies - active);
+  return {
+    totalCopies: copies,
+    activeCount: active,
+    remainingCopies: remaining,
+    available: remaining > 0,
   };
 }
 
 /* ---------------- Mapping helper ---------------- */
 
-function toDTO(row: BookRow) {
+function toDTO(row: BookRow | BookRowWithCounts) {
+  const totalCopies =
+    typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
+      ? Math.max(1, Math.floor(row.number_of_copies))
+      : 1;
+
+  const activeCountRaw = (row as BookRowWithCounts).active_count;
+  const availableCopiesRaw = (row as BookRowWithCounts).available_copies;
+  const computedAvailableRaw = (row as BookRowWithCounts).computed_available;
+
+  const activeCount =
+    typeof activeCountRaw === "number" && Number.isFinite(activeCountRaw)
+      ? activeCountRaw
+      : null;
+
+  const remainingCopies =
+    typeof availableCopiesRaw === "number" && Number.isFinite(availableCopiesRaw)
+      ? availableCopiesRaw
+      : activeCount !== null
+        ? Math.max(0, totalCopies - activeCount)
+        : totalCopies;
+
+  const available =
+    typeof computedAvailableRaw === "boolean"
+      ? computedAvailableRaw
+      : remainingCopies > 0;
+
   return {
     id: String(row.id),
 
-    // Primary
     accessionNumber: row.accession_number ?? "",
     title: row.title,
     subtitle: row.subtitle ?? "",
@@ -262,13 +344,11 @@ function toDTO(row: BookRow) {
     isbn: row.isbn ?? "",
     issn: row.issn ?? "",
 
-    // Publication
     placeOfPublication: row.place_of_publication ?? "",
     publisher: row.publisher ?? "",
     publicationYear: row.publication_year,
     copyrightYear: row.copyright_year ?? null,
 
-    // Physical Description
     pages: typeof row.pages === "number" ? row.pages : null,
     otherDetails: row.physical_details ?? "",
     dimensions: row.dimensions ?? "",
@@ -277,71 +357,122 @@ function toDTO(row: BookRow) {
     category: row.category ?? "",
     addedEntries: row.added_entries ?? "",
 
-    // Existing (kept)
     genre: row.genre ?? "",
-    available: row.available,
+
+    // ✅ availability now reflects remaining copies
+    available,
+
     borrowDurationDays:
       typeof row.borrow_duration_days === "number"
         ? row.borrow_duration_days
         : null,
 
-    // Copy Details
     barcode: row.barcode ?? "",
     callNumber: row.call_number ?? "",
     copyNumber: typeof row.copy_number === "number" ? row.copy_number : null,
     volumeNumber: row.volume_number ?? "",
     libraryArea: row.library_area ?? null,
 
-    // ✅ NEW
-    numberOfCopies:
-      typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
-        ? row.number_of_copies
-        : 1,
+    /**
+     * ✅ numberOfCopies = remaining/available copies (deducts as users borrow)
+     * totalCopies = total inventory copies
+     * borrowedCopies = active borrows (status <> returned)
+     */
+    numberOfCopies: remainingCopies,
+    totalCopies,
+    borrowedCopies: activeCount !== null ? activeCount : undefined,
   };
 }
 
+const BOOK_RETURNING = `
+  id,
+  title,
+  subtitle,
+  author,
+  statement_of_responsibility,
+  edition,
+  isbn,
+  issn,
+  accession_number,
+  genre,
+  category,
+  place_of_publication,
+  publisher,
+  publication_year,
+  copyright_year,
+  pages,
+  physical_details,
+  dimensions,
+  notes,
+  series,
+  added_entries,
+  barcode,
+  call_number,
+  copy_number,
+  volume_number,
+  library_area,
+  number_of_copies,
+  available,
+  borrow_duration_days,
+  created_at,
+  updated_at
+`;
+
+const BOOK_RETURNING_B = `
+  b.id,
+  b.title,
+  b.subtitle,
+  b.author,
+  b.statement_of_responsibility,
+  b.edition,
+  b.isbn,
+  b.issn,
+  b.accession_number,
+  b.genre,
+  b.category,
+  b.place_of_publication,
+  b.publisher,
+  b.publication_year,
+  b.copyright_year,
+  b.pages,
+  b.physical_details,
+  b.dimensions,
+  b.notes,
+  b.series,
+  b.added_entries,
+  b.barcode,
+  b.call_number,
+  b.copy_number,
+  b.volume_number,
+  b.library_area,
+  b.number_of_copies,
+  b.available,
+  b.borrow_duration_days,
+  b.created_at,
+  b.updated_at
+`;
+
 /* ---------------- Routes ---------------- */
 
-/**
- * GET /api/books
- * Public read endpoint (no auth required).
- */
 router.get("/", async (_req, res, next) => {
   try {
-    const result = await query<BookRow>(
-      `SELECT id,
-              title,
-              subtitle,
-              author,
-              statement_of_responsibility,
-              edition,
-              isbn,
-              issn,
-              accession_number,
-              genre,
-              category,
-              place_of_publication,
-              publisher,
-              publication_year,
-              copyright_year,
-              pages,
-              physical_details,
-              dimensions,
-              notes,
-              series,
-              added_entries,
-              barcode,
-              call_number,
-              copy_number,
-              volume_number,
-              library_area,
-              number_of_copies,
-              available,
-              borrow_duration_days,
-              created_at,
-              updated_at
-       FROM books
-       ORDER BY created_at DESC, id DESC`
+    // ✅ include active borrow count so UI can show remaining copies
+    const result = await dbQuery<BookRowWithCounts>(
+      `
+      SELECT
+        ${BOOK_RETURNING_B},
+        COALESCE(active.active_count, 0)::int AS active_count,
+        GREATEST(b.number_of_copies - COALESCE(active.active_count, 0), 0)::int AS available_copies,
+        (COALESCE(active.active_count, 0) < b.number_of_copies) AS computed_available
+      FROM books b
+      LEFT JOIN (
+        SELECT book_id, COUNT(*)::int AS active_count
+        FROM borrow_records
+        WHERE status <> 'returned'
+        GROUP BY book_id
+      ) active ON active.book_id = b.id
+      ORDER BY b.created_at DESC, b.id DESC
+      `
     );
 
     const books = result.rows.map(toDTO);
@@ -351,10 +482,6 @@ router.get("/", async (_req, res, next) => {
   }
 });
 
-/**
- * POST /api/books
- * Create a book – librarian/admin only.
- */
 router.post(
   "/",
   requireAuth,
@@ -362,16 +489,13 @@ router.post(
   async (req, res, next) => {
     try {
       const {
-        // Existing inputs
         title,
         author,
         isbn,
         genre,
         publicationYear,
-        available,
         borrowDurationDays,
 
-        // New inputs based on OPAC form
         accessionNumber,
         subtitle,
         statementOfResponsibility,
@@ -393,11 +517,9 @@ router.post(
         volumeNumber,
         libraryArea,
 
-        // ✅ NEW
         numberOfCopies,
       } = req.body || {};
 
-      // Map OPAC-like inputs to required legacy fields where helpful:
       const resolvedTitle = title ? String(title).trim() : "";
       const resolvedAuthorRaw =
         author !== undefined && author !== null && String(author).trim()
@@ -469,7 +591,6 @@ router.post(
         });
       }
 
-      // ✅ NEW: total number of copies for this title
       const copiesTotal =
         numberOfCopies !== undefined && numberOfCopies !== null && numberOfCopies !== ""
           ? Math.floor(Number(numberOfCopies))
@@ -500,9 +621,6 @@ router.post(
         borrowDurationVal = Math.floor(parsed);
       }
 
-      const availableVal = typeof available === "boolean" ? available : true;
-
-      // Keep backward compatibility: if only one of genre/category is provided, mirror into the other.
       const genreVal =
         genre !== undefined && genre !== null && String(genre).trim()
           ? String(genre).trim()
@@ -519,8 +637,11 @@ router.post(
 
       const libArea = normalizeLibraryArea(libraryArea);
 
+      // ✅ Availability is governed ONLY by remaining copies, not manually set here.
+      const availableVal = true;
+
       try {
-        const ins = await query<BookRow>(
+        const ins = await dbQuery<BookRow>(
           `INSERT INTO books (
              title,
              subtitle,
@@ -556,37 +677,7 @@ router.post(
              $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
              $21,$22,$23,$24,$25,$26,$27,$28
            )
-           RETURNING id,
-                     title,
-                     subtitle,
-                     author,
-                     statement_of_responsibility,
-                     edition,
-                     isbn,
-                     issn,
-                     accession_number,
-                     genre,
-                     category,
-                     place_of_publication,
-                     publisher,
-                     publication_year,
-                     copyright_year,
-                     pages,
-                     physical_details,
-                     dimensions,
-                     notes,
-                     series,
-                     added_entries,
-                     barcode,
-                     call_number,
-                     copy_number,
-                     volume_number,
-                     library_area,
-                     number_of_copies,
-                     available,
-                     borrow_duration_days,
-                     created_at,
-                     updated_at`,
+           RETURNING ${BOOK_RETURNING}`,
           [
             resolvedTitle,
             subtitle ? String(subtitle).trim() : null,
@@ -621,7 +712,13 @@ router.post(
           ]
         );
 
-        const book = toDTO(ins.rows[0]);
+        // newly created => active_count = 0
+        const row = ins.rows[0] as BookRowWithCounts;
+        row.active_count = 0;
+        row.available_copies = copiesTotal;
+        row.computed_available = true;
+
+        const book = toDTO(row);
         res.status(201).json({ ok: true, book });
       } catch (err: any) {
         if (err && err.code === "23505") {
@@ -639,22 +736,23 @@ router.post(
   }
 );
 
-/**
- * POST /api/books/:id/copies
- * Add additional copies to an existing title – librarian/admin only.
- * Body: { count: number } (also accepts copiesToAdd / numberOfCopies)
- */
 router.post(
   "/:id/copies",
   requireAuth,
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
+    const client = await dbPool.connect();
     try {
       const { id } = req.params;
-      const { count, copiesToAdd, numberOfCopies } = req.body || {};
+      const bookId = Number(id);
 
+      const { count, copiesToAdd, numberOfCopies } = req.body || {};
       const raw = count ?? copiesToAdd ?? numberOfCopies;
       const inc = Math.floor(Number(raw));
+
+      if (!bookId) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
 
       if (!Number.isFinite(inc) || inc <= 0) {
         return res.status(400).json({
@@ -663,79 +761,82 @@ router.post(
         });
       }
 
-      const result = await query<BookRow>(
+      await client.query("BEGIN");
+
+      const updatedCopies = await client.query<BookRow>(
         `UPDATE books
-         SET number_of_copies = number_of_copies + $1,
-             updated_at = NOW()
+           SET number_of_copies = number_of_copies + $1,
+               updated_at = NOW()
          WHERE id = $2
-         RETURNING id,
-                   title,
-                   subtitle,
-                   author,
-                   statement_of_responsibility,
-                   edition,
-                   isbn,
-                   issn,
-                   accession_number,
-                   genre,
-                   category,
-                   place_of_publication,
-                   publisher,
-                   publication_year,
-                   copyright_year,
-                   pages,
-                   physical_details,
-                   dimensions,
-                   notes,
-                   series,
-                   added_entries,
-                   barcode,
-                   call_number,
-                   copy_number,
-                   volume_number,
-                   library_area,
-                   number_of_copies,
-                   available,
-                   borrow_duration_days,
-                   created_at,
-                   updated_at`,
-        [inc, Number(id)]
+         RETURNING ${BOOK_RETURNING}`,
+        [inc, bookId]
       );
 
-      if (!result.rowCount) {
+      if (!updatedCopies.rowCount) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, message: "Book not found." });
       }
 
-      res.json({ ok: true, book: toDTO(result.rows[0]) });
-    } catch (err) {
+      const rowAfterCopies = updatedCopies.rows[0];
+
+      const state = await computeCopyStateForBook(
+        client,
+        bookId,
+        rowAfterCopies.number_of_copies
+      );
+
+      const finalRes = await client.query<BookRow>(
+        `UPDATE books
+            SET available = $1,
+                updated_at = NOW()
+          WHERE id = $2
+          RETURNING ${BOOK_RETURNING}`,
+        [state.available, bookId]
+      );
+
+      await client.query("COMMIT");
+
+      const finalRow = finalRes.rows[0] as BookRowWithCounts;
+      finalRow.active_count = state.activeCount;
+      finalRow.available_copies = state.remainingCopies;
+      finalRow.computed_available = state.available;
+
+      res.json({ ok: true, book: toDTO(finalRow) });
+    } catch (err: any) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
       next(err);
+    } finally {
+      client.release();
     }
   }
 );
 
-/**
- * PATCH /api/books/:id
- * Partial update – librarian/admin only.
- */
 router.patch(
   "/:id",
   requireAuth,
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
+    const client = await dbPool.connect();
     try {
       const { id } = req.params;
+      const bookId = Number(id);
+
+      if (!bookId) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
 
       const {
-        // Existing
         title,
         author,
         isbn,
         genre,
         publicationYear,
-        available,
         borrowDurationDays,
 
-        // New
         accessionNumber,
         subtitle,
         statementOfResponsibility,
@@ -757,7 +858,6 @@ router.patch(
         volumeNumber,
         libraryArea,
 
-        // ✅ NEW
         numberOfCopies,
         copiesToAdd,
       } = req.body || {};
@@ -768,6 +868,9 @@ router.patch(
           message: "Provide either numberOfCopies OR copiesToAdd, not both.",
         });
       }
+
+      const shouldRecomputeAvailability =
+        numberOfCopies !== undefined || copiesToAdd !== undefined;
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -783,8 +886,6 @@ router.patch(
         values.push(subtitle ? String(subtitle).trim() : null);
       }
 
-      // If statementOfResponsibility is updated and author is not explicitly provided,
-      // keep author in sync for backward compatibility.
       if (statementOfResponsibility !== undefined) {
         const sor = statementOfResponsibility
           ? String(statementOfResponsibility).trim()
@@ -824,7 +925,6 @@ router.patch(
         values.push(issn ? String(issn).trim() : null);
       }
 
-      // Genre/Category: if only one is provided, mirror into the other for compatibility.
       if (category !== undefined) {
         const cat = category ? String(category).trim() : null;
         updates.push(`category = $${idx++}`);
@@ -857,7 +957,6 @@ router.patch(
         values.push(publisher ? String(publisher).trim() : null);
       }
 
-      // publicationYear is required in DB; accept copyrightYear too (OPAC-like UI).
       if (publicationYear !== undefined) {
         const yearNum = Number(publicationYear);
         if (!Number.isFinite(yearNum) || yearNum < 1000 || yearNum > 9999) {
@@ -885,7 +984,6 @@ router.patch(
         updates.push(`copyright_year = $${idx++}`);
         values.push(yearNum);
 
-        // If caller only uses copyrightYear (OPAC UI), also keep publication_year aligned.
         if (publicationYear === undefined && yearNum !== null) {
           updates.push(`publication_year = $${idx++}`);
           values.push(yearNum);
@@ -962,7 +1060,6 @@ router.patch(
         values.push(libArea);
       }
 
-      // ✅ NEW: set total copies directly
       if (numberOfCopies !== undefined) {
         const copiesTotal = Math.floor(Number(numberOfCopies));
         if (!Number.isFinite(copiesTotal) || copiesTotal <= 0) {
@@ -975,7 +1072,6 @@ router.patch(
         values.push(copiesTotal);
       }
 
-      // ✅ NEW: add copies incrementally
       if (copiesToAdd !== undefined) {
         const inc = Math.floor(Number(copiesToAdd));
         if (!Number.isFinite(inc) || inc <= 0) {
@@ -986,11 +1082,6 @@ router.patch(
         }
         updates.push(`number_of_copies = number_of_copies + $${idx++}`);
         values.push(inc);
-      }
-
-      if (available !== undefined) {
-        updates.push(`available = $${idx++}`);
-        values.push(Boolean(available));
       }
 
       if (borrowDurationDays !== undefined) {
@@ -1018,52 +1109,25 @@ router.patch(
         UPDATE books
         SET ${updates.join(", ")}
         WHERE id = $${idx}
-        RETURNING id,
-                  title,
-                  subtitle,
-                  author,
-                  statement_of_responsibility,
-                  edition,
-                  isbn,
-                  issn,
-                  accession_number,
-                  genre,
-                  category,
-                  place_of_publication,
-                  publisher,
-                  publication_year,
-                  copyright_year,
-                  pages,
-                  physical_details,
-                  dimensions,
-                  notes,
-                  series,
-                  added_entries,
-                  barcode,
-                  call_number,
-                  copy_number,
-                  volume_number,
-                  library_area,
-                  number_of_copies,
-                  available,
-                  borrow_duration_days,
-                  created_at,
-                  updated_at
+        RETURNING ${BOOK_RETURNING}
       `;
-      values.push(Number(id));
+      values.push(bookId);
 
+      await client.query("BEGIN");
+
+      let updated: BookRow;
       try {
-        const result = await query<BookRow>(sql, values);
+        const result = await client.query<BookRow>(sql, values);
+
         if (!result.rowCount) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Book not found." });
+          await client.query("ROLLBACK");
+          return res.status(404).json({ ok: false, message: "Book not found." });
         }
 
-        const book = toDTO(result.rows[0]);
-        res.json({ ok: true, book });
+        updated = result.rows[0];
       } catch (err: any) {
         if (err && err.code === "23505") {
+          await client.query("ROLLBACK");
           return res.status(409).json({
             ok: false,
             message:
@@ -1072,16 +1136,44 @@ router.patch(
         }
         throw err;
       }
-    } catch (err) {
+
+      // ✅ Always recompute availability based on remaining copies
+      const state = await computeCopyStateForBook(
+        client,
+        bookId,
+        updated.number_of_copies
+      );
+
+      const final = await client.query<BookRow>(
+        `UPDATE books
+            SET available = $1,
+                updated_at = NOW()
+          WHERE id = $2
+          RETURNING ${BOOK_RETURNING}`,
+        [state.available, bookId]
+      );
+
+      await client.query("COMMIT");
+
+      const finalRow = final.rows[0] as BookRowWithCounts;
+      finalRow.active_count = state.activeCount;
+      finalRow.available_copies = state.remainingCopies;
+      finalRow.computed_available = state.available;
+
+      res.json({ ok: true, book: toDTO(finalRow) });
+    } catch (err: any) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
       next(err);
+    } finally {
+      client.release();
     }
   }
 );
 
-/**
- * DELETE /api/books/:id
- * Remove a book – librarian/admin only.
- */
 router.delete(
   "/:id",
   requireAuth,
@@ -1090,7 +1182,7 @@ router.delete(
     try {
       const { id } = req.params;
 
-      const result = await query(`DELETE FROM books WHERE id = $1`, [
+      const result = await dbQuery(`DELETE FROM books WHERE id = $1`, [
         Number(id),
       ]);
 

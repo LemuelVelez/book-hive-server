@@ -63,6 +63,27 @@ type BorrowRowJoined = {
   title: string | null;
 };
 
+/* ---------------- ✅ FIX TS2347: Typed DB wrappers ---------------- */
+
+type DBQueryResult<T> = { rowCount: number; rows: T[] };
+type DBQueryFn = <T = any>(
+  text: string,
+  params?: any[]
+) => Promise<DBQueryResult<T>>;
+
+type DBClient = {
+  query: DBQueryFn;
+  release: () => void;
+};
+
+type DBPool = {
+  connect: () => Promise<DBClient>;
+};
+
+// Cast untyped imports into typed wrappers (prevents TS2347)
+const dbQuery = query as unknown as DBQueryFn;
+const dbPool = pool as unknown as DBPool;
+
 /* ---------------- Helpers ---------------- */
 
 function normalizeRole(raw: unknown): Role {
@@ -145,7 +166,7 @@ function requireRole(roles: Role[]) {
       return res.status(401).json({ ok: false, message: "Not authenticated." });
     }
 
-    query<UserRoleRow>(
+    dbQuery<UserRoleRow>(
       `SELECT id, account_type, role
        FROM users
        WHERE id = $1
@@ -180,7 +201,7 @@ function requireRole(roles: Role[]) {
 
 async function getEffectiveRole(userId: string, fallback: Role): Promise<Role> {
   try {
-    const roleResult = await query<UserRoleRow>(
+    const roleResult = await dbQuery<UserRoleRow>(
       `SELECT id, account_type, role
          FROM users
          WHERE id = $1
@@ -199,7 +220,7 @@ async function getEffectiveRole(userId: string, fallback: Role): Promise<Role> {
 async function fetchBorrowRecordJoined(
   recordId: number
 ): Promise<BorrowRowJoined | null> {
-  const joined = await query<BorrowRowJoined>(
+  const joined = await dbQuery<BorrowRowJoined>(
     `SELECT br.id,
             br.user_id,
             br.book_id,
@@ -238,10 +259,128 @@ async function fetchBorrowRecordJoined(
   return joined.rowCount ? joined.rows[0] : null;
 }
 
+async function fetchBorrowRecordsJoined(
+  recordIds: number[]
+): Promise<BorrowRowJoined[]> {
+  if (!recordIds.length) return [];
+  const joined = await dbQuery<BorrowRowJoined>(
+    `SELECT br.id,
+            br.user_id,
+            br.book_id,
+            br.borrow_date,
+            br.due_date,
+            br.return_date,
+            br.status,
+            br.fine,
+
+            br.extension_count,
+            br.extension_total_days,
+            br.last_extension_days,
+            br.last_extended_at,
+            br.last_extension_reason,
+
+            br.extension_request_status,
+            br.extension_requested_days,
+            br.extension_requested_at,
+            br.extension_requested_reason,
+            br.extension_decided_at,
+            br.extension_decided_by,
+            br.extension_decision_note,
+
+            u.email,
+            u.student_id,
+            u.full_name,
+            b.title
+     FROM borrow_records br
+     LEFT JOIN users u ON u.id = br.user_id
+     LEFT JOIN books b ON b.id = br.book_id
+     WHERE br.id = ANY($1::int[])
+     ORDER BY br.id ASC`,
+    [recordIds]
+  );
+  return joined.rows;
+}
+
+/**
+ * ✅ Recompute book availability based on:
+ * available = (activeBorrowCount < number_of_copies)
+ * activeBorrowCount = borrow_records where status <> 'returned'
+ */
+async function recomputeAndUpdateBookAvailability(
+  client: DBClient,
+  bookId: number
+): Promise<void> {
+  const b = await client.query<{
+    id: number;
+    number_of_copies: number | null;
+  }>(
+    `SELECT id, number_of_copies
+       FROM books
+       WHERE id = $1
+       FOR UPDATE`,
+    [bookId]
+  );
+
+  if (!b.rowCount) return;
+
+  const copies =
+    typeof b.rows[0].number_of_copies === "number" &&
+      Number.isFinite(b.rows[0].number_of_copies) &&
+      b.rows[0].number_of_copies! > 0
+      ? Math.floor(b.rows[0].number_of_copies!)
+      : 1;
+
+  const activeRes = await client.query<{ active_count: number }>(
+    `SELECT COUNT(*)::int AS active_count
+       FROM borrow_records
+       WHERE book_id = $1
+         AND status <> 'returned'`,
+    [bookId]
+  );
+
+  const active =
+    typeof activeRes.rows[0]?.active_count === "number" &&
+      Number.isFinite(activeRes.rows[0].active_count)
+      ? activeRes.rows[0].active_count
+      : 0;
+
+  const available = active < copies;
+
+  await client.query(
+    `UPDATE books
+        SET available = $1,
+            updated_at = NOW()
+      WHERE id = $2`,
+    [available, bookId]
+  );
+}
+
+/**
+ * ✅ Parse how many copies user wants to borrow in a single action.
+ * We keep DB schema unchanged by creating 1 borrow_record per copy.
+ */
+function parseBorrowQuantity(body: any): number {
+  const raw =
+    body?.quantity ??
+    body?.qty ??
+    body?.copies ??
+    body?.count ??
+    body?.copiesToBorrow;
+
+  if (raw === undefined || raw === null || raw === "") return 1;
+
+  const q = Math.floor(Number(raw));
+  if (!Number.isFinite(q) || q <= 0) return 1;
+
+  // Safety cap (optional)
+  const cap = Math.floor(Number(process.env.BORROW_MAX_COPIES_PER_ACTION ?? 10));
+  const maxAllowed = Number.isFinite(cap) && cap > 0 ? cap : 10;
+
+  return Math.min(q, maxAllowed);
+}
+
 /**
  * Convert a DB row into the DTO the client expects.
- * - For borrowed/pending records: fine is computed dynamically from due_date and today.
- * - For returned records: we prefer the stored br.fine value (what was assessed at return time).
  */
 function toDTO(row: BorrowRowJoined, finePerDay: number) {
   const due = new Date(row.due_date + "T00:00:00Z");
@@ -282,10 +421,8 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     status: row.status,
     fine,
 
-    // ✅ Approved extension info
     extensionCount:
-      typeof row.extension_count === "number" &&
-        Number.isFinite(row.extension_count)
+      typeof row.extension_count === "number" && Number.isFinite(row.extension_count)
         ? row.extension_count
         : 0,
     extensionTotalDays:
@@ -301,7 +438,6 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     lastExtendedAt: row.last_extended_at ?? null,
     lastExtensionReason: row.last_extension_reason ?? null,
 
-    // ✅ Extension request workflow info
     extensionRequestStatus: safeReqStatus,
     extensionRequestedDays:
       typeof row.extension_requested_days === "number" &&
@@ -334,7 +470,7 @@ router.get(
     try {
       const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
 
-      const result = await query<BorrowRowJoined>(
+      const result = await dbQuery<BorrowRowJoined>(
         `SELECT br.id,
                 br.user_id,
                 br.book_id,
@@ -386,7 +522,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
     const userId = Number(s.sub);
     const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
 
-    const result = await query<BorrowRowJoined>(
+    const result = await dbQuery<BorrowRowJoined>(
       `SELECT br.id,
               br.user_id,
               br.book_id,
@@ -431,25 +567,10 @@ router.get("/my", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/borrow-records/:id/extend
- *
- * ✅ NEW BEHAVIOR:
- * - student/guest/faculty: creates an extension REQUEST (pending) for librarian/admin approval.
- * - librarian/admin: can directly extend immediately (auto-approved).
- *
- * Body: { days: number, reason?: string }
- * Also accepts: { extendDays } / { additionalDays }
- *
- * Rules:
- * - Must be the owner of the borrow record (unless librarian/admin).
- * - Only allowed when status is "borrowed".
- * - Cannot extend returned / pending_return records.
- * - Cannot create a new request if one is already pending.
- * - Optional caps:
- *   - BORROW_EXTENSION_MAX_DAYS_PER_REQUEST (default 30)
- *   - BORROW_EXTENSION_MAX_TOTAL_DAYS (default 30)
+ * (unchanged)
  */
 router.post("/:id/extend", requireAuth, async (req, res, next) => {
-  const client = await pool.connect();
+  const client = await dbPool.connect();
   try {
     const session = (req as any).sessionUser as SessionPayload;
     const effectiveRole = await getEffectiveRole(session.sub, session.role);
@@ -526,7 +647,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
 
     const current = cur.rows[0];
 
-    // ✅ Check "returned/pending_return" BEFORE narrowing to "borrowed"
     if (current.return_date || current.status === "returned") {
       await client.query("ROLLBACK");
       return res.status(409).json({
@@ -543,7 +663,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       });
     }
 
-    // Only borrowed can be extended / requested
     if (current.status !== "borrowed") {
       await client.query("ROLLBACK");
       return res.status(409).json({
@@ -573,7 +692,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
     const isOwner = Number(current.user_id) === Number(session.sub);
 
     if (!isAdminLike) {
-      // Only student/guest/faculty can request
       const allowedSelfRoles: Role[] = ["student", "guest", "faculty"];
       if (!allowedSelfRoles.includes(effectiveRole)) {
         await client.query("ROLLBACK");
@@ -600,7 +718,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
         });
       }
 
-      // Create/overwrite a request as pending
       await client.query(
         `UPDATE borrow_records
            SET extension_request_status = 'pending',
@@ -630,14 +747,9 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       });
     }
 
-    // librarian/admin: immediate extend (auto-approved)
     const decidedByNum = Number(session.sub);
     const decidedBy = Number.isFinite(decidedByNum) ? decidedByNum : null;
 
-    /**
-     * ✅ FIX (avoid "operator is not unique"):
-     * Force param type using ::int for date + int
-     */
     await client.query(
       `UPDATE borrow_records
          SET due_date = due_date + ($1::int),
@@ -683,16 +795,14 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/borrow-records/:id/extend/approve
- * librarian/admin approves a pending extension request.
- *
- * Body: { note?: string }
+ * (unchanged)
  */
 router.post(
   "/:id/extend/approve",
   requireAuth,
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
-    const client = await pool.connect();
+    const client = await dbPool.connect();
     try {
       const session = (req as any).sessionUser as SessionPayload;
 
@@ -863,16 +973,14 @@ router.post(
 
 /**
  * POST /api/borrow-records/:id/extend/disapprove
- * librarian/admin disapproves a pending extension request.
- *
- * Body: { note?: string }
+ * (unchanged)
  */
 router.post(
   "/:id/extend/disapprove",
   requireAuth,
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
-    const client = await pool.connect();
+    const client = await dbPool.connect();
     try {
       const session = (req as any).sessionUser as SessionPayload;
 
@@ -967,22 +1075,20 @@ router.post(
 
 /**
  * POST /api/borrow-records
- * Create a borrow record and set book unavailable (transaction).
- * Body: { userId, bookId, borrowDate?, dueDate }
- * (librarian/admin only)
- *
- * These are typically in-person transactions, so we mark them as "borrowed".
+ * Create borrow record(s) (transaction).
+ * ✅ Now supports borrowing multiple copies in one request.
  */
 router.post(
   "/",
   requireAuth,
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
-    const client = await pool.connect();
+    const client = await dbPool.connect();
     try {
       const { userId, bookId, borrowDate, dueDate } = req.body || {};
       const uid = Number(userId);
       const bid = Number(bookId);
+      const qty = parseBorrowQuantity(req.body || {});
 
       if (!uid || !bid || !dueDate) {
         return res.status(400).json({
@@ -993,7 +1099,6 @@ router.post(
 
       await client.query("BEGIN");
 
-      // Validate user
       const u = await client.query(`SELECT id FROM users WHERE id=$1 LIMIT 1`, [
         uid,
       ]);
@@ -1002,48 +1107,80 @@ router.post(
         return res.status(404).json({ ok: false, message: "User not found." });
       }
 
-      // Validate book availability
-      const b = await client.query(
-        `SELECT id, available FROM books WHERE id=$1 LIMIT 1`,
+      const b = await client.query<{
+        id: number;
+        number_of_copies: number | null;
+      }>(
+        `SELECT id, number_of_copies
+           FROM books
+           WHERE id=$1
+           FOR UPDATE`,
         [bid]
       );
+
       if (!b.rowCount) {
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, message: "Book not found." });
       }
-      if (b.rows[0].available === false) {
-        await client.query("ROLLBACK");
-        return res
-          .status(409)
-          .json({ ok: false, message: "Book is not available." });
-      }
 
-      const ins = await client.query<{ id: string }>(
-        `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
-         VALUES ($1,$2, COALESCE($3::date, CURRENT_DATE), $4::date, 'borrowed')
-         RETURNING id`,
-        [uid, bid, borrowDate || null, dueDate]
-      );
+      const copies =
+        typeof b.rows[0].number_of_copies === "number" &&
+          Number.isFinite(b.rows[0].number_of_copies) &&
+          b.rows[0].number_of_copies! > 0
+          ? Math.floor(b.rows[0].number_of_copies!)
+          : 1;
 
-      // Set book unavailable
-      await client.query(
-        `UPDATE books SET available = FALSE, updated_at = NOW() WHERE id = $1`,
+      const activeRes = await client.query<{ active_count: number }>(
+        `SELECT COUNT(*)::int AS active_count
+           FROM borrow_records
+           WHERE book_id = $1
+             AND status <> 'returned'`,
         [bid]
       );
 
+      const active =
+        typeof activeRes.rows[0]?.active_count === "number" &&
+          Number.isFinite(activeRes.rows[0].active_count)
+          ? activeRes.rows[0].active_count
+          : 0;
+
+      const remaining = Math.max(0, copies - active);
+
+      if (qty > remaining) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: `Book is not available (only ${remaining} copy/copies left).`,
+        });
+      }
+
+      // ✅ Insert 1 record per copy
+      const ins = await client.query<{ id: string }>(
+        `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
+         SELECT $1, $2, COALESCE($3::date, CURRENT_DATE), $4::date, 'borrowed'
+         FROM generate_series(1, $5::int)
+         RETURNING id`,
+        [uid, bid, borrowDate || null, dueDate, qty]
+      );
+
+      await recomputeAndUpdateBookAvailability(client, bid);
+
       await client.query("COMMIT");
 
-      // Hydrate joins for DTO
+      const ids = ins.rows.map((r) => Number(r.id));
       const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-      const joinedRow = await fetchBorrowRecordJoined(Number(ins.rows[0].id));
-      if (!joinedRow) {
-        return res.status(404).json({ ok: false, message: "Record not found." });
-      }
-      const record = toDTO(joinedRow, finePerDay);
-      res.status(201).json({ ok: true, record });
+      const joinedRows = await fetchBorrowRecordsJoined(ids);
+      const records = joinedRows.map((r) => toDTO(r, finePerDay));
+
+      res.status(201).json({
+        ok: true,
+        record: records[0],
+        records,
+        createdCount: records.length,
+      });
     } catch (err) {
       try {
-        await client.query("ROLLBACK");
+        await (client as any).query("ROLLBACK");
       } catch {
         /* ignore */
       }
@@ -1056,29 +1193,23 @@ router.post(
 
 /**
  * POST /api/borrow-records/self
- * Current user (typically student) borrows a book online.
- * Body: { bookId }
- * - userId is taken from the session.
- * - borrow_date = today
- * - due_date = today + per-book borrow_duration_days (fallback BORROW_DAYS, default 7)
- * - Marks the book as unavailable.
- * - Status starts as "pending_pickup" so a librarian can confirm pickup.
+ * ✅ Now supports borrowing multiple copies in one request.
  */
 router.post("/self", requireAuth, async (req, res, next) => {
   const s = (req as any).sessionUser as SessionPayload;
   const userId = Number(s.sub);
   const { bookId } = req.body || {};
   const bid = Number(bookId);
+  const qty = parseBorrowQuantity(req.body || {});
 
   if (!bid) {
     return res.status(400).json({ ok: false, message: "bookId is required." });
   }
 
-  const client = await pool.connect();
+  const client = await dbPool.connect();
   try {
     await client.query("BEGIN");
 
-    // Validate user exists
     const u = await client.query(`SELECT id FROM users WHERE id=$1 LIMIT 1`, [
       userId,
     ]);
@@ -1087,27 +1218,52 @@ router.post("/self", requireAuth, async (req, res, next) => {
       return res.status(404).json({ ok: false, message: "User not found." });
     }
 
-    // Validate book availability + get per-book duration
     const b = await client.query<{
       id: number;
-      available: boolean;
       borrow_duration_days: number | null;
+      number_of_copies: number | null;
     }>(
-      `SELECT id, available, borrow_duration_days
+      `SELECT id, borrow_duration_days, number_of_copies
          FROM books
          WHERE id = $1
-         LIMIT 1`,
+         FOR UPDATE`,
       [bid]
     );
+
     if (!b.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, message: "Book not found." });
     }
-    if (b.rows[0].available === false) {
+
+    const copies =
+      typeof b.rows[0].number_of_copies === "number" &&
+        Number.isFinite(b.rows[0].number_of_copies) &&
+        b.rows[0].number_of_copies! > 0
+        ? Math.floor(b.rows[0].number_of_copies!)
+        : 1;
+
+    const activeRes = await client.query<{ active_count: number }>(
+      `SELECT COUNT(*)::int AS active_count
+         FROM borrow_records
+         WHERE book_id = $1
+           AND status <> 'returned'`,
+      [bid]
+    );
+
+    const active =
+      typeof activeRes.rows[0]?.active_count === "number" &&
+        Number.isFinite(activeRes.rows[0].active_count)
+        ? activeRes.rows[0].active_count
+        : 0;
+
+    const remaining = Math.max(0, copies - active);
+
+    if (qty > remaining) {
       await client.query("ROLLBACK");
-      return res
-        .status(409)
-        .json({ ok: false, message: "Book is not available." });
+      return res.status(409).json({
+        ok: false,
+        message: `Book is not available (only ${remaining} copy/copies left).`,
+      });
     }
 
     const today = new Date();
@@ -1129,30 +1285,30 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
     const ins = await client.query<{ id: string }>(
       `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
-         VALUES ($1,$2,$3::date,$4::date,'pending_pickup')
+         SELECT $1, $2, $3::date, $4::date, 'pending_pickup'
+         FROM generate_series(1, $5::int)
          RETURNING id`,
-      [userId, bid, borrowDateStr, dueDateStr]
+      [userId, bid, borrowDateStr, dueDateStr, qty]
     );
 
-    // Set book unavailable for student self-borrow as well
-    await client.query(
-      `UPDATE books SET available = FALSE, updated_at = NOW() WHERE id = $1`,
-      [bid]
-    );
+    await recomputeAndUpdateBookAvailability(client, bid);
 
     await client.query("COMMIT");
 
-    // Hydrate joins for DTO
+    const ids = ins.rows.map((r) => Number(r.id));
     const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-    const joinedRow = await fetchBorrowRecordJoined(Number(ins.rows[0].id));
-    if (!joinedRow) {
-      return res.status(404).json({ ok: false, message: "Record not found." });
-    }
-    const record = toDTO(joinedRow, finePerDay);
-    res.status(201).json({ ok: true, record });
+    const joinedRows = await fetchBorrowRecordsJoined(ids);
+    const records = joinedRows.map((r) => toDTO(r, finePerDay));
+
+    res.status(201).json({
+      ok: true,
+      record: records[0],
+      records,
+      createdCount: records.length,
+    });
   } catch (err) {
     try {
-      await client.query("ROLLBACK");
+      await (client as any).query("ROLLBACK");
     } catch {
       /* ignore */
     }
@@ -1164,10 +1320,10 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
 /**
  * PATCH /api/borrow-records/:id
- * Update status/return date/due date/fine.
+ * (unchanged logic; availability is recomputed when status changes)
  */
 router.patch("/:id", requireAuth, async (req, res, next) => {
-  const client = await pool.connect();
+  const client = await dbPool.connect();
   try {
     const { id } = req.params;
     const rid = Number(id);
@@ -1200,10 +1356,9 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
 
     const current = cur.rows[0];
 
-    // Determine effective role from DB
     let effectiveRole: Role = session.role;
     try {
-      const roleResult = await query<UserRoleRow>(
+      const roleResult = await dbQuery<UserRoleRow>(
         `SELECT id, account_type, role
              FROM users
              WHERE id = $1
@@ -1228,7 +1383,6 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       });
     }
 
-    // Extra safety: students cannot finalize returns or set return/due date or fine
     if (!isAdminLike) {
       const desiredStatus =
         status !== undefined ? String(status).toLowerCase() : undefined;
@@ -1268,6 +1422,8 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     const values: any[] = [];
     let i = 1;
 
+    let newStatus: BorrowStatus = current.status;
+
     if (status !== undefined) {
       const sVal = String(status).toLowerCase() as BorrowStatus;
 
@@ -1284,8 +1440,14 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
         return res.status(400).json({ ok: false, message: "Invalid status." });
       }
 
+      newStatus = sVal;
+
       updates.push(`status = $${i++}`);
       values.push(sVal);
+
+      if (sVal === "returned" && returnDate === undefined) {
+        updates.push(`return_date = COALESCE(return_date, CURRENT_DATE)`);
+      }
     }
 
     if (returnDate !== undefined) {
@@ -1347,17 +1509,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
 
     const updatedRow = upd.rows[0];
 
-    const newStatus: BorrowStatus =
-      status !== undefined
-        ? (String(status).toLowerCase() as BorrowStatus)
-        : current.status;
-
     if (newStatus === "returned") {
-      await client.query(
-        `UPDATE books SET available = TRUE, updated_at = NOW() WHERE id = $1`,
-        [updatedRow.book_id]
-      );
-
       const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
 
       const due = new Date(updatedRow.due_date + "T00:00:00Z");
@@ -1414,6 +1566,10 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       }
     }
 
+    if (status !== undefined) {
+      await recomputeAndUpdateBookAvailability(client, Number(updatedRow.book_id));
+    }
+
     await client.query("COMMIT");
 
     const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
@@ -1425,7 +1581,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     res.json({ ok: true, record });
   } catch (err) {
     try {
-      await client.query("ROLLBACK");
+      await (client as any).query("ROLLBACK");
     } catch {
       /* ignore */
     }
