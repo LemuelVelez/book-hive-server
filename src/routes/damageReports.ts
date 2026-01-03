@@ -11,19 +11,14 @@ const router = express.Router();
 /* ---------------- S3 setup ---------------- */
 const S3_REGION = process.env.AWS_REGION || process.env.S3_REGION || "ap-southeast-2";
 const S3_BUCKET = process.env.S3_BUCKET_NAME || "";
-const S3_PUBLIC_BASE =
-  (process.env.S3_PUBLIC_URL_BASE || "").replace(/\/+$/, ""); // optional CloudFront or custom domain
-const S3_PREFIX = (process.env.S3_PREFIX || "uploads/").replace(/^\/+|\/+$/g, ""); // no leading/trailing slash
+const S3_PUBLIC_BASE = (process.env.S3_PUBLIC_URL_BASE || "").replace(/\/+$/, "");
+const S3_PREFIX = (process.env.S3_PREFIX || "uploads/").replace(/^\/+|\/+$/g, "");
 
 if (!S3_BUCKET) {
-  console.warn(
-    "[damage-reports] S3 bucket not set (S3_BUCKET_NAME). Image uploads will fail."
-  );
+  console.warn("[damage-reports] S3 bucket not set (S3_BUCKET_NAME). Image uploads will fail.");
 }
 
-const s3 = new S3Client({
-  region: S3_REGION,
-});
+const s3 = new S3Client({ region: S3_REGION });
 
 function extFromMime(mime: string, fallback: string = "bin") {
   const map: Record<string, string> = {
@@ -53,11 +48,7 @@ function publicUrlForKey(key: string) {
   return `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`;
 }
 
-async function uploadBufferToS3(
-  buf: Buffer,
-  mime: string,
-  originalName: string
-): Promise<string> {
+async function uploadBufferToS3(buf: Buffer, mime: string, originalName: string): Promise<string> {
   const Key = makeObjectKey(originalName, mime);
   await s3.send(
     new PutObjectCommand({
@@ -74,7 +65,7 @@ async function uploadBufferToS3(
 /* ---------------- Upload (multer) ---------------- */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  limits: { fileSize: 8 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (/^image\//i.test(file.mimetype)) return cb(null, true);
     cb(new Error("Only image uploads are allowed."));
@@ -86,7 +77,7 @@ const upload = multer({
 type Role = "student" | "librarian" | "faculty" | "admin" | "other";
 type DamageStatus = "pending" | "assessed" | "paid";
 type Severity = "minor" | "moderate" | "major";
-type FineStatus = "active" | "pending_verification" | "paid" | "cancelled";
+type FineStatus = "active" | "paid" | "cancelled";
 
 type SessionPayload = {
   sub: string;
@@ -101,40 +92,50 @@ type UserRoleRow = {
   role?: Role | string | null;
 };
 
-type DamageRowJoined = {
+type DamageUnionRow = {
   id: string;
   user_id: string;
+  liable_user_id: string | null;
   book_id: string;
   damage_type: string;
   severity: Severity;
-  fee: string; // NUMERIC comes back as string
+  fee: string;
   status: DamageStatus;
   notes: string | null;
   reported_at: string;
   photo_url: string | null;
 
-  // joined
+  paid_at: string | null;
+  archived: boolean;
+
+  // reported-by joined user
   email: string | null;
   student_id: string | null;
   full_name: string | null;
+
+  // liable joined user
+  liable_email: string | null;
+  liable_student_id: string | null;
+  liable_full_name: string | null;
+
+  // joined book
   title: string | null;
+
+  // sorting helper
+  sort_ts: string;
 };
 
 /* ---------------- helpers (consistent with other routes) ---------------- */
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
-
   if (v === "student") return "student";
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
-
-  // Synonyms / legacy
   if (v === "administrator") return "admin";
   if (v === "staff") return "librarian";
   if (v === "teacher" || v === "professor" || v === "lecturer") return "faculty";
-
   return "other";
 }
 
@@ -154,15 +155,9 @@ function readSession(req: express.Request): SessionPayload | null {
   }
 }
 
-function requireAuth(
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction
-) {
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const s = readSession(req);
-  if (!s) {
-    return res.status(401).json({ ok: false, message: "Not authenticated." });
-  }
+  if (!s) return res.status(401).json({ ok: false, message: "Not authenticated." });
   (req as any).sessionUser = s;
   next();
 }
@@ -177,22 +172,16 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
 
   if (primary !== "other") return primary;
   if (legacy) return legacy;
-
   return "student";
 }
 
 function requireRole(roles: Role[]) {
   const required = roles.map(normalizeRole);
 
-  return (
-    req: express.Request,
-    res: express.Response,
-    next: express.NextFunction
-  ) => {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const s = (req as any).sessionUser as SessionPayload | undefined;
-    if (!s) {
-      return res.status(401).json({ ok: false, message: "Not authenticated." });
-    }
+    if (!s) return res.status(401).json({ ok: false, message: "Not authenticated." });
+
     query<UserRoleRow>(
       `SELECT id, account_type, role
        FROM users
@@ -202,9 +191,7 @@ function requireRole(roles: Role[]) {
     )
       .then((result) => {
         if (!result.rowCount) {
-          return res
-            .status(401)
-            .json({ ok: false, message: "Not authenticated." });
+          return res.status(401).json({ ok: false, message: "Not authenticated." });
         }
         const u = result.rows[0];
         const effectiveRole = computeEffectiveRoleFromRow(u);
@@ -215,9 +202,7 @@ function requireRole(roles: Role[]) {
             effectiveRole,
             required,
           });
-          return res
-            .status(403)
-            .json({ ok: false, message: "Forbidden: insufficient role." });
+          return res.status(403).json({ ok: false, message: "Forbidden: insufficient role." });
         }
         (req as any).sessionUser = { ...s, role: effectiveRole };
         next();
@@ -228,62 +213,147 @@ function requireRole(roles: Role[]) {
 
 /* ---------------- mapping ---------------- */
 
-function toDTO(row: DamageRowJoined) {
+function parsePhotoUrls(photo_url: string | null): string[] {
   let photoUrls: string[] = [];
-  if (row.photo_url) {
-    try {
-      const parsed = JSON.parse(row.photo_url);
-      if (Array.isArray(parsed)) {
-        photoUrls = parsed
-          .map((v) => (typeof v === "string" ? v : null))
-          .filter((v): v is string => !!v);
-      } else if (typeof parsed === "string") {
-        photoUrls = [parsed];
-      } else {
-        photoUrls = [String(row.photo_url)];
-      }
-    } catch {
-      photoUrls = [row.photo_url];
+  if (!photo_url) return photoUrls;
+
+  try {
+    const parsed = JSON.parse(photo_url);
+    if (Array.isArray(parsed)) {
+      photoUrls = parsed
+        .map((v) => (typeof v === "string" ? v : null))
+        .filter((v): v is string => !!v);
+    } else if (typeof parsed === "string") {
+      photoUrls = [parsed];
+    } else {
+      photoUrls = [String(photo_url)];
     }
+  } catch {
+    photoUrls = [photo_url];
   }
 
+  return photoUrls;
+}
+
+function toDTO(row: DamageUnionRow) {
   return {
     id: String(row.id),
+
     userId: String(row.user_id),
     studentEmail: row.email,
     studentId: row.student_id,
     studentName: row.full_name,
+
+    liableUserId: row.liable_user_id ? String(row.liable_user_id) : null,
+    liableStudentEmail: row.liable_email,
+    liableStudentId: row.liable_student_id,
+    liableStudentName: row.liable_full_name,
+
     bookId: String(row.book_id),
     bookTitle: row.title,
+
     damageType: row.damage_type,
     severity: row.severity,
     fee: Number(row.fee || 0),
     status: row.status,
+
+    archived: Boolean(row.archived),
+    paidAt: row.paid_at,
+
     reportedAt: row.reported_at,
     notes: row.notes,
-    photoUrls,
+    photoUrls: parsePhotoUrls(row.photo_url),
   };
+}
+
+/* ---------------- shared UNION query builder ---------------- */
+
+function buildUnionQuery(whereSql: string | null) {
+  const whereActive = whereSql ? `WHERE ${whereSql.replace(/\bdrp\./g, "dr.")}` : "";
+  const wherePaid = whereSql ? `WHERE ${whereSql}` : "";
+
+  return `
+    SELECT *
+    FROM (
+      SELECT
+        dr.id, dr.user_id, dr.liable_user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
+        NULL::timestamptz AS paid_at,
+        false AS archived,
+
+        u.email, u.student_id, u.full_name,
+
+        lu.email AS liable_email,
+        lu.student_id AS liable_student_id,
+        lu.full_name AS liable_full_name,
+
+        b.title,
+
+        COALESCE(NULL::timestamptz, dr.reported_at) AS sort_ts
+      FROM damage_reports dr
+      LEFT JOIN users u ON u.id = dr.user_id
+      LEFT JOIN users lu ON lu.id = dr.liable_user_id
+      LEFT JOIN books b ON b.id = dr.book_id
+      ${whereActive}
+
+      UNION ALL
+
+      SELECT
+        drp.id, drp.user_id, drp.liable_user_id, drp.book_id, drp.damage_type, drp.severity, drp.fee, drp.status, drp.notes, drp.reported_at, drp.photo_url,
+        drp.paid_at AS paid_at,
+        true AS archived,
+
+        u.email, u.student_id, u.full_name,
+
+        lu.email AS liable_email,
+        lu.student_id AS liable_student_id,
+        lu.full_name AS liable_full_name,
+
+        b.title,
+
+        COALESCE(drp.paid_at, drp.reported_at) AS sort_ts
+      FROM damage_reports_paid drp
+      LEFT JOIN users u ON u.id = drp.user_id
+      LEFT JOIN users lu ON lu.id = drp.liable_user_id
+      LEFT JOIN books b ON b.id = drp.book_id
+      ${wherePaid}
+    ) t
+    ORDER BY t.sort_ts DESC, t.id DESC
+  `;
+}
+
+async function fetchOneById(id: number): Promise<DamageUnionRow | null> {
+  const sql = `
+    SELECT *
+    FROM (${buildUnionQuery("t.id = $1".replace("t.", "drp."))}) q
+    WHERE q.id = $1
+    LIMIT 1
+  `;
+  // NOTE: the buildUnionQuery expects whereSql expressed in terms of drp.* (paid alias),
+  // and it auto-maps to dr.* for active. We pass drp.id = $1 (via replacement above).
+  const res = await query<DamageUnionRow>(sql, [id]);
+  if (!res.rowCount) return null;
+  return res.rows[0];
 }
 
 /* ---------------- fine sync helper ---------------- */
 
-async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
-  const damageIdStr = String(row.id);
+async function syncFineForDamageReport(row: DamageUnionRow): Promise<void> {
   const damageIdNum = Number(row.id);
-  const userIdNum = Number(row.user_id);
+
+  const liableIdNum =
+    row.liable_user_id != null && String(row.liable_user_id).trim() !== ""
+      ? Number(row.liable_user_id)
+      : Number(row.user_id);
+
   const feeNum = Number(row.fee || 0);
   const hasPositiveFee = Number.isFinite(feeNum) && feeNum > 0;
   const status = row.status;
 
-  const prefix = `Damage report #${damageIdStr}:`;
+  const prefix = `Damage report #${damageIdNum}:`;
 
+  // If no fine should exist, remove any existing fine tied to this damage report
   if (!hasPositiveFee || status === "pending") {
-    await query(
-      `DELETE FROM fines
-       WHERE damage_report_id = $1
-          OR (damage_report_id IS NULL AND user_id = $2 AND reason LIKE $3)`,
-      [damageIdNum, userIdNum, `${prefix}%`]
-    );
+    await query(`DELETE FROM fines WHERE damage_report_id = $1`, [damageIdNum]);
     return;
   }
 
@@ -293,6 +363,7 @@ async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
   const details: string[] = [];
   if (row.damage_type) details.push(row.damage_type);
   if (row.notes) details.push(row.notes);
+  if (row.liable_user_id) details.push(`liable_user_id=${row.liable_user_id}`);
   const detailStr = details.join(" – ");
   const reason = detailStr.length > 0 ? `${prefix} ${detailStr}` : `${prefix}`;
 
@@ -302,30 +373,29 @@ async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
     `SELECT id
      FROM fines
      WHERE damage_report_id = $1
-        OR (damage_report_id IS NULL AND user_id = $2 AND reason LIKE $3)
      ORDER BY created_at ASC
      LIMIT 1`,
-    [damageIdNum, userIdNum, `${prefix}%`]
+    [damageIdNum]
   );
 
   if (!existing.rowCount) {
     await query(
       `INSERT INTO fines (user_id, borrow_record_id, damage_report_id, amount, status, reason, resolved_at)
        VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
-      [userIdNum, damageIdNum, feeNum, fineStatus, reason, resolvedAt]
+      [liableIdNum, damageIdNum, feeNum, fineStatus, reason, resolvedAt]
     );
   } else {
     const fid = Number(existing.rows[0].id);
     await query(
       `UPDATE fines
-       SET damage_report_id = $1,
+       SET user_id = $1,
            amount = $2,
            status = $3,
            reason = $4,
            resolved_at = $5,
            updated_at = NOW()
        WHERE id = $6`,
-      [damageIdNum, feeNum, fineStatus, reason, resolvedAt, fid]
+      [liableIdNum, feeNum, fineStatus, reason, resolvedAt, fid]
     );
   }
 }
@@ -335,62 +405,40 @@ async function syncFineForDamageReport(row: DamageRowJoined): Promise<void> {
 /**
  * GET /api/damage-reports
  * List all damage reports (librarian/admin).
+ * Includes active + archived/paid (separate record) via UNION.
  */
-router.get(
-  "/",
-  requireAuth,
-  requireRole(["librarian", "admin"]),
-  async (_req, res, next) => {
-    try {
-      const result = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
-                u.email, u.student_id, u.full_name,
-                b.title
-         FROM damage_reports dr
-         LEFT JOIN users u ON u.id = dr.user_id
-         LEFT JOIN books b ON b.id = dr.book_id
-         ORDER BY dr.reported_at DESC, dr.id DESC`
-      );
-
-      const reports = result.rows.map(toDTO);
-      res.json({ ok: true, reports });
-    } catch (err) {
-      next(err);
-    }
+router.get("/", requireAuth, requireRole(["librarian", "admin"]), async (_req, res, next) => {
+  try {
+    const sql = buildUnionQuery(null);
+    const result = await query<DamageUnionRow>(sql);
+    const reports = result.rows.map(toDTO);
+    res.json({ ok: true, reports });
+  } catch (err) {
+    next(err);
   }
-);
+});
 
 /**
  * GET /api/damage-reports/my
- * List damage reports submitted by the current authenticated user.
+ * List damage reports relevant to current authenticated user:
+ * - reports they submitted (user_id)
+ * - reports they are liable for (liable_user_id)
+ * Includes active + archived via UNION.
  */
-router.get(
-  "/my",
-  requireAuth,
-  async (req, res, next) => {
-    try {
-      const s = (req as any).sessionUser as SessionPayload;
-      const userId = Number(s.sub);
+router.get("/my", requireAuth, async (req, res, next) => {
+  try {
+    const s = (req as any).sessionUser as SessionPayload;
+    const userId = Number(s.sub);
 
-      const result = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
-                u.email, u.student_id, u.full_name,
-                b.title
-         FROM damage_reports dr
-         LEFT JOIN users u ON u.id = dr.user_id
-         LEFT JOIN books b ON b.id = dr.book_id
-         WHERE dr.user_id = $1
-         ORDER BY dr.reported_at DESC, dr.id DESC`,
-        [userId]
-      );
+    const sql = buildUnionQuery("drp.user_id = $1 OR drp.liable_user_id = $1");
+    const result = await query<DamageUnionRow>(sql, [userId]);
 
-      const reports = result.rows.map(toDTO);
-      res.json({ ok: true, reports });
-    } catch (err) {
-      next(err);
-    }
+    const reports = result.rows.map(toDTO);
+    res.json({ ok: true, reports });
+  } catch (err) {
+    next(err);
   }
-);
+});
 
 /**
  * POST /api/damage-reports
@@ -414,14 +462,19 @@ router.post(
       if (!bid || !Number.isFinite(bid)) {
         return res.status(400).json({ ok: false, message: "bookId is required." });
       }
+
       const dt = String(damageType || "").trim();
       if (!dt) {
         return res.status(400).json({ ok: false, message: "damageType is required." });
       }
+
       const sev = String(severity || "").toLowerCase();
       if (!["minor", "moderate", "major"].includes(sev)) {
-        return res.status(400).json({ ok: false, message: "severity must be 'minor' | 'moderate' | 'major'." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "severity must be 'minor' | 'moderate' | 'major'." });
       }
+
       const feeNum = fee === undefined || fee === null ? 0 : Number(fee);
       if (!Number.isFinite(feeNum) || feeNum < 0) {
         return res.status(400).json({ ok: false, message: "fee must be a non-negative number." });
@@ -442,28 +495,20 @@ router.post(
         return res.status(404).json({ ok: false, message: "Book not found." });
       }
 
-      const ins = await query<DamageRowJoined>(
-        `INSERT INTO damage_reports (user_id, book_id, damage_type, severity, fee, status, notes, photo_url)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
-         RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at, photo_url,
-                   NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name, NULL::text AS title`,
+      const ins = await query<{ id: string }>(
+        `INSERT INTO damage_reports (user_id, liable_user_id, book_id, damage_type, severity, fee, status, notes, photo_url)
+         VALUES ($1, NULL, $2, $3, $4, $5, 'pending', $6, $7)
+         RETURNING id`,
         [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrlJson]
       );
 
-      const joined = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
-                u.email, u.student_id, u.full_name,
-                b.title
-         FROM damage_reports dr
-         LEFT JOIN users u ON u.id = dr.user_id
-         LEFT JOIN books b ON b.id = dr.book_id
-         WHERE dr.id = $1
-         LIMIT 1`,
-        [ins.rows[0].id]
-      );
+      const rid = Number(ins.rows[0].id);
+      const row = await fetchOneById(rid);
+      if (!row) {
+        return res.status(500).json({ ok: false, message: "Failed to load created report." });
+      }
 
-      const report = toDTO(joined.rows[0]);
-      res.status(201).json({ ok: true, report });
+      res.status(201).json({ ok: true, report: toDTO(row) });
     } catch (err) {
       next(err);
     }
@@ -473,6 +518,7 @@ router.post(
 /**
  * PATCH /api/damage-reports/:id
  * Update fields – librarian/admin only.
+ * If status becomes "paid", the report is moved into damage_reports_paid and removed from damage_reports.
  */
 router.patch(
   "/:id",
@@ -487,9 +533,22 @@ router.patch(
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
-      const { status, severity, fee, notes, damageType } = req.body || {};
-      let newPhotoUrl: string | undefined = undefined;
+      // If it’s already archived, block edits
+      const alreadyArchived = await query(`SELECT id FROM damage_reports_paid WHERE id = $1 LIMIT 1`, [rid]);
+      if (alreadyArchived.rowCount) {
+        return res.status(409).json({
+          ok: false,
+          message: "This damage report is already archived (paid) and can no longer be edited.",
+        });
+      }
 
+      const { status, severity, fee, notes, damageType } = req.body || {};
+
+      // Support both liableUserId and liable_user_id from clients
+      const rawLiable =
+        (req.body && (req.body.liableUserId ?? req.body.liable_user_id)) ?? undefined;
+
+      let newPhotoUrl: string | undefined = undefined;
       if (req.file) {
         if (!S3_BUCKET) {
           return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
@@ -542,6 +601,26 @@ router.patch(
         values.push(dt);
       }
 
+      if (rawLiable !== undefined) {
+        // allow null/empty => clear liable user
+        const rawStr = rawLiable === null ? "" : String(rawLiable).trim();
+
+        if (rawLiable === null || rawStr === "") {
+          updates.push(`liable_user_id = NULL`);
+        } else {
+          const uid = Number(rawStr);
+          if (!uid || !Number.isFinite(uid)) {
+            return res.status(400).json({ ok: false, message: "liableUserId must be a valid user id or null." });
+          }
+          const u = await query(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [uid]);
+          if (!u.rowCount) {
+            return res.status(404).json({ ok: false, message: "Liable user not found." });
+          }
+          updates.push(`liable_user_id = $${i++}`);
+          values.push(uid);
+        }
+      }
+
       if (newPhotoUrl !== undefined) {
         const json = JSON.stringify([newPhotoUrl]);
         updates.push(`photo_url = $${i++}`);
@@ -554,12 +633,11 @@ router.patch(
 
       updates.push(`updated_at = NOW()`);
 
-      const upd = await query<DamageRowJoined>(
+      const upd = await query(
         `UPDATE damage_reports
          SET ${updates.join(", ")}
          WHERE id = $${i}
-         RETURNING id, user_id, book_id, damage_type, severity, fee, status, notes, reported_at, photo_url,
-                   NULL::text AS email, NULL::text AS student_id, NULL::text AS full_name, NULL::text AS title`,
+         RETURNING id`,
         [...values, rid]
       );
 
@@ -567,32 +645,73 @@ router.patch(
         return res.status(404).json({ ok: false, message: "Damage report not found." });
       }
 
-      const joined = await query<DamageRowJoined>(
-        `SELECT dr.id, dr.user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
-                u.email, u.student_id, u.full_name,
-                b.title
-         FROM damage_reports dr
-         LEFT JOIN users u ON u.id = dr.user_id
-         LEFT JOIN books b ON b.id = dr.book_id
-         WHERE dr.id = $1
-         LIMIT 1`,
+      // Load the updated row (still active at this point)
+      const activeRowRes = await query<DamageUnionRow>(
+        `
+        SELECT
+          dr.id, dr.user_id, dr.liable_user_id, dr.book_id, dr.damage_type, dr.severity, dr.fee, dr.status, dr.notes, dr.reported_at, dr.photo_url,
+          NULL::timestamptz AS paid_at,
+          false AS archived,
+
+          u.email, u.student_id, u.full_name,
+
+          lu.email AS liable_email,
+          lu.student_id AS liable_student_id,
+          lu.full_name AS liable_full_name,
+
+          b.title,
+
+          COALESCE(NULL::timestamptz, dr.reported_at) AS sort_ts
+        FROM damage_reports dr
+        LEFT JOIN users u ON u.id = dr.user_id
+        LEFT JOIN users lu ON lu.id = dr.liable_user_id
+        LEFT JOIN books b ON b.id = dr.book_id
+        WHERE dr.id = $1
+        LIMIT 1
+        `,
         [rid]
       );
 
-      if (!joined.rowCount) {
+      if (!activeRowRes.rowCount) {
         return res.status(404).json({ ok: false, message: "Damage report not found." });
       }
 
-      const joinedRow = joined.rows[0];
+      const joinedRow = activeRowRes.rows[0];
 
+      // Keep fines in sync with the LIABLE user
       try {
         await syncFineForDamageReport(joinedRow);
       } catch (syncErr) {
         console.error("[damage-reports] Failed to sync fine:", syncErr);
       }
 
-      const report = toDTO(joinedRow);
-      res.json({ ok: true, report });
+      // If paid => move to archive table and remove from active
+      if (joinedRow.status === "paid") {
+        // Atomic move using DELETE..RETURNING inside CTE
+        await query(
+          `
+          WITH moved AS (
+            DELETE FROM damage_reports
+            WHERE id = $1
+            RETURNING *
+          )
+          INSERT INTO damage_reports_paid
+          SELECT moved.*, NOW()
+          FROM moved
+          ON CONFLICT (id) DO NOTHING
+          `,
+          [rid]
+        );
+
+        const archivedRow = await fetchOneById(rid);
+        if (!archivedRow) {
+          return res.status(500).json({ ok: false, message: "Archived record not found after moving." });
+        }
+
+        return res.json({ ok: true, report: toDTO(archivedRow) });
+      }
+
+      res.json({ ok: true, report: toDTO(joinedRow) });
     } catch (err) {
       next(err);
     }
@@ -602,37 +721,35 @@ router.patch(
 /**
  * DELETE /api/damage-reports/:id
  * Remove a report – librarian/admin only.
+ * Works for both active and archived.
  */
-router.delete(
-  "/:id",
-  requireAuth,
-  requireRole(["librarian", "admin"]),
-  async (req, res, next) => {
-    try {
-      const { id } = req.params;
-      const rid = Number(id);
-      if (!rid) {
-        return res.status(400).json({ ok: false, message: "Invalid id." });
-      }
-
-      const prefix = `Damage report #${rid}:`;
-      await query(
-        `DELETE FROM fines
-         WHERE damage_report_id = $1
-            OR reason LIKE $2`,
-        [rid, `${prefix}%`]
-      );
-
-      const del = await query(`DELETE FROM damage_reports WHERE id = $1`, [rid]);
-      if (!del.rowCount) {
-        return res.status(404).json({ ok: false, message: "Damage report not found." });
-      }
-
-      res.json({ ok: true, message: "Damage report deleted." });
-    } catch (err) {
-      next(err);
+router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const rid = Number(id);
+    if (!rid) {
+      return res.status(400).json({ ok: false, message: "Invalid id." });
     }
+
+    // Remove fine by direct link (preferred)
+    await query(`DELETE FROM fines WHERE damage_report_id = $1`, [rid]);
+
+    // Try delete active first
+    const delActive = await query(`DELETE FROM damage_reports WHERE id = $1`, [rid]);
+    if (delActive.rowCount) {
+      return res.json({ ok: true, message: "Damage report deleted." });
+    }
+
+    // If not in active, try delete archived
+    const delPaid = await query(`DELETE FROM damage_reports_paid WHERE id = $1`, [rid]);
+    if (!delPaid.rowCount) {
+      return res.status(404).json({ ok: false, message: "Damage report not found." });
+    }
+
+    res.json({ ok: true, message: "Archived damage report deleted." });
+  } catch (err) {
+    next(err);
   }
-);
+});
 
 export default router;
