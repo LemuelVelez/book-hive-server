@@ -79,6 +79,8 @@ function normalizeRole(raw: unknown): Role {
   return "other";
 }
 
+const ALLOWED_ROLES: Role[] = ["student", "librarian", "faculty", "admin", "other"];
+
 /**
  * Compute the effective role:
  * - Prefer account_type if it’s non-student.
@@ -329,11 +331,6 @@ const avatarUpload = multer({
  * PATCH /api/users/me
  * Update personal info for the current user.
  * Body: { fullName?, email?, course?, yearLevel? }
- *
- * IMPORTANT CHANGE:
- * ✅ We NO LONGER auto-send verification email here (prevents duplicates).
- * ✅ We only mark email unverified + invalidate old tokens.
- * Verification email is now MANUAL via POST /api/users/me/verify-email.
  */
 router.patch("/me", requireAuth, async (req, res, next) => {
   try {
@@ -443,7 +440,7 @@ router.patch("/me", requireAuth, async (req, res, next) => {
       [...values, s.sub]
     );
 
-    // If email changed: invalidate all old tokens (so only future sends are valid)
+    // If email changed: invalidate all old tokens
     if (emailChanged) {
       await invalidateEmailVerificationTokens(s.sub);
     }
@@ -459,8 +456,6 @@ router.patch("/me", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/users/me/verify-email
- * Manually send a verification email for the currently logged-in user.
- * (This prevents duplicate sends and avoids sending to arbitrary emails.)
  */
 router.post("/me/verify-email", requireAuth, async (req, res, next) => {
   try {
@@ -486,8 +481,6 @@ router.post("/me/verify-email", requireAuth, async (req, res, next) => {
 
 /**
  * PATCH /api/users/me/password
- * Change password for the current user.
- * Body: { currentPassword, newPassword }
  */
 router.patch("/me/password", requireAuth, async (req, res, next) => {
   try {
@@ -538,8 +531,6 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/users/me/avatar
- * Upload a display picture (avatar) for the current user.
- * multipart/form-data field: "avatar"
  */
 router.post(
   "/me/avatar",
@@ -584,7 +575,6 @@ router.post(
 
 /**
  * DELETE /api/users/me/avatar
- * Remove avatar (set to null)
  */
 router.delete("/me/avatar", requireAuth, async (req, res, next) => {
   try {
@@ -608,10 +598,227 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
   }
 });
 
+/* =======================================================================
+   ✅ NEW (ADMIN): Create user + Change role
+   These are required by the Admin Users page.
+   ======================================================================= */
+
+/**
+ * POST /api/users
+ * Admin-only: create a new user (add new user).
+ *
+ * Body:
+ *  { fullName, email, password, role, accountType?, studentId?, course?, yearLevel?, isApproved? }
+ */
+router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => {
+  try {
+    const s = (req as any).sessionUser as SessionPayload;
+
+    const fullName = String(req.body?.fullName ?? "").trim();
+    const emailRaw = String(req.body?.email ?? "").trim();
+    const password = String(req.body?.password ?? "");
+    const roleRaw = req.body?.role ?? req.body?.accountType ?? "student";
+    const role = normalizeRole(roleRaw);
+
+    const isApprovedRaw = req.body?.isApproved;
+
+    const studentId = cleanOptionalText(req.body?.studentId);
+    const course = cleanOptionalText(req.body?.course);
+    const yearLevel = cleanOptionalText(req.body?.yearLevel);
+
+    if (!fullName) {
+      return res.status(400).json({ ok: false, message: "Full name is required." });
+    }
+    if (!emailRaw || !isValidEmail(emailRaw)) {
+      return res.status(400).json({ ok: false, message: "Valid email is required." });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({
+        ok: false,
+        message: "Password must be at least 8 characters.",
+      });
+    }
+    if (!ALLOWED_ROLES.includes(role)) {
+      return res.status(400).json({ ok: false, message: "Invalid role." });
+    }
+
+    // Student fields required if role is student
+    if (role === "student") {
+      if (!studentId || !course || !yearLevel) {
+        return res.status(400).json({
+          ok: false,
+          message: "Student fields are required (studentId, course, yearLevel).",
+        });
+      }
+      const sidDupe = await query(
+        `SELECT 1 FROM users WHERE student_id = $1 LIMIT 1`,
+        [studentId]
+      );
+      if (sidDupe.rowCount) {
+        return res
+          .status(409)
+          .json({ ok: false, message: "Student ID already in use." });
+      }
+    }
+
+    const email = emailRaw.toLowerCase();
+
+    const emailDupe = await query(
+      `SELECT 1 FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
+    if (emailDupe.rowCount) {
+      return res
+        .status(409)
+        .json({ ok: false, message: "Email already in use." });
+    }
+
+    // Approval rules:
+    // - Admin/librarian are exempt => approved true
+    // - otherwise admin can choose isApproved (default false)
+    const approved =
+      isExemptFromApproval(role) ? true : Boolean(isApprovedRaw === true);
+
+    const approvedAt = approved ? new Date() : null;
+    const approvedBy = approved ? s.sub : null;
+
+    const hash = await bcrypt.hash(password, 10);
+
+    // Create user. We set BOTH account_type + role for compatibility.
+    // is_email_verified stays FALSE; user must verify email to login.
+    const ins = await query<UserRow>(
+      `INSERT INTO users
+       (full_name, email, password_hash,
+        account_type, role,
+        student_id, course, year_level,
+        is_email_verified,
+        is_approved, approved_at, approved_by,
+        updated_at)
+       VALUES
+       ($1,$2,$3,
+        $4,$5,
+        $6,$7,$8,
+        FALSE,
+        $9,$10,$11,
+        NOW())
+       RETURNING
+        id, email, full_name, account_type, role,
+        student_id, course, year_level,
+        is_email_verified,
+        avatar_url,
+        is_approved, approved_at, approved_by`,
+      [
+        fullName,
+        email,
+        hash,
+        role,
+        role,
+        role === "student" ? studentId : null,
+        role === "student" ? course : null,
+        role === "student" ? yearLevel : null,
+        approved,
+        approvedAt,
+        approvedBy,
+      ]
+    );
+
+    const user = ins.rows[0];
+
+    // Fire-and-forget verify email
+    createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((e) => {
+      console.warn("Failed sending verification email (admin create):", e);
+    });
+
+    return res.status(201).json({ ok: true, user: toMeDTO(user) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /api/users/:id/role
+ * Admin-only: change a user's role.
+ * Body: { role }
+ */
+router.patch(
+  "/:id/role",
+  requireAuth,
+  requireRole(["admin"]),
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
+      const targetId = String(req.params.id || "").trim();
+
+      if (!/^\d+$/.test(targetId)) {
+        return res.status(400).json({ ok: false, message: "Invalid user id." });
+      }
+
+      // Safety: prevent changing your own role (avoids lock-out)
+      if (String(s.sub) === targetId) {
+        return res.status(400).json({
+          ok: false,
+          message: "You cannot change your own role.",
+        });
+      }
+
+      const nextRole = normalizeRole(req.body?.role);
+      if (!ALLOWED_ROLES.includes(nextRole)) {
+        return res.status(400).json({ ok: false, message: "Invalid role." });
+      }
+
+      const found = await query<UserRow>(
+        `SELECT id, email, full_name, account_type, role,
+                student_id, course, year_level,
+                is_email_verified,
+                avatar_url,
+                is_approved, approved_at, approved_by
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [targetId]
+      );
+
+      if (!found.rowCount) {
+        return res.status(404).json({ ok: false, message: "User not found." });
+      }
+
+      // If switching INTO an exempt role => force approve true.
+      // If switching OUT of exempt role => keep approval as-is (admin can disapprove separately).
+      const forceApprove = isExemptFromApproval(nextRole);
+
+      await query(
+        `UPDATE users
+         SET account_type = $1,
+             role = $2,
+             is_approved = CASE WHEN $3 THEN TRUE ELSE is_approved END,
+             approved_at = CASE
+               WHEN $3 AND approved_at IS NULL THEN NOW()
+               ELSE approved_at
+             END,
+             approved_by = CASE
+               WHEN $3 AND approved_by IS NULL THEN $4
+               ELSE approved_by
+             END,
+             updated_at = NOW()
+         WHERE id = $5`,
+        [nextRole, nextRole, forceApprove, s.sub, targetId]
+      );
+
+      const refreshed = await fetchMeRow(targetId);
+      return res.json({ ok: true, user: toMeDTO(refreshed.rows[0]) });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/* =======================================================================
+   Existing user management (list/pending/approve/disapprove/delete)
+   ======================================================================= */
+
 /**
  * GET /api/users
  * Read-only list of users (librarian/admin).
- * ✅ Includes approval info to manage pending accounts.
  */
 router.get(
   "/",
@@ -638,7 +845,6 @@ router.get(
 
 /**
  * GET /api/users/pending
- * List users awaiting approval (librarian/admin).
  */
 router.get(
   "/pending",
@@ -673,7 +879,6 @@ router.get(
 
 /**
  * PATCH /api/users/:id/approve
- * Approve a user so they can log in (librarian/admin).
  */
 router.patch(
   "/:id/approve",
@@ -733,7 +938,6 @@ router.patch(
 
 /**
  * PATCH /api/users/:id/disapprove
- * Disapprove a user (set to pending) so they cannot log in (librarian/admin).
  */
 router.patch(
   "/:id/disapprove",
@@ -792,8 +996,6 @@ router.patch(
 
 /**
  * DELETE /api/users/:id
- * Librarian: can delete ONLY newly registered users (not approved yet) and not librarian/admin.
- * Admin: can delete any user except self (and still cannot delete self).
  */
 router.delete(
   "/:id",
