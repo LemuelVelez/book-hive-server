@@ -364,7 +364,11 @@ const avatarUpload = multer({
 /**
  * PATCH /api/users/me
  * Update personal info for the current user.
- * Body: { fullName?, email?, course?, yearLevel? }
+ *
+ * ✅ Supported body keys:
+ * - fullName?, email?, course?
+ * - yearLevel? OR year_level?
+ * - studentId? OR student_id?
  */
 router.patch("/me", requireAuth, async (req, res, next) => {
   try {
@@ -381,7 +385,10 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     const fullNameRaw = req.body?.fullName;
     const emailRaw = req.body?.email;
     const courseRaw = req.body?.course;
-    const yearLevelRaw = req.body?.yearLevel;
+
+    // ✅ accept camelCase OR snake_case
+    const yearLevelRaw = req.body?.yearLevel ?? req.body?.year_level;
+    const studentIdRaw = req.body?.studentId ?? req.body?.student_id;
 
     const updates: string[] = [];
     const values: any[] = [];
@@ -457,6 +464,36 @@ router.patch("/me", requireAuth, async (req, res, next) => {
       }
       updates.push(`year_level = $${i++}`);
       values.push(yearLevel);
+    }
+
+    // ✅ FIX: allow updating student_id and ensure it persists
+    if (studentIdRaw !== undefined) {
+      const nextStudentId = cleanOptionalText(studentIdRaw);
+      if (effectiveRole === "student" && !nextStudentId) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "studentId is required for students." });
+      }
+
+      const currentStudentId = cleanOptionalText((row as any).student_id);
+
+      // Only check duplicates + update if actually changed
+      if (nextStudentId !== currentStudentId) {
+        if (nextStudentId) {
+          const sidDupe = await query(
+            `SELECT 1 FROM users WHERE student_id = $1 AND id <> $2 LIMIT 1`,
+            [nextStudentId, s.sub]
+          );
+          if (sidDupe.rowCount) {
+            return res
+              .status(409)
+              .json({ ok: false, message: "Student ID already in use." });
+          }
+        }
+
+        updates.push(`student_id = $${i++}`);
+        values.push(nextStudentId);
+      }
     }
 
     if (updates.length === 0) {
