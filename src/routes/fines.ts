@@ -24,8 +24,8 @@ type SessionPayload = {
 
 type UserRoleRow = {
   id: string;
-  account_type: Role;
-  role?: Role | null;
+  account_type: Role | string | null;
+  role?: Role | string | null;
 };
 
 type FineRowJoined = {
@@ -62,6 +62,10 @@ function normalizeRole(raw: unknown): Role {
   return "other";
 }
 
+function isStaffRole(role: Role) {
+  return role === "admin" || role === "librarian" || role === "faculty";
+}
+
 function readSession(req: express.Request): SessionPayload | null {
   const token = (req.cookies as any)?.["bh_session"];
   if (!token) return null;
@@ -91,12 +95,38 @@ function requireAuth(
   next();
 }
 
+/**
+ * ✅ FIXED: Effective AUTH role for guards/authorization
+ * - Prefer legacy `role` if it's a staff role (admin/librarian/faculty)
+ * - Else if account_type is staff role, use it
+ * - Else if legacy role exists (student/other), use it
+ * - Else fallback to account_type (or student)
+ *
+ * This fixes the bug where staff users still have account_type="other/student"
+ * but role="admin/librarian/faculty", causing 403 Forbidden.
+ */
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
-  const primary = (row.account_type || "student") as Role;
-  const legacy = (row.role as Role | null) || undefined;
-  if (primary && primary !== "student") return primary;
-  if (primary === "student" && legacy && legacy !== "student") return legacy;
-  return primary || legacy || "student";
+  const accountType = normalizeRole(row.account_type);
+
+  const legacyRaw = row.role;
+  const legacyHasValue =
+    legacyRaw !== undefined &&
+    legacyRaw !== null &&
+    String(legacyRaw).trim().length > 0;
+
+  const legacyRole = normalizeRole(legacyRaw);
+
+  // 1) Prefer legacy/stored `role` if it's a staff role
+  if (legacyHasValue && isStaffRole(legacyRole)) return legacyRole;
+
+  // 2) Otherwise if account_type itself is staff, allow it
+  if (isStaffRole(accountType)) return accountType;
+
+  // 3) Otherwise, use legacy role if present (student/other)
+  if (legacyHasValue) return legacyRole;
+
+  // 4) Fallback
+  return accountType || "student";
 }
 
 function requireRole(roles: Role[]) {
@@ -125,6 +155,7 @@ function requireRole(roles: Role[]) {
         }
         const u = result.rows[0];
         const effectiveRole = computeEffectiveRoleFromRow(u);
+
         if (!roles.includes(effectiveRole)) {
           console.warn("[fines] Forbidden", {
             userId: s.sub,
@@ -136,6 +167,7 @@ function requireRole(roles: Role[]) {
             .status(403)
             .json({ ok: false, message: "Forbidden: insufficient role." });
         }
+
         (req as any).sessionUser = { ...s, role: effectiveRole };
         next();
       })
