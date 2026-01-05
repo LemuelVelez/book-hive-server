@@ -42,44 +42,71 @@ type UserRow = {
   role?: Role;
 };
 
+/* ------------------------------------------------------------------
+   ✅ ROLE RESOLUTION (IMPORTANT)
+   We must rely on `role` (authorization) for guarding/redirecting,
+   and NEVER let `account_type` (often student/other) override it.
+------------------------------------------------------------------- */
+
+function normalizeRole(raw: unknown): Role {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "student") return "student";
+  if (v === "librarian") return "librarian";
+  if (v === "faculty") return "faculty";
+  if (v === "admin") return "admin";
+  return "other";
+}
+
+function isStaffRole(role: Role) {
+  return role === "admin" || role === "librarian" || role === "faculty";
+}
+
 /**
- * Normalize a user's role considering both the new `account_type` column
- * and the legacy `role` column.
+ * ✅ Effective AUTH role for guards/redirects:
+ * - Prefer `user.role` if it is a staff role (admin/librarian/faculty)
+ * - Otherwise, if account_type is a staff role, use it
+ * - Otherwise, if user.role exists (student/other), use it
+ * - Otherwise fallback to account_type (or student)
  *
- * - Prefer `account_type` if it is non-student (librarian/faculty/admin/other).
- * - If `account_type` is still `student` but the legacy `role` column has a
- *   non-student value (e.g. "librarian"), treat that legacy value as the
- *   effective role.
- * - Otherwise fall back to `account_type` (or student).
+ * This fixes the bug where an admin user might still have account_type="other"
+ * and gets routed to the student/guest dashboard.
  */
 function getEffectiveRole(user: UserRow): Role {
-  const primary = (user.account_type || "student") as Role;
-  const legacy = (user as any).role as Role | undefined;
+  const accountType = normalizeRole(user.account_type);
 
-  // New-style roles (including "other") take priority
-  if (primary && primary !== "student") {
-    return primary;
-  }
+  const legacyRaw = (user as any).role;
+  const legacyHasValue =
+    legacyRaw !== undefined &&
+    legacyRaw !== null &&
+    String(legacyRaw).trim().length > 0;
 
-  // If the DB row still uses the old `role` column for a non-student,
-  // but `account_type` is stuck at the default "student", honor the legacy role.
-  if (primary === "student" && legacy && legacy !== "student") {
-    return legacy;
-  }
+  const legacyRole = normalizeRole(legacyRaw);
 
-  // Default
-  return primary || legacy || "student";
+  // 1) Prefer legacy/stored `role` if it's a staff role
+  if (legacyHasValue && isStaffRole(legacyRole)) return legacyRole;
+
+  // 2) Otherwise if account_type itself is staff, allow it
+  if (isStaffRole(accountType)) return accountType;
+
+  // 3) Otherwise, use legacy role if present (student/other)
+  if (legacyHasValue) return legacyRole;
+
+  // 4) Fallback
+  return accountType || "student";
 }
 
 // --- Helpers ---
-function signSessionJWT(
-  user: Pick<UserRow, "id" | "email" | "account_type" | "is_email_verified">
-) {
+function signSessionJWT(user: {
+  id: string;
+  email: string;
+  role: Role;
+  is_email_verified: boolean;
+}) {
   const secret = process.env.JWT_SECRET!;
   const payload = {
     sub: user.id,
     email: user.email,
-    role: user.account_type,
+    role: user.role, // ✅ store effective auth role
     ev: user.is_email_verified ? 1 : 0,
   };
   return jwt.sign(payload, secret, { algorithm: "HS256", expiresIn: "7d" });
@@ -229,7 +256,7 @@ function readSession(
     return {
       sub: String(payload.sub),
       email: String(payload.email),
-      role: String(payload.role) as Role,
+      role: normalizeRole(payload.role),
       ev: Number(payload.ev) || 0,
     };
   } catch {
@@ -260,7 +287,12 @@ router.get("/me", async (req, res, next) => {
     }
 
     const user = found.rows[0];
-    const accountType = getEffectiveRole(user);
+
+    // ✅ role is authoritative for routing/guarding
+    const role = getEffectiveRole(user);
+
+    // keep whatever your DB says for account_type (often student/other)
+    const accountType = normalizeRole(user.account_type);
 
     return res.json({
       ok: true,
@@ -268,7 +300,10 @@ router.get("/me", async (req, res, next) => {
         id: user.id,
         email: user.email,
         fullName: user.full_name,
+
         accountType,
+        role, // ✅ NEW: client must use this for redirects/guards
+
         isEmailVerified: user.is_email_verified,
 
         // ✅ NEW: approval status
@@ -415,7 +450,9 @@ router.post("/register", async (req, res, next) => {
     );
 
     const user = ins.rows[0];
-    const accountTypeNormalized = getEffectiveRole(user);
+
+    const role = getEffectiveRole(user);
+    const accountTypeNormalized = normalizeRole(user.account_type);
 
     // 💡 Fire-and-forget: don't block the HTTP response on SMTP latency
     createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((e) => {
@@ -428,7 +465,10 @@ router.post("/register", async (req, res, next) => {
         id: user.id,
         email: user.email,
         fullName: user.full_name,
+
         accountType: accountTypeNormalized,
+        role, // ✅ NEW
+
         isEmailVerified: user.is_email_verified,
 
         // ✅ NEW
@@ -490,11 +530,13 @@ router.post("/login", async (req, res, next) => {
         .json({ ok: false, message: "Please verify your email to continue." });
     }
 
-    const accountType = getEffectiveRole(user);
+    // ✅ compute effective auth role (prefer `role`)
+    const role = getEffectiveRole(user);
+    const accountType = normalizeRole(user.account_type);
 
     // ✅ NEW: Block login until librarian approves (EXCEPT librarian/admin)
     const approved = Boolean((user as any).is_approved);
-    if (!isExemptFromApproval(accountType) && !approved) {
+    if (!isExemptFromApproval(role) && !approved) {
       return res.status(403).json({
         ok: false,
         message:
@@ -505,9 +547,10 @@ router.post("/login", async (req, res, next) => {
     const token = signSessionJWT({
       id: user.id,
       email: user.email,
-      account_type: accountType,
+      role,
       is_email_verified: user.is_email_verified,
     });
+
     setSessionCookie(res, token);
 
     return res.json({
@@ -516,7 +559,10 @@ router.post("/login", async (req, res, next) => {
         id: user.id,
         email: user.email,
         fullName: user.full_name,
+
         accountType,
+        role, // ✅ NEW
+
         isEmailVerified: user.is_email_verified,
 
         // ✅ NEW

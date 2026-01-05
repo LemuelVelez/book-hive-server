@@ -64,11 +64,11 @@ type UserAuthRow = {
 type SessionPayload = {
   sub: string;
   email: string;
-  role: Role;
+  role: Role; // ✅ effective role from JWT (still re-checked in DB for privileged routes)
   ev: number; // email verified flag (0/1)
 };
 
-/* ---------------- Role helpers (mirror logic used elsewhere) ---------------- */
+/* ---------------- Role helpers ---------------- */
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
@@ -79,22 +79,40 @@ function normalizeRole(raw: unknown): Role {
   return "other";
 }
 
+function isStaffRole(role: Role) {
+  return role === "admin" || role === "librarian" || role === "faculty";
+}
+
 const ALLOWED_ROLES: Role[] = ["student", "librarian", "faculty", "admin", "other"];
 
 /**
- * Compute the effective role:
- * - Prefer account_type if it’s non-student.
- * - If account_type is student but legacy role is non-student, use legacy role.
- * - Otherwise fall back to account_type (or student).
+ * ✅ Effective AUTH role for guards/authorization:
+ * - Prefer legacy `role` if it's a staff role
+ * - Else if account_type is staff role use it
+ * - Else if legacy role exists use it (student/other)
+ * - Else fallback to account_type
+ *
+ * This fixes admin accounts that have account_type="other/student"
+ * but role="admin".
  */
 function computeEffectiveRoleFromRow(
   row: Pick<UserRow, "account_type" | "role">
 ): Role {
-  const primary = (row.account_type || "student") as Role;
-  const legacy = (row.role as Role | null) || undefined;
-  if (primary && primary !== "student") return primary;
-  if (primary === "student" && legacy && legacy !== "student") return legacy;
-  return primary || legacy || "student";
+  const accountType = normalizeRole(row.account_type);
+
+  const legacyRaw = row.role;
+  const legacyHasValue =
+    legacyRaw !== undefined &&
+    legacyRaw !== null &&
+    String(legacyRaw).trim().length > 0;
+
+  const legacyRole = normalizeRole(legacyRaw);
+
+  if (legacyHasValue && isStaffRole(legacyRole)) return legacyRole;
+  if (isStaffRole(accountType)) return accountType;
+  if (legacyHasValue) return legacyRole;
+
+  return accountType || "student";
 }
 
 function isExemptFromApproval(role: Role) {
@@ -250,13 +268,24 @@ async function createAndSendVerifyEmail(
   });
 }
 
+/**
+ * ✅ IMPORTANT:
+ * Return BOTH:
+ * - accountType: based on DB `account_type` (often student/other)
+ * - role: effective auth role (what the frontend must guard/redirect with)
+ */
 function toMeDTO(row: UserRow) {
-  const accountType = computeEffectiveRoleFromRow(row);
+  const role = computeEffectiveRoleFromRow(row);
+  const accountType = normalizeRole(row.account_type);
+
   return {
     id: String(row.id),
     email: row.email,
     fullName: row.full_name,
+
     accountType,
+    role, // ✅ NEW
+
     isEmailVerified: Boolean(row.is_email_verified),
 
     // ✅ NEW
@@ -271,12 +300,17 @@ function toMeDTO(row: UserRow) {
 }
 
 function toUserListDTO(row: UserRow) {
-  const accountType = computeEffectiveRoleFromRow(row);
+  const role = computeEffectiveRoleFromRow(row);
+  const accountType = normalizeRole(row.account_type);
+
   return {
     id: String(row.id),
     email: row.email,
     fullName: row.full_name,
+
     accountType,
+    role, // ✅ NEW (handy for admin UI)
+
     avatarUrl: row.avatar_url ?? null,
 
     // ✅ NEW
@@ -600,15 +634,11 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
 
 /* =======================================================================
    ✅ NEW (ADMIN): Create user + Change role
-   These are required by the Admin Users page.
    ======================================================================= */
 
 /**
  * POST /api/users
  * Admin-only: create a new user (add new user).
- *
- * Body:
- *  { fullName, email, password, role, accountType?, studentId?, course?, yearLevel?, isApproved? }
  */
 router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => {
   try {
@@ -783,7 +813,6 @@ router.patch(
       }
 
       // If switching INTO an exempt role => force approve true.
-      // If switching OUT of exempt role => keep approval as-is (admin can disapprove separately).
       const forceApprove = isExemptFromApproval(nextRole);
 
       await query(
@@ -816,10 +845,6 @@ router.patch(
    Existing user management (list/pending/approve/disapprove/delete)
    ======================================================================= */
 
-/**
- * GET /api/users
- * Read-only list of users (librarian/admin).
- */
 router.get(
   "/",
   requireAuth,
@@ -843,9 +868,6 @@ router.get(
   }
 );
 
-/**
- * GET /api/users/pending
- */
 router.get(
   "/pending",
   requireAuth,
@@ -877,9 +899,6 @@ router.get(
   }
 );
 
-/**
- * PATCH /api/users/:id/approve
- */
 router.patch(
   "/:id/approve",
   requireAuth,
@@ -936,9 +955,6 @@ router.patch(
   }
 );
 
-/**
- * PATCH /api/users/:id/disapprove
- */
 router.patch(
   "/:id/disapprove",
   requireAuth,
@@ -994,9 +1010,6 @@ router.patch(
   }
 );
 
-/**
- * DELETE /api/users/:id
- */
 router.delete(
   "/:id",
   requireAuth,
@@ -1057,9 +1070,6 @@ router.delete(
   }
 );
 
-/**
- * GET /api/users/check-student-id?studentId=...
- */
 router.get("/check-student-id", async (req, res, next) => {
   try {
     const studentId = String(req.query.studentId || "").trim();
