@@ -44,6 +44,16 @@ const allowList = new Set<string>(
   ].filter(Boolean)
 );
 
+
+app.get("/", (_req, res) => {
+  res.status(200).json({ ok: true, service: "bookhive-api" })
+})
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({ ok: true, service: "bookhive-api", status: "healthy" })
+})
+
+
 app.use(
   cors({
     origin: (origin, cb) => {
