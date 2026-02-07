@@ -10,10 +10,12 @@
     "start": "node dist/index.js",
     "migrate": "node-pg-migrate --migration-filename-format utc -c dev up",
     "migrate:local": "dotenv -e .env -- node-pg-migrate --migration-filename-format utc -c dev up",
-    "migrate:down": "dotenv -e .env -- node-pg-migrate --migration-filename-format utc -c dev down",
+    "migrate:down": "dotenv -e .env -- node-pg-migrate -c dev down",
     "migrate:reset": "dotenv -e .env -- node-pg-migrate -c dev down --all && dotenv -e .env -- node-pg-migrate -c dev up",
     "migrate:create": "node-pg-migrate -c dev create -l sql",
     "migrate:prod": "node-pg-migrate --migration-filename-format utc up",
+    "seed:superadmin": "node migrations/seeder/seed-superadmin.js",
+    "setup:local": "npm run migrate:local && npm run seed:superadmin",
     "postinstall": "npm run build"
   },
   "engines": {
@@ -34,14 +36,14 @@
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "dotenv-cli": "^7.4.4",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
+    "node-pg-migrate": "^7.9.1",
     "nodemailer": "^7.0.10",
     "pg": "^8.16.3",
-    "typescript": "^5.9.3",
-    "node-pg-migrate": "^7.9.1",
-    "dotenv-cli": "^7.4.4"
+    "typescript": "^5.9.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.10",
