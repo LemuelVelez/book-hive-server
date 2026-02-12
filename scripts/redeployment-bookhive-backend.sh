@@ -2,13 +2,20 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-APP_DIR="${APP_DIR:-$(cd "$SCRIPT_DIR/.." && pwd -P)}"
-
 CORE_SCRIPT="${CORE_SCRIPT:-$SCRIPT_DIR/redeployment-bookhive.sh}"
 ENV_LOADER_ABS="${ENV_LOADER_ABS:-$SCRIPT_DIR/load-external-env-backend.sh}"
 
 [[ -f "$CORE_SCRIPT" ]] || { echo "[ERROR] Missing core script: $CORE_SCRIPT" >&2; exit 1; }
 [[ -f "$ENV_LOADER_ABS" ]] || { echo "[ERROR] Missing env loader: $ENV_LOADER_ABS" >&2; exit 1; }
+
+# Your compose files are here
+APP_DIR="${APP_DIR:-/root/book-hive}"
+
+# Defaults (override via env if needed)
+BLUE_SVC="${BLUE_SVC:-bookhive-blue}"
+GREEN_SVC="${GREEN_SVC:-bookhive-green}"
+BLUE_PORT="${BLUE_PORT:-18081}"
+GREEN_PORT="${GREEN_PORT:-18082}"
 
 resolve_path() {
   local p="$1"
@@ -19,49 +26,58 @@ resolve_path() {
   fi
 }
 
-# Compose file resolution:
-# 1) user-provided COMPOSE_FILE (absolute or relative to APP_DIR)
-# 2) auto-detect known backend/common compose filenames
+# Compose selection
 if [[ -n "${COMPOSE_FILE:-}" ]]; then
   COMPOSE_FILE="$(resolve_path "$COMPOSE_FILE")"
 else
   for f in \
     "$APP_DIR/docker-compose.backend.yml" \
-    "$APP_DIR/docker-compose.server.yml" \
+    "$APP_DIR/docker-compose.backend.yaml" \
     "$APP_DIR/docker-compose.api.yml" \
+    "$APP_DIR/docker-compose.api.yaml" \
     "$APP_DIR/docker-compose.yml" \
-    "$APP_DIR/compose.backend.yml" \
-    "$APP_DIR/compose.yml"
+    "$APP_DIR/docker-compose.frontend.yml" \
+    "$APP_DIR/compose.yml" \
+    "$APP_DIR/compose.yaml"
   do
-    if [[ -f "$f" ]]; then
-      COMPOSE_FILE="$f"
-      break
-    fi
+    [[ -f "$f" ]] && { COMPOSE_FILE="$f"; break; }
   done
 fi
 
-[[ -n "${COMPOSE_FILE:-}" && -f "$COMPOSE_FILE" ]] || {
-  echo "[ERROR] Compose file not found." >&2
-  echo "Tried common names under: $APP_DIR" >&2
-  echo "Use explicit override, e.g.:" >&2
-  echo "  COMPOSE_FILE=$APP_DIR/docker-compose.backend.yml $SCRIPT_DIR/redeployment-bookhive-backend.sh" >&2
-  echo "Available compose-like files:" >&2
-  ls -1 "$APP_DIR"/*compose*.yml 2>/dev/null || true
+[[ -f "${COMPOSE_FILE:-}" ]] || {
+  echo "[ERROR] Compose file not found under APP_DIR=$APP_DIR" >&2
+  echo "Candidates:" >&2
+  find "$APP_DIR" -maxdepth 6 -type f \( \
+    -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o \
+    -name 'compose*.yml' -o -name 'compose*.yaml' \
+  \) | sort >&2 || true
   exit 1
 }
 
 REPO_DIR_ABS="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
 
-# Default Caddyfile (override via CADDY_REPO_FILE)
+# Caddyfile preference: runtime-mounted first
 if [[ -z "${CADDY_REPO_FILE:-}" ]]; then
-  if [[ -f "$REPO_DIR_ABS/infra/Caddyfile" ]]; then
+  if [[ -f "/opt/workloadhub-stack/Caddyfile" ]]; then
+    CADDY_REPO_FILE="/opt/workloadhub-stack/Caddyfile"
+  elif [[ -f "$REPO_DIR_ABS/infra/Caddyfile" ]]; then
     CADDY_REPO_FILE="$REPO_DIR_ABS/infra/Caddyfile"
   elif [[ -f "/etc/caddy/Caddyfile" ]]; then
     CADDY_REPO_FILE="/etc/caddy/Caddyfile"
   else
-    echo "[ERROR] No Caddyfile found (infra/Caddyfile or /etc/caddy/Caddyfile)." >&2
+    echo "[ERROR] No Caddyfile found." >&2
     exit 1
   fi
+fi
+
+# IMPORTANT: auto-adopt existing compose project label to avoid container-name conflicts
+if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  for c in "$BLUE_SVC" "$GREEN_SVC"; do
+    if docker ps -a --format '{{.Names}}' | grep -Fxq "$c"; then
+      COMPOSE_PROJECT_NAME="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$c" 2>/dev/null || true)"
+      [[ -n "$COMPOSE_PROJECT_NAME" ]] && break
+    fi
+  done
 fi
 
 export REPO_DIR="${REPO_DIR:-$REPO_DIR_ABS}"
@@ -70,44 +86,42 @@ export ENV_LOADER="${ENV_LOADER:-$ENV_LOADER_ABS}"
 export CADDY_REPO_FILE
 export ACTIVE_MARKER="${ACTIVE_MARKER:-/opt/bookhive-env/bookhive-backend.active}"
 
-# Backend domain
 export DOMAIN="${DOMAIN:-api-bookhive.jrmsu-tc.cloud}"
 export PUBLIC_CHECK_URL="${PUBLIC_CHECK_URL:-https://${DOMAIN}}"
 
-# Blue/green
-export BLUE_SVC="${BLUE_SVC:-bookhive-blue}"
-export GREEN_SVC="${GREEN_SVC:-bookhive-green}"
-export BLUE_PORT="${BLUE_PORT:-18081}"
-export GREEN_PORT="${GREEN_PORT:-18082}"
+export BLUE_SVC GREEN_SVC BLUE_PORT GREEN_PORT
 
-# Deterministic compose project
-export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-bookhive-backend}"
+# Only export project name if we really have one
+if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  export COMPOSE_PROJECT_NAME
+fi
 
-# Validate services if docker compose config can be resolved at this stage.
-# If config fails (e.g., env vars loaded later by core script), warn and continue.
-mapfile -t _svcs < <(
-  docker compose \
-    --project-directory "$REPO_DIR" \
-    --project-name "$COMPOSE_PROJECT_NAME" \
-    -f "$COMPOSE_FILE" config --services 2>/dev/null || true
-)
+# Best-effort service validation
+compose_cmd=(docker compose --project-directory "$REPO_DIR" -f "$COMPOSE_FILE")
+if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  compose_cmd+=(--project-name "$COMPOSE_PROJECT_NAME")
+fi
 
+mapfile -t _svcs < <("${compose_cmd[@]}" config --services 2>/dev/null || true)
 if ((${#_svcs[@]} > 0)); then
-  printf '%s\n' "${_svcs[@]}" | grep -qx "$BLUE_SVC"  || {
-    echo "[ERROR] Service '$BLUE_SVC' not found in $COMPOSE_FILE" >&2; exit 1; }
+  printf '%s\n' "${_svcs[@]}" | grep -qx "$BLUE_SVC" || {
+    echo "[ERROR] Service '$BLUE_SVC' not found in $COMPOSE_FILE" >&2
+    echo "Available: ${_svcs[*]}" >&2
+    exit 1
+  }
   printf '%s\n' "${_svcs[@]}" | grep -qx "$GREEN_SVC" || {
-    echo "[ERROR] Service '$GREEN_SVC' not found in $COMPOSE_FILE" >&2; exit 1; }
-else
-  echo "[WARN] Could not validate compose services at wrapper stage (config unresolved). Continuing..."
+    echo "[ERROR] Service '$GREEN_SVC' not found in $COMPOSE_FILE" >&2
+    echo "Available: ${_svcs[*]}" >&2
+    exit 1
+  }
 fi
 
 echo "[INFO] APP_DIR=$APP_DIR"
 echo "[INFO] REPO_DIR=$REPO_DIR"
 echo "[INFO] COMPOSE_FILE=$COMPOSE_FILE"
-echo "[INFO] COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME"
 echo "[INFO] CADDY_REPO_FILE=$CADDY_REPO_FILE"
-echo "[INFO] ENV_LOADER=$ENV_LOADER"
 echo "[INFO] DOMAIN=$DOMAIN"
+[[ -n "${COMPOSE_PROJECT_NAME:-}" ]] && echo "[INFO] COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME"
 echo "[INFO] BLUE=$BLUE_SVC:$BLUE_PORT GREEN=$GREEN_SVC:$GREEN_PORT"
 
 exec "$CORE_SCRIPT"
