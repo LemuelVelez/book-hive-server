@@ -1,6 +1,6 @@
 import express from "express";
 import jwt from "jsonwebtoken";
-import { pool, query } from "../db"; // ✅ import pool for transactions
+import { pool, query } from "../db";
 
 const router = express.Router();
 
@@ -38,6 +38,7 @@ type BookRow = {
   isbn: string | null;
   issn: string | null;
 
+  subjects: string | null; // ✅ NEW
   genre: string | null;
 
   accession_number: string | null;
@@ -92,8 +93,6 @@ type UserRoleRow = {
   role?: Role | null;
 };
 
-/* ---------------- ✅ FIX TS2347: Typed DB wrappers ---------------- */
-
 type DBQueryResult<T> = { rowCount: number; rows: T[] };
 type DBQueryFn = <T = any>(
   text: string,
@@ -109,18 +108,10 @@ type DBPool = {
   connect: () => Promise<DBClient>;
 };
 
-// Cast untyped imports into typed wrappers (prevents TS2347)
 const dbQuery = query as unknown as DBQueryFn;
 const dbPool = pool as unknown as DBPool;
 
-/* ---------------- ✅ IMPORTANT: Disable role guards ----------------
- * ✅ This removes the "Forbidden role" behavior that causes 403 even
- *    when the user has correct roles.
- * If later you want to enable role enforcement again, change to true.
- */
 const ENFORCE_ROLE_GUARDS = false;
-
-/* ---------------- Role normalization helper ---------------- */
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
@@ -132,8 +123,6 @@ function normalizeRole(raw: unknown): Role {
 
   return "other";
 }
-
-/* ---------------- Library Area normalization ---------------- */
 
 function normalizeLibraryArea(raw: unknown): LibraryArea | null {
   if (raw === undefined || raw === null) return null;
@@ -167,8 +156,6 @@ function normalizeLibraryArea(raw: unknown): LibraryArea | null {
   return null;
 }
 
-/* ---------------- Session helpers (cookie-based JWT) ---------------- */
-
 function readSession(req: express.Request): SessionPayload | null {
   const token = (req.cookies as any)?.["bh_session"];
   if (!token) return null;
@@ -201,7 +188,6 @@ function requireAuth(
 }
 
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
-  // ✅ normalize DB values to prevent mismatch issues
   const primary = normalizeRole(row.account_type || "student");
   const legacy = row.role ? normalizeRole(row.role) : undefined;
 
@@ -216,10 +202,6 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
   return primary !== "other" ? primary : legacy !== "other" ? legacy || "student" : "student";
 }
 
-/**
- * ✅ ROLE CHECK DISABLED (NO MORE 403 FORBIDDEN)
- * This removes the issue you described.
- */
 function requireRole(_roles: Role[]) {
   return (
     req: express.Request,
@@ -231,12 +213,10 @@ function requireRole(_roles: Role[]) {
       return res.status(401).json({ ok: false, message: "Not authenticated." });
     }
 
-    // ✅ If role guards are disabled, allow request immediately
     if (!ENFORCE_ROLE_GUARDS) {
       return next();
     }
 
-    // ✅ If you later enable role guards, this still supports normalized DB role check:
     dbQuery<UserRoleRow>(
       `SELECT id, account_type, role
        FROM users
@@ -267,13 +247,6 @@ function requireRole(_roles: Role[]) {
   };
 }
 
-/* ---------------- Copy counting helpers ---------------- */
-
-/**
- * activeCount = borrow_records where status <> 'returned'
- * remainingCopies = max(totalCopies - activeCount, 0)
- * available = remainingCopies > 0
- */
 async function computeCopyStateForBook(
   client: DBClient,
   bookId: number,
@@ -285,9 +258,7 @@ async function computeCopyStateForBook(
   available: boolean;
 }> {
   const copies =
-    typeof copiesTotal === "number" &&
-      Number.isFinite(copiesTotal) &&
-      copiesTotal > 0
+    typeof copiesTotal === "number" && Number.isFinite(copiesTotal) && copiesTotal > 0
       ? Math.floor(copiesTotal)
       : 1;
 
@@ -313,8 +284,6 @@ async function computeCopyStateForBook(
     available: remaining > 0,
   };
 }
-
-/* ---------------- Mapping helper ---------------- */
 
 function toDTO(row: BookRow | BookRowWithCounts) {
   const totalCopies =
@@ -350,10 +319,12 @@ function toDTO(row: BookRow | BookRowWithCounts) {
     title: row.title,
     subtitle: row.subtitle ?? "",
     author: row.author,
-    statementOfResponsibility: row.statement_of_responsibility ?? "",
     edition: row.edition ?? "",
     isbn: row.isbn ?? "",
     issn: row.issn ?? "",
+
+    subjects: row.subjects ?? row.genre ?? row.category ?? "",
+    genre: row.genre ?? row.subjects ?? row.category ?? "",
 
     placeOfPublication: row.place_of_publication ?? "",
     publisher: row.publisher ?? "",
@@ -368,9 +339,6 @@ function toDTO(row: BookRow | BookRowWithCounts) {
     category: row.category ?? "",
     addedEntries: row.added_entries ?? "",
 
-    genre: row.genre ?? "",
-
-    // ✅ availability now reflects remaining copies
     available,
 
     borrowDurationDays:
@@ -384,11 +352,6 @@ function toDTO(row: BookRow | BookRowWithCounts) {
     volumeNumber: row.volume_number ?? "",
     libraryArea: row.library_area ?? null,
 
-    /**
-     * ✅ numberOfCopies = remaining/available copies (deducts as users borrow)
-     * totalCopies = total inventory copies
-     * borrowedCopies = active borrows (status <> returned)
-     */
     numberOfCopies: remainingCopies,
     totalCopies,
     borrowedCopies: activeCount !== null ? activeCount : undefined,
@@ -405,6 +368,7 @@ const BOOK_RETURNING = `
   isbn,
   issn,
   accession_number,
+  subjects,
   genre,
   category,
   place_of_publication,
@@ -439,6 +403,7 @@ const BOOK_RETURNING_B = `
   b.isbn,
   b.issn,
   b.accession_number,
+  b.subjects,
   b.genre,
   b.category,
   b.place_of_publication,
@@ -463,11 +428,8 @@ const BOOK_RETURNING_B = `
   b.updated_at
 `;
 
-/* ---------------- Routes ---------------- */
-
 router.get("/", async (_req, res, next) => {
   try {
-    // ✅ include active borrow count so UI can show remaining copies
     const result = await dbQuery<BookRowWithCounts>(
       `
       SELECT
@@ -502,6 +464,7 @@ router.post(
       const {
         title,
         author,
+        subjects, // ✅ new
         isbn,
         genre,
         publicationYear,
@@ -509,12 +472,10 @@ router.post(
 
         accessionNumber,
         subtitle,
-        statementOfResponsibility,
         edition,
         issn,
         placeOfPublication,
         publisher,
-        copyrightYear,
         pages,
         otherDetails,
         dimensions,
@@ -535,19 +496,14 @@ router.post(
       const resolvedAuthorRaw =
         author !== undefined && author !== null && String(author).trim()
           ? String(author).trim()
-          : statementOfResponsibility !== undefined &&
-            statementOfResponsibility !== null &&
-            String(statementOfResponsibility).trim()
-            ? String(statementOfResponsibility).trim()
-            : "";
+          : "";
 
-      const rawYear = publicationYear ?? copyrightYear;
+      const rawYear = publicationYear;
 
       if (!resolvedTitle || !resolvedAuthorRaw || rawYear === undefined) {
         return res.status(400).json({
           ok: false,
-          message:
-            "Title, author (or statementOfResponsibility), and publicationYear (or copyrightYear) are required.",
+          message: "Title, author, and publicationYear are required.",
         });
       }
 
@@ -555,28 +511,12 @@ router.post(
       if (!Number.isFinite(yearNum) || yearNum < 1000 || yearNum > 9999) {
         return res.status(400).json({
           ok: false,
-          message: "publicationYear/copyrightYear must be a valid 4-digit year.",
+          message: "publicationYear must be a valid 4-digit year.",
         });
       }
 
-      const copyrightNum =
-        copyrightYear !== undefined &&
-          copyrightYear !== null &&
-          copyrightYear !== ""
-          ? Number(copyrightYear)
-          : yearNum;
-
-      if (
-        copyrightNum !== null &&
-        (!Number.isFinite(copyrightNum) ||
-          copyrightNum < 1000 ||
-          copyrightNum > 9999)
-      ) {
-        return res.status(400).json({
-          ok: false,
-          message: "copyrightYear must be a valid 4-digit year.",
-        });
-      }
+      // UI removed copyright input: default to publication year
+      const copyrightNum = yearNum;
 
       const pagesNum =
         pages !== undefined && pages !== null && pages !== ""
@@ -632,23 +572,27 @@ router.post(
         borrowDurationVal = Math.floor(parsed);
       }
 
+      const subjectsVal =
+        subjects !== undefined && subjects !== null && String(subjects).trim()
+          ? String(subjects).trim()
+          : genre !== undefined && genre !== null && String(genre).trim()
+            ? String(genre).trim()
+            : category !== undefined && category !== null && String(category).trim()
+              ? String(category).trim()
+              : null;
+
       const genreVal =
         genre !== undefined && genre !== null && String(genre).trim()
           ? String(genre).trim()
-          : category !== undefined && category !== null && String(category).trim()
-            ? String(category).trim()
-            : null;
+          : subjectsVal;
 
       const categoryVal =
         category !== undefined && category !== null && String(category).trim()
           ? String(category).trim()
-          : genre !== undefined && genre !== null && String(genre).trim()
-            ? String(genre).trim()
-            : null;
+          : subjectsVal;
 
       const libArea = normalizeLibraryArea(libraryArea);
 
-      // ✅ Availability is governed ONLY by remaining copies, not manually set here.
       const availableVal = true;
 
       try {
@@ -662,6 +606,7 @@ router.post(
              isbn,
              issn,
              accession_number,
+             subjects,
              genre,
              category,
              place_of_publication,
@@ -686,20 +631,19 @@ router.post(
            VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
              $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,$25,$26,$27,$28
+             $21,$22,$23,$24,$25,$26,$27,$28,$29
            )
            RETURNING ${BOOK_RETURNING}`,
           [
             resolvedTitle,
             subtitle ? String(subtitle).trim() : null,
             resolvedAuthorRaw,
-            statementOfResponsibility
-              ? String(statementOfResponsibility).trim()
-              : resolvedAuthorRaw,
+            null, // removed from UI
             edition ? String(edition).trim() : null,
             isbn ? String(isbn).trim() : null,
             issn ? String(issn).trim() : null,
             accessionNumber ? String(accessionNumber).trim() : null,
+            subjectsVal,
             genreVal,
             categoryVal,
             placeOfPublication ? String(placeOfPublication).trim() : null,
@@ -723,7 +667,6 @@ router.post(
           ]
         );
 
-        // newly created => active_count = 0
         const row = ins.rows[0] as BookRowWithCounts;
         row.active_count = 0;
         row.available_copies = copiesTotal;
@@ -817,7 +760,7 @@ router.post(
       try {
         await client.query("ROLLBACK");
       } catch {
-        /* ignore */
+        // ignore
       }
       next(err);
     } finally {
@@ -843,6 +786,7 @@ router.patch(
       const {
         title,
         author,
+        subjects, // ✅ new
         isbn,
         genre,
         publicationYear,
@@ -850,7 +794,6 @@ router.patch(
 
         accessionNumber,
         subtitle,
-        statementOfResponsibility,
         edition,
         issn,
         placeOfPublication,
@@ -894,20 +837,6 @@ router.patch(
         values.push(subtitle ? String(subtitle).trim() : null);
       }
 
-      if (statementOfResponsibility !== undefined) {
-        const sor = statementOfResponsibility
-          ? String(statementOfResponsibility).trim()
-          : null;
-
-        updates.push(`statement_of_responsibility = $${idx++}`);
-        values.push(sor);
-
-        if (author === undefined) {
-          updates.push(`author = $${idx++}`);
-          values.push(sor ? sor : "");
-        }
-      }
-
       if (author !== undefined) {
         updates.push(`author = $${idx++}`);
         values.push(String(author).trim());
@@ -933,10 +862,31 @@ router.patch(
         values.push(issn ? String(issn).trim() : null);
       }
 
+      if (subjects !== undefined) {
+        const s = subjects ? String(subjects).trim() : null;
+        updates.push(`subjects = $${idx++}`);
+        values.push(s);
+
+        if (genre === undefined) {
+          updates.push(`genre = $${idx++}`);
+          values.push(s);
+        }
+
+        if (category === undefined) {
+          updates.push(`category = $${idx++}`);
+          values.push(s);
+        }
+      }
+
       if (category !== undefined) {
         const cat = category ? String(category).trim() : null;
         updates.push(`category = $${idx++}`);
         values.push(cat);
+
+        if (subjects === undefined) {
+          updates.push(`subjects = $${idx++}`);
+          values.push(cat);
+        }
 
         if (genre === undefined) {
           updates.push(`genre = $${idx++}`);
@@ -948,6 +898,11 @@ router.patch(
         const g = genre ? String(genre).trim() : null;
         updates.push(`genre = $${idx++}`);
         values.push(g);
+
+        if (subjects === undefined) {
+          updates.push(`subjects = $${idx++}`);
+          values.push(g);
+        }
 
         if (category === undefined) {
           updates.push(`category = $${idx++}`);
@@ -975,6 +930,12 @@ router.patch(
         }
         updates.push(`publication_year = $${idx++}`);
         values.push(yearNum);
+
+        // keep copyright synced when publication year is changed
+        if (copyrightYear === undefined) {
+          updates.push(`copyright_year = $${idx++}`);
+          values.push(yearNum);
+        }
       }
 
       if (copyrightYear !== undefined) {
@@ -1145,7 +1106,6 @@ router.patch(
         throw err;
       }
 
-      // ✅ Always recompute availability based on remaining copies
       const state = await computeCopyStateForBook(
         client,
         bookId,
@@ -1173,7 +1133,7 @@ router.patch(
       try {
         await client.query("ROLLBACK");
       } catch {
-        /* ignore */
+        // ignore
       }
       next(err);
     } finally {
