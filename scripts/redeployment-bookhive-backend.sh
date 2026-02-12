@@ -8,14 +8,18 @@ ENV_LOADER_ABS="${ENV_LOADER_ABS:-$SCRIPT_DIR/load-external-env-backend.sh}"
 [[ -f "$CORE_SCRIPT" ]] || { echo "[ERROR] Missing core script: $CORE_SCRIPT" >&2; exit 1; }
 [[ -f "$ENV_LOADER_ABS" ]] || { echo "[ERROR] Missing env loader: $ENV_LOADER_ABS" >&2; exit 1; }
 
-# Your compose files are here
-APP_DIR="${APP_DIR:-/root/book-hive}"
+# Backend repo only
+APP_DIR="${APP_DIR:-/root/book-hive-server}"
 
-# Defaults (override via env if needed)
-BLUE_SVC="${BLUE_SVC:-bookhive-blue}"
-GREEN_SVC="${GREEN_SVC:-bookhive-green}"
-BLUE_PORT="${BLUE_PORT:-18081}"
-GREEN_PORT="${GREEN_PORT:-18082}"
+# Backend defaults (override if your compose uses other names)
+BLUE_SVC="${BLUE_SVC:-bookhive-api-blue}"
+GREEN_SVC="${GREEN_SVC:-bookhive-api-green}"
+BLUE_PORT="${BLUE_PORT:-28081}"
+GREEN_PORT="${GREEN_PORT:-28082}"
+UPSTREAM_CONTAINER_PORT="${UPSTREAM_CONTAINER_PORT:-8080}"
+
+# Health path for API readiness/public verification
+HEALTH_PATH="${HEALTH_PATH:-/health}"
 
 resolve_path() {
   local p="$1"
@@ -26,7 +30,7 @@ resolve_path() {
   fi
 }
 
-# Compose selection
+# Compose selection: backend-first, no frontend fallback
 if [[ -n "${COMPOSE_FILE:-}" ]]; then
   COMPOSE_FILE="$(resolve_path "$COMPOSE_FILE")"
 else
@@ -35,8 +39,9 @@ else
     "$APP_DIR/docker-compose.backend.yaml" \
     "$APP_DIR/docker-compose.api.yml" \
     "$APP_DIR/docker-compose.api.yaml" \
+    "$APP_DIR/compose.backend.yml" \
+    "$APP_DIR/compose.backend.yaml" \
     "$APP_DIR/docker-compose.yml" \
-    "$APP_DIR/docker-compose.frontend.yml" \
     "$APP_DIR/compose.yml" \
     "$APP_DIR/compose.yaml"
   do
@@ -45,14 +50,19 @@ else
 fi
 
 [[ -f "${COMPOSE_FILE:-}" ]] || {
-  echo "[ERROR] Compose file not found under APP_DIR=$APP_DIR" >&2
-  echo "Candidates:" >&2
+  echo "[ERROR] Backend compose file not found under APP_DIR=$APP_DIR" >&2
   find "$APP_DIR" -maxdepth 6 -type f \( \
     -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o \
     -name 'compose*.yml' -o -name 'compose*.yaml' \
   \) | sort >&2 || true
   exit 1
 }
+
+# Hard guard: never allow frontend compose in backend deploy
+if [[ "$(basename "$COMPOSE_FILE")" =~ frontend ]]; then
+  echo "[ERROR] Backend script resolved a FRONTEND compose file: $COMPOSE_FILE" >&2
+  exit 1
+fi
 
 REPO_DIR_ABS="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
 
@@ -70,7 +80,7 @@ if [[ -z "${CADDY_REPO_FILE:-}" ]]; then
   fi
 fi
 
-# IMPORTANT: auto-adopt existing compose project label to avoid container-name conflicts
+# Auto-adopt existing compose project label if present
 if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
   for c in "$BLUE_SVC" "$GREEN_SVC"; do
     if docker ps -a --format '{{.Names}}' | grep -Fxq "$c"; then
@@ -87,16 +97,19 @@ export CADDY_REPO_FILE
 export ACTIVE_MARKER="${ACTIVE_MARKER:-/opt/bookhive-env/bookhive-backend.active}"
 
 export DOMAIN="${DOMAIN:-api-bookhive.jrmsu-tc.cloud}"
-export PUBLIC_CHECK_URL="${PUBLIC_CHECK_URL:-https://${DOMAIN}}"
+export HEALTH_PATH
+export PUBLIC_CHECK_URL="${PUBLIC_CHECK_URL:-https://${DOMAIN}${HEALTH_PATH}}"
+
+export SLOT_HEADER_NAME="${SLOT_HEADER_NAME:-X-BookHive-API-Slot}"
+export REQUIRED_ENV_KEY="${REQUIRED_ENV_KEY:-}"
 
 export BLUE_SVC GREEN_SVC BLUE_PORT GREEN_PORT
+export UPSTREAM_CONTAINER_PORT
 
-# Only export project name if we really have one
 if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
   export COMPOSE_PROJECT_NAME
 fi
 
-# Best-effort service validation
 compose_cmd=(docker compose --project-directory "$REPO_DIR" -f "$COMPOSE_FILE")
 if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
   compose_cmd+=(--project-name "$COMPOSE_PROJECT_NAME")
@@ -121,6 +134,8 @@ echo "[INFO] REPO_DIR=$REPO_DIR"
 echo "[INFO] COMPOSE_FILE=$COMPOSE_FILE"
 echo "[INFO] CADDY_REPO_FILE=$CADDY_REPO_FILE"
 echo "[INFO] DOMAIN=$DOMAIN"
+echo "[INFO] PUBLIC_CHECK_URL=$PUBLIC_CHECK_URL"
+echo "[INFO] SLOT_HEADER_NAME=$SLOT_HEADER_NAME"
 [[ -n "${COMPOSE_PROJECT_NAME:-}" ]] && echo "[INFO] COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME"
 echo "[INFO] BLUE=$BLUE_SVC:$BLUE_PORT GREEN=$GREEN_SVC:$GREEN_PORT"
 
