@@ -8,13 +8,13 @@ ENV_LOADER_ABS="$APP_DIR/scripts/load-external-env-backend.sh"
 [[ -f "$CORE_SCRIPT" ]] || { echo "[ERROR] Missing core script: $CORE_SCRIPT" >&2; exit 1; }
 [[ -f "$ENV_LOADER_ABS" ]] || { echo "[ERROR] Missing env loader: $ENV_LOADER_ABS" >&2; exit 1; }
 
-# Default compose (override by exporting COMPOSE_FILE)
+# Default compose (backend)
 if [[ -z "${COMPOSE_FILE:-}" ]]; then
-  COMPOSE_FILE="/root/book-hive/docker-compose.yml"
+  COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 fi
 [[ -f "$COMPOSE_FILE" ]] || { echo "[ERROR] Compose file not found: $COMPOSE_FILE" >&2; exit 1; }
 
-REPO_DIR_ABS="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
+REPO_DIR_ABS="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
 
 # Default Caddyfile (override by exporting CADDY_REPO_FILE)
 if [[ -z "${CADDY_REPO_FILE:-}" ]]; then
@@ -38,14 +38,31 @@ export ACTIVE_MARKER="${ACTIVE_MARKER:-/opt/bookhive-env/bookhive-backend.active
 export DOMAIN="${DOMAIN:-api-bookhive.jrmsu-tc.cloud}"
 export PUBLIC_CHECK_URL="${PUBLIC_CHECK_URL:-https://${DOMAIN}}"
 
-# Blue/green (you already confirmed these service names)
+# Blue/green
 export BLUE_SVC="${BLUE_SVC:-bookhive-blue}"
 export GREEN_SVC="${GREEN_SVC:-bookhive-green}"
 export BLUE_PORT="${BLUE_PORT:-18081}"
 export GREEN_PORT="${GREEN_PORT:-18082}"
 
+# Keep compose project deterministic
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-bookhive-backend}"
+
+# Validate that selected compose file actually contains expected services
+mapfile -t _svcs < <(
+  docker compose \
+    --project-directory "$REPO_DIR" \
+    --project-name "$COMPOSE_PROJECT_NAME" \
+    -f "$COMPOSE_FILE" config --services 2>/dev/null || true
+)
+
+printf '%s\n' "${_svcs[@]}" | grep -qx "$BLUE_SVC"  || {
+  echo "[ERROR] Service '$BLUE_SVC' not found in $COMPOSE_FILE" >&2; exit 1; }
+printf '%s\n' "${_svcs[@]}" | grep -qx "$GREEN_SVC" || {
+  echo "[ERROR] Service '$GREEN_SVC' not found in $COMPOSE_FILE" >&2; exit 1; }
+
 echo "[INFO] REPO_DIR=$REPO_DIR"
 echo "[INFO] COMPOSE_FILE=$COMPOSE_FILE"
+echo "[INFO] COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME"
 echo "[INFO] CADDY_REPO_FILE=$CADDY_REPO_FILE"
 echo "[INFO] ENV_LOADER=$ENV_LOADER"
 echo "[INFO] DOMAIN=$DOMAIN"
