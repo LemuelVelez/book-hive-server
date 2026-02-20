@@ -1,4 +1,0 @@
-api-bookhive.jrmsu-tc.cloud {
-    encode gzip zstd
-    reverse_proxy bookhive-api-blue:3000
-}
