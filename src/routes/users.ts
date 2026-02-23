@@ -6,6 +6,7 @@ import { uploadImageToS3 } from "../s3";
 import * as bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { sendMail } from "../email";
+import { buildLoginCredentialsEmail } from "../lib/email-templates/login-credentials";
 
 const router = express.Router();
 
@@ -213,6 +214,25 @@ function escapeHtml(input: string) {
     .replace(/'/g, "&#39;");
 }
 
+function getClientBaseUrl() {
+  return (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .toString()
+    .replace(/\/+$/, "");
+}
+
+function getLoginUrl() {
+  // Best-effort default path (matches your existing /auth/* routes)
+  return `${getClientBaseUrl()}/auth/login`;
+}
+
+function generateTemporaryPassword() {
+  // Generate a reasonably strong temporary password and ensure min length.
+  const raw = crypto.randomBytes(24).toString("base64");
+  const cleaned = raw.replace(/[^a-zA-Z0-9]/g, "");
+  // Add a small complexity suffix, keep it readable
+  return `${cleaned.slice(0, 12)}A1!`;
+}
+
 async function invalidateEmailVerificationTokens(userId: string) {
   // Mark all unused tokens used so only the newest can be used.
   await query(
@@ -223,11 +243,7 @@ async function invalidateEmailVerificationTokens(userId: string) {
   );
 }
 
-async function createAndSendVerifyEmail(
-  userId: string,
-  email: string,
-  fullName?: string
-) {
+async function createEmailVerificationToken(userId: string) {
   // Invalidate existing unused tokens first
   await invalidateEmailVerificationTokens(userId);
 
@@ -240,13 +256,19 @@ async function createAndSendVerifyEmail(
     [userId, token, expiresAt]
   );
 
-  const client = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
-    .toString()
-    .replace(/\/+$/, "");
-
-  const confirmUrl = `${client}/auth/verify-email/callback?token=${encodeURIComponent(
+  const confirmUrl = `${getClientBaseUrl()}/auth/verify-email/callback?token=${encodeURIComponent(
     token
   )}`;
+
+  return { token, expiresAt, confirmUrl };
+}
+
+async function createAndSendVerifyEmail(
+  userId: string,
+  email: string,
+  fullName?: string
+) {
+  const { confirmUrl } = await createEmailVerificationToken(userId);
 
   const safeName =
     fullName && fullName.trim().length > 0
@@ -676,6 +698,12 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
 /**
  * POST /api/users
  * Admin-only: create a new user (add new user).
+ *
+ * ✅ NEW:
+ * - sendLoginCredentials?: boolean (default TRUE)
+ *   If true, the system emails the user:
+ *   - email + temporary password
+ *   - verify-email link (so they can verify and login)
  */
 router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => {
   try {
@@ -692,6 +720,8 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
     const studentId = cleanOptionalText(req.body?.studentId);
     const course = cleanOptionalText(req.body?.course);
     const yearLevel = cleanOptionalText(req.body?.yearLevel);
+
+    const sendLoginCredentials = req.body?.sendLoginCredentials !== false;
 
     if (!fullName) {
       return res.status(400).json({ ok: false, message: "Full name is required." });
@@ -791,16 +821,143 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
 
     const user = ins.rows[0];
 
-    // Fire-and-forget verify email
-    createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((e) => {
-      console.warn("Failed sending verification email (admin create):", e);
-    });
+    if (sendLoginCredentials) {
+      // Create verify token and send ONE email that contains BOTH:
+      // - login credentials
+      // - verify-email link
+      const loginUrl = getLoginUrl();
+
+      createEmailVerificationToken(user.id)
+        .then(({ confirmUrl }) => {
+          const tpl = buildLoginCredentialsEmail({
+            appName: "JRMSU-TC Book-Hive",
+            fullName: user.full_name,
+            email: user.email,
+            temporaryPassword: password,
+            loginUrl,
+            verifyEmailUrl: confirmUrl,
+          });
+
+          return sendMail({
+            to: user.email,
+            subject: tpl.subject,
+            html: tpl.html,
+            text: tpl.text,
+          });
+        })
+        .catch((e) => {
+          console.warn("Failed sending login credentials email (admin create):", e);
+          // Fallback: still try to send the verify email
+          createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((err) => {
+            console.warn("Failed sending verification email fallback:", err);
+          });
+        });
+    } else {
+      // Fire-and-forget verify email
+      createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((e) => {
+        console.warn("Failed sending verification email (admin create):", e);
+      });
+    }
 
     return res.status(201).json({ ok: true, user: toMeDTO(user) });
   } catch (err) {
     next(err);
   }
 });
+
+/**
+ * POST /api/users/:id/send-login-credentials
+ * Admin-only: send (or re-send) login credentials.
+ *
+ * ✅ Behavior:
+ * - If body.password is provided: sets that as the NEW password (min 8 chars)
+ * - Otherwise: generates a NEW temporary password
+ * - Emails the user their email + temporary password
+ * - If user isn't verified yet, includes a fresh verify-email link
+ */
+router.post(
+  "/:id/send-login-credentials",
+  requireAuth,
+  requireRole(["admin"]),
+  async (req, res, next) => {
+    try {
+      const targetId = String(req.params.id || "").trim();
+
+      if (!/^\d+$/.test(targetId)) {
+        return res.status(400).json({ ok: false, message: "Invalid user id." });
+      }
+
+      const found = await query<{
+        id: string;
+        email: string;
+        full_name: string;
+        is_email_verified: boolean;
+      }>(
+        `SELECT id, email, full_name, is_email_verified
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [targetId]
+      );
+
+      if (!found.rowCount) {
+        return res.status(404).json({ ok: false, message: "User not found." });
+      }
+
+      const user = found.rows[0];
+
+      const provided = req.body?.password;
+      const nextPassword =
+        typeof provided === "string" && provided.trim().length > 0
+          ? provided
+          : generateTemporaryPassword();
+
+      if (nextPassword.length < 8) {
+        return res.status(400).json({
+          ok: false,
+          message: "Password must be at least 8 characters.",
+        });
+      }
+
+      const hash = await bcrypt.hash(nextPassword, 10);
+
+      await query(
+        `UPDATE users
+         SET password_hash = $1, updated_at = NOW()
+         WHERE id = $2`,
+        [hash, targetId]
+      );
+
+      const loginUrl = getLoginUrl();
+
+      let verifyUrl: string | null = null;
+      if (!user.is_email_verified) {
+        const { confirmUrl } = await createEmailVerificationToken(user.id);
+        verifyUrl = confirmUrl;
+      }
+
+      const tpl = buildLoginCredentialsEmail({
+        appName: "JRMSU-TC Book-Hive",
+        fullName: user.full_name,
+        email: user.email,
+        temporaryPassword: nextPassword,
+        loginUrl,
+        verifyEmailUrl: verifyUrl,
+      });
+
+      await sendMail({
+        to: user.email,
+        subject: tpl.subject,
+        html: tpl.html,
+        text: tpl.text,
+      });
+
+      return res.json({ ok: true, message: "Login credentials sent." });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 /**
  * PATCH /api/users/:id/role
