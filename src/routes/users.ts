@@ -197,8 +197,36 @@ function escapeHtml(input: string) {
     .replace(/'/g, "&#39;");
 }
 
+/** Normalize a base URL (trim + drop trailing slashes). */
+function normalizeBaseUrl(v?: string | null) {
+  return (v ?? "").toString().trim().replace(/\/+$/, "");
+}
+
+/**
+ * ✅ FIX: Email links were falling back to localhost when only CLIENT_ORIGINS was set.
+ * We now resolve client base URL in this order:
+ * 1) CLIENT_ORIGIN
+ * 2) first entry of CLIENT_ORIGINS (comma-separated)
+ * 3) common legacy env keys (PUBLIC_WEB_URL / FRONTEND_URL / CLIENT_URL)
+ * 4) localhost fallback
+ */
 function getClientBaseUrl() {
-  return (process.env.CLIENT_ORIGIN || "http://localhost:5173").toString().replace(/\/+$/, "");
+  const primary = normalizeBaseUrl(process.env.CLIENT_ORIGIN);
+  if (primary) return primary;
+
+  const csv = (process.env.CLIENT_ORIGINS || "")
+    .split(",")
+    .map((s) => normalizeBaseUrl(s))
+    .filter(Boolean);
+
+  if (csv.length) return csv[0];
+
+  const legacy = normalizeBaseUrl(
+    process.env.PUBLIC_WEB_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL
+  );
+  if (legacy) return legacy;
+
+  return "http://localhost:5173";
 }
 
 function getLoginUrl() {
