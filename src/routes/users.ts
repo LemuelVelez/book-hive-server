@@ -197,41 +197,30 @@ function escapeHtml(input: string) {
     .replace(/'/g, "&#39;");
 }
 
-/** Normalize a base URL (trim + drop trailing slashes). */
-function normalizeBaseUrl(v?: string | null) {
-  return (v ?? "").toString().trim().replace(/\/+$/, "");
-}
-
-/**
- * ✅ FIX: Email links were falling back to localhost when only CLIENT_ORIGINS was set.
- * We now resolve client base URL in this order:
- * 1) CLIENT_ORIGIN
- * 2) first entry of CLIENT_ORIGINS (comma-separated)
- * 3) common legacy env keys (PUBLIC_WEB_URL / FRONTEND_URL / CLIENT_URL)
- * 4) localhost fallback
- */
 function getClientBaseUrl() {
-  const primary = normalizeBaseUrl(process.env.CLIENT_ORIGIN);
-  if (primary) return primary;
-
-  const csv = (process.env.CLIENT_ORIGINS || "")
-    .split(",")
-    .map((s) => normalizeBaseUrl(s))
-    .filter(Boolean);
-
-  if (csv.length) return csv[0];
-
-  const legacy = normalizeBaseUrl(
-    process.env.PUBLIC_WEB_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL
-  );
-  if (legacy) return legacy;
-
-  return "http://localhost:5173";
+  return (process.env.CLIENT_ORIGIN || "http://localhost:5173").toString().replace(/\/+$/, "");
 }
 
 function getLoginUrl() {
-  // Best-effort default path (matches your existing /auth/* routes)
-  return `${getClientBaseUrl()}/auth/login`;
+  /**
+   * ✅ FIX:
+   * Your React app routes login at "/auth" (no "/auth/login").
+   * - Optional override:
+   *   - CLIENT_LOGIN_URL: full URL (e.g. https://bookhive.jrmsu-tc.cloud/auth)
+   *   - CLIENT_LOGIN_PATH: path only (e.g. /auth)
+   */
+  const full = String(process.env.CLIENT_LOGIN_URL ?? "").trim();
+  if (full) return full.replace(/\/+$/, "");
+
+  const base = getClientBaseUrl();
+
+  let p = String(process.env.CLIENT_LOGIN_PATH || "/auth").trim();
+  if (!p) p = "/auth";
+  if (!p.startsWith("/")) p = `/${p}`;
+  p = p.replace(/\/+$/, "");
+  if (!p) p = "/auth";
+
+  return `${base}${p}`;
 }
 
 function readIdParam(raw: unknown): string | null {
