@@ -38,7 +38,7 @@ type BookRow = {
   isbn: string | null;
   issn: string | null;
 
-  subjects: string | null; // ✅ NEW
+  subjects: string | null;
   genre: string | null;
 
   accession_number: string | null;
@@ -154,6 +154,42 @@ function normalizeLibraryArea(raw: unknown): LibraryArea | null {
   if (compact.includes("fiction")) return "fiction";
 
   return null;
+}
+
+function trimToNull(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  const value = String(raw).trim();
+  return value ? value : null;
+}
+
+function resolveClassificationPayload(input: {
+  subjects?: unknown;
+  genre?: unknown;
+  category?: unknown;
+}): {
+  subjects: string | null;
+  genre: string | null;
+  category: string | null;
+} | null {
+  const hasSubjects = input.subjects !== undefined;
+  const hasGenre = input.genre !== undefined;
+  const hasCategory = input.category !== undefined;
+
+  if (!hasSubjects && !hasGenre && !hasCategory) {
+    return null;
+  }
+
+  const explicitSubjects = hasSubjects ? trimToNull(input.subjects) : undefined;
+  const explicitGenre = hasGenre ? trimToNull(input.genre) : undefined;
+  const explicitCategory = hasCategory ? trimToNull(input.category) : undefined;
+
+  const fallback = explicitSubjects ?? explicitGenre ?? explicitCategory ?? null;
+
+  return {
+    subjects: explicitSubjects !== undefined ? explicitSubjects : fallback,
+    genre: explicitGenre !== undefined ? explicitGenre : fallback,
+    category: explicitCategory !== undefined ? explicitCategory : fallback,
+  };
 }
 
 function readSession(req: express.Request): SessionPayload | null {
@@ -272,7 +308,7 @@ async function computeCopyStateForBook(
 
   const active =
     typeof activeRes.rows[0]?.active_count === "number" &&
-      Number.isFinite(activeRes.rows[0].active_count)
+    Number.isFinite(activeRes.rows[0].active_count)
       ? activeRes.rows[0].active_count
       : 0;
 
@@ -464,7 +500,7 @@ router.post(
       const {
         title,
         author,
-        subjects, // ✅ new
+        subjects,
         isbn,
         genre,
         publicationYear,
@@ -515,7 +551,6 @@ router.post(
         });
       }
 
-      // UI removed copyright input: default to publication year
       const copyrightNum = yearNum;
 
       const pagesNum =
@@ -572,24 +607,15 @@ router.post(
         borrowDurationVal = Math.floor(parsed);
       }
 
-      const subjectsVal =
-        subjects !== undefined && subjects !== null && String(subjects).trim()
-          ? String(subjects).trim()
-          : genre !== undefined && genre !== null && String(genre).trim()
-            ? String(genre).trim()
-            : category !== undefined && category !== null && String(category).trim()
-              ? String(category).trim()
-              : null;
+      const classification = resolveClassificationPayload({
+        subjects,
+        genre,
+        category,
+      });
 
-      const genreVal =
-        genre !== undefined && genre !== null && String(genre).trim()
-          ? String(genre).trim()
-          : subjectsVal;
-
-      const categoryVal =
-        category !== undefined && category !== null && String(category).trim()
-          ? String(category).trim()
-          : subjectsVal;
+      const subjectsVal = classification?.subjects ?? null;
+      const genreVal = classification?.genre ?? null;
+      const categoryVal = classification?.category ?? null;
 
       const libArea = normalizeLibraryArea(libraryArea);
 
@@ -638,7 +664,7 @@ router.post(
             resolvedTitle,
             subtitle ? String(subtitle).trim() : null,
             resolvedAuthorRaw,
-            null, // removed from UI
+            null,
             edition ? String(edition).trim() : null,
             isbn ? String(isbn).trim() : null,
             issn ? String(issn).trim() : null,
@@ -786,7 +812,7 @@ router.patch(
       const {
         title,
         author,
-        subjects, // ✅ new
+        subjects,
         isbn,
         genre,
         publicationYear,
@@ -862,52 +888,21 @@ router.patch(
         values.push(issn ? String(issn).trim() : null);
       }
 
-      if (subjects !== undefined) {
-        const s = subjects ? String(subjects).trim() : null;
+      const classification = resolveClassificationPayload({
+        subjects,
+        genre,
+        category,
+      });
+
+      if (classification) {
         updates.push(`subjects = $${idx++}`);
-        values.push(s);
+        values.push(classification.subjects);
 
-        if (genre === undefined) {
-          updates.push(`genre = $${idx++}`);
-          values.push(s);
-        }
-
-        if (category === undefined) {
-          updates.push(`category = $${idx++}`);
-          values.push(s);
-        }
-      }
-
-      if (category !== undefined) {
-        const cat = category ? String(category).trim() : null;
-        updates.push(`category = $${idx++}`);
-        values.push(cat);
-
-        if (subjects === undefined) {
-          updates.push(`subjects = $${idx++}`);
-          values.push(cat);
-        }
-
-        if (genre === undefined) {
-          updates.push(`genre = $${idx++}`);
-          values.push(cat);
-        }
-      }
-
-      if (genre !== undefined) {
-        const g = genre ? String(genre).trim() : null;
         updates.push(`genre = $${idx++}`);
-        values.push(g);
+        values.push(classification.genre);
 
-        if (subjects === undefined) {
-          updates.push(`subjects = $${idx++}`);
-          values.push(g);
-        }
-
-        if (category === undefined) {
-          updates.push(`category = $${idx++}`);
-          values.push(g);
-        }
+        updates.push(`category = $${idx++}`);
+        values.push(classification.category);
       }
 
       if (placeOfPublication !== undefined) {
@@ -931,7 +926,6 @@ router.patch(
         updates.push(`publication_year = $${idx++}`);
         values.push(yearNum);
 
-        // keep copyright synced when publication year is changed
         if (copyrightYear === undefined) {
           updates.push(`copyright_year = $${idx++}`);
           values.push(yearNum);
