@@ -1,4 +1,3 @@
-// src/routes/borrowRecords.ts
 import express from "express";
 import jwt from "jsonwebtoken";
 import { pool, query } from "../db";
@@ -55,6 +54,12 @@ type BorrowRowJoined = {
   extension_decided_at: string | null;
   extension_decided_by: number | null;
   extension_decision_note: string | null;
+
+  // ✅ Return request workflow
+  return_requested_at: string | null;
+  return_requested_by: number | null;
+  return_request_note: string | null;
+  return_requested_by_name: string | null;
 
   // joined fields
   email: string | null;
@@ -244,12 +249,18 @@ async function fetchBorrowRecordJoined(
             br.extension_decided_by,
             br.extension_decision_note,
 
+            br.return_requested_at,
+            br.return_requested_by,
+            br.return_request_note,
+            rq.full_name AS return_requested_by_name,
+
             u.email,
             u.student_id,
             u.full_name,
             b.title
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
+     LEFT JOIN users rq ON rq.id = br.return_requested_by
      LEFT JOIN books b ON b.id = br.book_id
      WHERE br.id = $1
      LIMIT 1`,
@@ -287,12 +298,18 @@ async function fetchBorrowRecordsJoined(
             br.extension_decided_by,
             br.extension_decision_note,
 
+            br.return_requested_at,
+            br.return_requested_by,
+            br.return_request_note,
+            rq.full_name AS return_requested_by_name,
+
             u.email,
             u.student_id,
             u.full_name,
             b.title
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
+     LEFT JOIN users rq ON rq.id = br.return_requested_by
      LEFT JOIN books b ON b.id = br.book_id
      WHERE br.id = ANY($1::int[])
      ORDER BY br.id ASC`,
@@ -325,8 +342,8 @@ async function recomputeAndUpdateBookAvailability(
 
   const copies =
     typeof b.rows[0].number_of_copies === "number" &&
-      Number.isFinite(b.rows[0].number_of_copies) &&
-      b.rows[0].number_of_copies! > 0
+    Number.isFinite(b.rows[0].number_of_copies) &&
+    b.rows[0].number_of_copies! > 0
       ? Math.floor(b.rows[0].number_of_copies!)
       : 1;
 
@@ -340,7 +357,7 @@ async function recomputeAndUpdateBookAvailability(
 
   const active =
     typeof activeRes.rows[0]?.active_count === "number" &&
-      Number.isFinite(activeRes.rows[0].active_count)
+    Number.isFinite(activeRes.rows[0].active_count)
       ? activeRes.rows[0].active_count
       : 0;
 
@@ -373,7 +390,9 @@ function parseBorrowQuantity(body: any): number {
   if (!Number.isFinite(q) || q <= 0) return 1;
 
   // Safety cap (optional)
-  const cap = Math.floor(Number(process.env.BORROW_MAX_COPIES_PER_ACTION ?? 10));
+  const cap = Math.floor(
+    Number(process.env.BORROW_MAX_COPIES_PER_ACTION ?? 10)
+  );
   const maxAllowed = Number.isFinite(cap) && cap > 0 ? cap : 10;
 
   return Math.min(q, maxAllowed);
@@ -427,12 +446,12 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
         : 0,
     extensionTotalDays:
       typeof row.extension_total_days === "number" &&
-        Number.isFinite(row.extension_total_days)
+      Number.isFinite(row.extension_total_days)
         ? row.extension_total_days
         : 0,
     lastExtensionDays:
       typeof row.last_extension_days === "number" &&
-        Number.isFinite(row.last_extension_days)
+      Number.isFinite(row.last_extension_days)
         ? row.last_extension_days
         : null,
     lastExtendedAt: row.last_extended_at ?? null,
@@ -441,7 +460,7 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     extensionRequestStatus: safeReqStatus,
     extensionRequestedDays:
       typeof row.extension_requested_days === "number" &&
-        Number.isFinite(row.extension_requested_days)
+      Number.isFinite(row.extension_requested_days)
         ? row.extension_requested_days
         : null,
     extensionRequestedAt: row.extension_requested_at ?? null,
@@ -449,10 +468,19 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     extensionDecidedAt: row.extension_decided_at ?? null,
     extensionDecidedBy:
       typeof row.extension_decided_by === "number" &&
-        Number.isFinite(row.extension_decided_by)
+      Number.isFinite(row.extension_decided_by)
         ? row.extension_decided_by
         : null,
     extensionDecisionNote: row.extension_decision_note ?? null,
+
+    returnRequestedAt: row.return_requested_at ?? null,
+    returnRequestedBy:
+      typeof row.return_requested_by === "number" &&
+      Number.isFinite(row.return_requested_by)
+        ? row.return_requested_by
+        : null,
+    returnRequestedByName: row.return_requested_by_name ?? null,
+    returnRequestNote: row.return_request_note ?? null,
   };
 }
 
@@ -494,12 +522,18 @@ router.get(
                 br.extension_decided_by,
                 br.extension_decision_note,
 
+                br.return_requested_at,
+                br.return_requested_by,
+                br.return_request_note,
+                rq.full_name AS return_requested_by_name,
+
                 u.email,
                 u.student_id,
                 u.full_name,
                 b.title
          FROM borrow_records br
          LEFT JOIN users u ON u.id = br.user_id
+         LEFT JOIN users rq ON rq.id = br.return_requested_by
          LEFT JOIN books b ON b.id = br.book_id
          ORDER BY br.borrow_date DESC, br.id DESC`
       );
@@ -546,12 +580,18 @@ router.get("/my", requireAuth, async (req, res, next) => {
               br.extension_decided_by,
               br.extension_decision_note,
 
+              br.return_requested_at,
+              br.return_requested_by,
+              br.return_request_note,
+              rq.full_name AS return_requested_by_name,
+
               u.email,
               u.student_id,
               u.full_name,
               b.title
        FROM borrow_records br
        LEFT JOIN users u ON u.id = br.user_id
+       LEFT JOIN users rq ON rq.id = br.return_requested_by
        LEFT JOIN books b ON b.id = br.book_id
        WHERE br.user_id = $1
        ORDER BY br.borrow_date DESC, br.id DESC`,
@@ -567,7 +607,6 @@ router.get("/my", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/borrow-records/:id/extend
- * (unchanged)
  */
 router.post("/:id/extend", requireAuth, async (req, res, next) => {
   const client = await dbPool.connect();
@@ -673,7 +712,7 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
 
     const prevTotal =
       typeof current.extension_total_days === "number" &&
-        Number.isFinite(current.extension_total_days)
+      Number.isFinite(current.extension_total_days)
         ? current.extension_total_days
         : 0;
 
@@ -709,7 +748,9 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
         });
       }
 
-      const reqStatus = String(current.extension_request_status ?? "none").toLowerCase();
+      const reqStatus = String(
+        current.extension_request_status ?? "none"
+      ).toLowerCase();
       if (reqStatus === "pending") {
         await client.query("ROLLBACK");
         return res.status(409).json({
@@ -795,7 +836,6 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/borrow-records/:id/extend/approve
- * (unchanged)
  */
 router.post(
   "/:id/extend/approve",
@@ -879,7 +919,9 @@ router.post(
         });
       }
 
-      const reqStatus = String(current.extension_request_status ?? "none").toLowerCase();
+      const reqStatus = String(
+        current.extension_request_status ?? "none"
+      ).toLowerCase();
       if (reqStatus !== "pending") {
         await client.query("ROLLBACK");
         return res.status(409).json({
@@ -911,7 +953,7 @@ router.post(
 
       const prevTotal =
         typeof current.extension_total_days === "number" &&
-          Number.isFinite(current.extension_total_days)
+        Number.isFinite(current.extension_total_days)
           ? current.extension_total_days
           : 0;
 
@@ -973,7 +1015,6 @@ router.post(
 
 /**
  * POST /api/borrow-records/:id/extend/disapprove
- * (unchanged)
  */
 router.post(
   "/:id/extend/disapprove",
@@ -1028,7 +1069,9 @@ router.post(
         });
       }
 
-      const reqStatus = String(current.extension_request_status ?? "none").toLowerCase();
+      const reqStatus = String(
+        current.extension_request_status ?? "none"
+      ).toLowerCase();
       if (reqStatus !== "pending") {
         await client.query("ROLLBACK");
         return res.status(409).json({
@@ -1060,6 +1103,118 @@ router.post(
       }
       const record = toDTO(joinedRow, finePerDay);
       return res.json({ ok: true, record });
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      next(err);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/**
+ * POST /api/borrow-records/:id/request-return
+ * Librarian/Admin can request the borrower to return the book.
+ * This uses status = 'pending_return' and records request metadata.
+ */
+router.post(
+  "/:id/request-return",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    const client = await dbPool.connect();
+    try {
+      const session = (req as any).sessionUser as SessionPayload;
+      const actorIdNum = Number(session.sub);
+      const actorId = Number.isFinite(actorIdNum) ? actorIdNum : null;
+
+      const { id } = req.params;
+      const rid = Number(id);
+
+      if (!rid) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
+
+      const note =
+        (req.body || {}).note !== undefined && (req.body || {}).note !== null
+          ? String((req.body || {}).note).trim()
+          : null;
+
+      await client.query("BEGIN");
+
+      const cur = await client.query<{
+        id: number;
+        status: BorrowStatus;
+        return_date: string | null;
+      }>(
+        `SELECT id, status, return_date
+         FROM borrow_records
+         WHERE id = $1
+         FOR UPDATE`,
+        [rid]
+      );
+
+      if (!cur.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+
+      const current = cur.rows[0];
+
+      if (current.return_date || current.status === "returned") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "This borrow record is already returned.",
+        });
+      }
+
+      if (current.status === "pending_return") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: "A return request is already pending for this borrow record.",
+        });
+      }
+
+      if (current.status !== "borrowed") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message:
+            "Only records with status 'borrowed' can be marked as requested for return.",
+        });
+      }
+
+      await client.query(
+        `UPDATE borrow_records
+           SET status = 'pending_return',
+               return_requested_at = NOW(),
+               return_requested_by = $1,
+               return_request_note = $2,
+               updated_at = NOW()
+         WHERE id = $3`,
+        [actorId, note, rid]
+      );
+
+      await client.query("COMMIT");
+
+      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const joinedRow = await fetchBorrowRecordJoined(rid);
+      if (!joinedRow) {
+        return res.status(404).json({ ok: false, message: "Record not found." });
+      }
+
+      const record = toDTO(joinedRow, finePerDay);
+      return res.json({
+        ok: true,
+        record,
+        message: "Return request has been sent.",
+      });
     } catch (err) {
       try {
         await client.query("ROLLBACK");
@@ -1125,8 +1280,8 @@ router.post(
 
       const copies =
         typeof b.rows[0].number_of_copies === "number" &&
-          Number.isFinite(b.rows[0].number_of_copies) &&
-          b.rows[0].number_of_copies! > 0
+        Number.isFinite(b.rows[0].number_of_copies) &&
+        b.rows[0].number_of_copies! > 0
           ? Math.floor(b.rows[0].number_of_copies!)
           : 1;
 
@@ -1140,7 +1295,7 @@ router.post(
 
       const active =
         typeof activeRes.rows[0]?.active_count === "number" &&
-          Number.isFinite(activeRes.rows[0].active_count)
+        Number.isFinite(activeRes.rows[0].active_count)
           ? activeRes.rows[0].active_count
           : 0;
 
@@ -1237,8 +1392,8 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
     const copies =
       typeof b.rows[0].number_of_copies === "number" &&
-        Number.isFinite(b.rows[0].number_of_copies) &&
-        b.rows[0].number_of_copies! > 0
+      Number.isFinite(b.rows[0].number_of_copies) &&
+      b.rows[0].number_of_copies! > 0
         ? Math.floor(b.rows[0].number_of_copies!)
         : 1;
 
@@ -1252,7 +1407,7 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
     const active =
       typeof activeRes.rows[0]?.active_count === "number" &&
-        Number.isFinite(activeRes.rows[0].active_count)
+      Number.isFinite(activeRes.rows[0].active_count)
         ? activeRes.rows[0].active_count
         : 0;
 
@@ -1320,7 +1475,7 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
 /**
  * PATCH /api/borrow-records/:id
- * (unchanged logic; availability is recomputed when status changes)
+ * Availability is recomputed when status changes.
  */
 router.patch("/:id", requireAuth, async (req, res, next) => {
   const client = await dbPool.connect();
@@ -1334,6 +1489,8 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     }
 
     const session = (req as any).sessionUser as SessionPayload;
+    const actorIdNum = Number(session.sub);
+    const actorId = Number.isFinite(actorIdNum) ? actorIdNum : null;
 
     await client.query("BEGIN");
 
@@ -1448,6 +1605,25 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       if (sVal === "returned" && returnDate === undefined) {
         updates.push(`return_date = COALESCE(return_date, CURRENT_DATE)`);
       }
+
+      if (sVal === "pending_return") {
+        const returnRequestNoteRaw =
+          (req.body || {}).returnRequestNote ?? (req.body || {}).note;
+
+        updates.push(`return_requested_at = NOW()`);
+        updates.push(`return_requested_by = $${i++}`);
+        values.push(actorId);
+
+        if (returnRequestNoteRaw !== undefined) {
+          const note =
+            returnRequestNoteRaw !== null &&
+            String(returnRequestNoteRaw).trim().length > 0
+              ? String(returnRequestNoteRaw).trim()
+              : null;
+          updates.push(`return_request_note = $${i++}`);
+          values.push(note);
+        }
+      }
     }
 
     if (returnDate !== undefined) {
@@ -1500,6 +1676,11 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
                    extension_decided_by,
                    extension_decision_note,
 
+                   return_requested_at,
+                   return_requested_by,
+                   return_request_note,
+                   NULL::text AS return_requested_by_name,
+
                    NULL::text AS email,
                    NULL::text AS student_id,
                    NULL::text AS full_name,
@@ -1515,7 +1696,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       const due = new Date(updatedRow.due_date + "T00:00:00Z");
       const end = new Date(
         (updatedRow.return_date || new Date().toISOString().slice(0, 10)) +
-        "T00:00:00Z"
+          "T00:00:00Z"
       );
       const ms = Math.max(0, end.getTime() - due.getTime());
       const days = Math.floor(ms / (1000 * 60 * 60 * 24));
