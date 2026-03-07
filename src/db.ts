@@ -2,9 +2,10 @@ import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 
 /**
  * Connect to Postgres with smart SSL defaults:
- * - Local (localhost/127.0.0.1)  -> SSL OFF
- * - Cloud (Render/Neon/Supabase) -> SSL ON (no-verify)
+ * - Local (localhost/127.0.0.1/private hosts) -> SSL OFF
+ * - Cloud (Render/Neon/Supabase/etc.)         -> SSL ON (no-verify)
  * - Can be overridden with env DATABASE_SSL=true/false
+ * - Respects sslmode in DATABASE_URL when present
  */
 
 type SSLConfig = false | { rejectUnauthorized: false };
@@ -24,6 +25,16 @@ function parseEnvInt(name: string, fallback: number, min = 0): number {
   return parsed;
 }
 
+function parseEnvBool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+
+  return fallback;
+}
+
 function getHostname(url: string): string {
   try {
     return new URL(url).hostname.toLowerCase();
@@ -32,21 +43,64 @@ function getHostname(url: string): string {
   }
 }
 
+function getSSLMode(url: string): string | undefined {
+  try {
+    const value = new URL(url).searchParams.get("sslmode");
+    return value?.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+function isLocalOrPrivateHost(hostname: string): boolean {
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1"
+  ) {
+    return true;
+  }
+
+  if (
+    hostname.endsWith(".local") ||
+    hostname === "postgres" ||
+    hostname === "db" ||
+    hostname === "database"
+  ) {
+    return true;
+  }
+
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname))
+    return true;
+
+  return false;
+}
+
 function computeSSLFlag(url: string): SSLConfig {
-  const explicit = process.env.DATABASE_SSL?.toLowerCase();
+  const explicit = process.env.DATABASE_SSL?.trim().toLowerCase();
   if (explicit === "true") return { rejectUnauthorized: false };
   if (explicit === "false") return false;
 
-  const hostname = getHostname(url);
-  const isLocal =
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1";
+  const sslMode = getSSLMode(url);
+  if (sslMode === "disable") return false;
+  if (
+    sslMode === "require" ||
+    sslMode === "verify-ca" ||
+    sslMode === "verify-full" ||
+    sslMode === "prefer" ||
+    sslMode === "allow" ||
+    sslMode === "no-verify"
+  ) {
+    return { rejectUnauthorized: false };
+  }
 
-  if (isLocal) return false;
+  const hostname = getHostname(url);
+  if (isLocalOrPrivateHost(hostname)) return false;
 
   const looksCloud =
-    /render\.com|neon\.tech|supabase\.co|amazonaws\.com|azure\.com|googleapis\.com/i.test(
+    /render\.com|neon\.tech|supabase\.co|amazonaws\.com|azure\.com|googleapis\.com|railway\.app|aivencloud\.com/i.test(
       hostname
     );
 
@@ -57,11 +111,17 @@ const DB_POOL_MAX = parseEnvInt("DB_POOL_MAX", 10, 1);
 const DB_IDLE_TIMEOUT_MS = parseEnvInt("DB_IDLE_TIMEOUT_MS", 30_000, 1);
 const DB_CONNECTION_TIMEOUT_MS = parseEnvInt(
   "DB_CONNECTION_TIMEOUT_MS",
-  10_000,
+  15_000,
   1
 );
-const DB_QUERY_RETRIES = parseEnvInt("DB_QUERY_RETRIES", 1, 0);
-const DB_RETRY_DELAY_MS = parseEnvInt("DB_RETRY_DELAY_MS", 250, 0);
+const DB_QUERY_RETRIES = parseEnvInt("DB_QUERY_RETRIES", 2, 0);
+const DB_RETRY_DELAY_MS = parseEnvInt("DB_RETRY_DELAY_MS", 500, 0);
+const DB_KEEP_ALIVE = parseEnvBool("DB_KEEP_ALIVE", true);
+const DB_KEEP_ALIVE_INITIAL_DELAY_MS = parseEnvInt(
+  "DB_KEEP_ALIVE_INITIAL_DELAY_MS",
+  10_000,
+  0
+);
 
 export const pool = new Pool({
   connectionString,
@@ -69,6 +129,8 @@ export const pool = new Pool({
   max: DB_POOL_MAX,
   idleTimeoutMillis: DB_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: DB_CONNECTION_TIMEOUT_MS,
+  keepAlive: DB_KEEP_ALIVE,
+  keepAliveInitialDelayMillis: DB_KEEP_ALIVE_INITIAL_DELAY_MS,
 });
 
 pool.on("error", (error: Error) => {
@@ -87,39 +149,93 @@ const RETRYABLE_DB_ERROR_CODES = new Set([
   "EPIPE",
   "ETIMEDOUT",
   "ECONNREFUSED",
+  "ECONNABORTED",
+  "08000",
+  "08001",
+  "08003",
+  "08004",
+  "08006",
   "57P01", // admin_shutdown
   "57P02", // crash_shutdown
   "57P03", // cannot_connect_now
 ]);
 
-function getErrorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null || !("code" in error)) {
-    return undefined;
+type ErrorDetails = {
+  code?: string;
+  message: string;
+};
+
+function getErrorChain(error: unknown): ErrorDetails[] {
+  const chain: ErrorDetails[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+
+    const maybeError = current as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+    };
+
+    chain.push({
+      code:
+        typeof maybeError.code === "string"
+          ? maybeError.code.toUpperCase()
+          : undefined,
+      message:
+        typeof maybeError.message === "string"
+          ? maybeError.message
+          : String(current),
+    });
+
+    current = maybeError.cause;
   }
 
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code.toUpperCase() : undefined;
+  if (chain.length === 0) {
+    chain.push({
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return chain;
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  return getErrorChain(error).find((entry) => entry.code)?.code;
 }
 
 function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return getErrorChain(error)
+    .map((entry) => entry.message)
+    .filter(Boolean)
+    .join(" | ");
 }
 
 function isRetryableDbError(error: unknown): boolean {
-  const code = getErrorCode(error);
+  const chain = getErrorChain(error);
 
-  if (code && RETRYABLE_DB_ERROR_CODES.has(code)) {
+  if (chain.some((entry) => entry.code && RETRYABLE_DB_ERROR_CODES.has(entry.code))) {
     return true;
   }
 
-  const message = getErrorMessage(error).toLowerCase();
+  const combinedMessage = chain
+    .map((entry) => entry.message.toLowerCase())
+    .join(" | ");
 
   return (
-    message.includes("connection terminated unexpectedly") ||
-    message.includes("server closed the connection unexpectedly") ||
-    message.includes("terminating connection due to administrator command") ||
-    message.includes("socket hang up") ||
-    message.includes("read econnreset")
+    combinedMessage.includes("connection terminated due to connection timeout") ||
+    combinedMessage.includes("connection terminated unexpectedly") ||
+    combinedMessage.includes("server closed the connection unexpectedly") ||
+    combinedMessage.includes("terminating connection due to administrator command") ||
+    combinedMessage.includes("socket hang up") ||
+    combinedMessage.includes("read econnreset") ||
+    combinedMessage.includes("connect etimedout") ||
+    combinedMessage.includes("timeout expired") ||
+    combinedMessage.includes("connection timeout") ||
+    combinedMessage.includes("the database system is starting up") ||
+    combinedMessage.includes("could not connect to server")
   );
 }
 
