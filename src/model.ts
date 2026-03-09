@@ -2,16 +2,22 @@ export type Role =
   | "student"
   | "guest"
   | "librarian"
+  | "assistant_librarian"
   | "faculty"
   | "admin"
   | "other";
 
-export type StaffRole = "librarian" | "faculty" | "admin";
+export type StaffRole =
+  | "librarian"
+  | "assistant_librarian"
+  | "faculty"
+  | "admin";
 
 export const ROLE_VALUES: readonly Role[] = [
   "student",
   "guest",
   "librarian",
+  "assistant_librarian",
   "faculty",
   "admin",
   "other",
@@ -19,6 +25,7 @@ export const ROLE_VALUES: readonly Role[] = [
 
 export const STAFF_ROLE_VALUES: readonly StaffRole[] = [
   "librarian",
+  "assistant_librarian",
   "faculty",
   "admin",
 ] as const;
@@ -123,6 +130,14 @@ export function normalizeRole(raw: unknown): Role {
   if (value === "student") return "student";
   if (value === "guest") return "guest";
   if (value === "librarian") return "librarian";
+  if (
+    value === "assistant_librarian" ||
+    value === "assistant librarian" ||
+    value === "assistant-librarian" ||
+    value === "assistantlibrarian"
+  ) {
+    return "assistant_librarian";
+  }
   if (value === "faculty") return "faculty";
   if (value === "admin") return "admin";
 
@@ -141,11 +156,20 @@ export function normalizeRole(raw: unknown): Role {
 }
 
 export function isStaffRole(role: Role): role is StaffRole {
-  return role === "admin" || role === "librarian" || role === "faculty";
+  return (
+    role === "admin" ||
+    role === "librarian" ||
+    role === "assistant_librarian" ||
+    role === "faculty"
+  );
 }
 
 export function isExemptFromApproval(role: Role) {
-  return role === "librarian" || role === "admin";
+  return (
+    role === "librarian" ||
+    role === "assistant_librarian" ||
+    role === "admin"
+  );
 }
 
 /**
