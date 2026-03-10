@@ -110,6 +110,9 @@ const ALLOWED_ROLES: Role[] = [
   "other",
 ];
 
+const ARCHIVED_USER_EMAIL_DOMAIN = "bookhive.local";
+const ARCHIVED_USER_EMAIL_REGEX_SQL = "^deleted\\+.*@bookhive\\.local$";
+
 /**
  * ✅ Effective AUTH role for guards/authorization:
  * - Prefer legacy `role` if it's a staff role
@@ -276,6 +279,16 @@ function generateTemporaryPassword(len = 12) {
   return `${out}A1!`;
 }
 
+function isArchivedUserEmail(email: string | null | undefined) {
+  const value = String(email ?? "").trim().toLowerCase();
+  return /^deleted\+.*@bookhive\.local$/.test(value);
+}
+
+function buildArchivedUserEmail(userId: string) {
+  const safeId = String(userId).replace(/[^a-z0-9_-]/gi, "");
+  return `deleted+${safeId}.${Date.now()}@${ARCHIVED_USER_EMAIL_DOMAIN}`;
+}
+
 async function invalidateEmailVerificationTokens(userId: string) {
   await query(
     `UPDATE email_verifications
@@ -329,6 +342,47 @@ async function createAndSendVerifyEmail(
     subject: "Verify your email • JRMSU-TC Book-Hive",
     html,
   });
+}
+
+async function hasBorrowOrReturnHistory(userId: string) {
+  const result = await query<{ ref_count: string }>(
+    `SELECT (
+        COALESCE((SELECT COUNT(*) FROM borrow_records WHERE user_id::text = $1), 0) +
+        COALESCE((SELECT COUNT(*) FROM borrow_records WHERE return_requested_by::text = $1), 0) +
+        COALESCE((SELECT COUNT(*) FROM borrow_records WHERE extension_decided_by::text = $1), 0)
+      )::text AS ref_count`,
+    [userId]
+  );
+
+  const count = Number(result.rows[0]?.ref_count ?? 0);
+  return Number.isFinite(count) && count > 0;
+}
+
+async function archiveUserToPreserveRecords(userId: string) {
+  const archivedEmail = buildArchivedUserEmail(userId);
+  const archivedPasswordHash = await bcrypt.hash(generateTemporaryPassword(24), 10);
+
+  await invalidateEmailVerificationTokens(userId);
+
+  await query(
+    `UPDATE users
+       SET email = $1,
+           password_hash = $2,
+           account_type = 'other',
+           role = 'other',
+           student_id = NULL,
+           course = NULL,
+           year_level = NULL,
+           avatar_url = NULL,
+           is_email_verified = FALSE,
+           email_verified_at = NULL,
+           is_approved = FALSE,
+           approved_at = NULL,
+           approved_by = NULL,
+           updated_at = NOW()
+     WHERE id = $3`,
+    [archivedEmail, archivedPasswordHash, userId]
+  );
 }
 
 /**
@@ -1099,7 +1153,9 @@ router.get("/", requireAuth, requireRole(["librarian", "admin"]), async (_req, r
               is_approved, approved_at, approved_by,
               created_at
          FROM users
-         ORDER BY created_at DESC, id DESC`
+         WHERE email !~ $1
+         ORDER BY created_at DESC, id DESC`,
+      [ARCHIVED_USER_EMAIL_REGEX_SQL]
     );
 
     const users = result.rows.map(toUserListDTO);
@@ -1118,7 +1174,9 @@ router.get("/pending", requireAuth, requireRole(["librarian", "admin"]), async (
               created_at
          FROM users
          WHERE is_approved = FALSE
-         ORDER BY created_at DESC, id DESC`
+           AND email !~ $1
+         ORDER BY created_at DESC, id DESC`,
+      [ARCHIVED_USER_EMAIL_REGEX_SQL]
     );
 
     const pending = result.rows
@@ -1279,6 +1337,24 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
           message: "Cannot delete assistant librarian/librarian/admin accounts.",
         });
       }
+    }
+
+    if (isArchivedUserEmail(row.email)) {
+      return res.json({
+        ok: true,
+        message: "User is already deleted and archived.",
+      });
+    }
+
+    const mustPreserveRecords =
+      effRole === "assistant_librarian" || (await hasBorrowOrReturnHistory(targetId));
+
+    if (mustPreserveRecords) {
+      await archiveUserToPreserveRecords(targetId);
+      return res.json({
+        ok: true,
+        message: "User deleted. Account was archived to preserve borrow/return records.",
+      });
     }
 
     await query(`DELETE FROM users WHERE id = $1`, [targetId]);
