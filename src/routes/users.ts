@@ -10,7 +10,13 @@ import { buildLoginCredentialsEmail } from "../lib/email-templates/login-credent
 
 const router = express.Router();
 
-type Role = "student" | "librarian" | "faculty" | "admin" | "other";
+type Role =
+  | "student"
+  | "assistant_librarian"
+  | "librarian"
+  | "faculty"
+  | "admin"
+  | "other";
 
 /** Minimal DB row for users list + role resolution */
 type UserRow = {
@@ -30,7 +36,7 @@ type UserRow = {
   // ✅ email verified (for /me response)
   is_email_verified?: boolean;
 
-  // ✅ NEW: approval
+  // ✅ approval
   is_approved?: boolean;
   approved_at?: string | null;
   approved_by?: string | null;
@@ -56,7 +62,6 @@ type UserAuthRow = {
   is_email_verified?: boolean;
   avatar_url?: string | null;
 
-  // ✅ NEW: approval
   is_approved?: boolean;
   approved_at?: string | null;
   approved_by?: string | null;
@@ -65,8 +70,8 @@ type UserAuthRow = {
 type SessionPayload = {
   sub: string;
   email: string;
-  role: Role; // ✅ effective role from JWT (still re-checked in DB for privileged routes)
-  ev: number; // email verified flag (0/1)
+  role: Role;
+  ev: number;
 };
 
 /* ---------------- Role helpers ---------------- */
@@ -74,6 +79,13 @@ type SessionPayload = {
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
+  if (
+    v === "assistant_librarian" ||
+    v === "assistant librarian" ||
+    v === "assistant-librarian"
+  ) {
+    return "assistant_librarian";
+  }
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
@@ -81,10 +93,22 @@ function normalizeRole(raw: unknown): Role {
 }
 
 function isStaffRole(role: Role) {
-  return role === "admin" || role === "librarian" || role === "faculty";
+  return (
+    role === "admin" ||
+    role === "librarian" ||
+    role === "assistant_librarian" ||
+    role === "faculty"
+  );
 }
 
-const ALLOWED_ROLES: Role[] = ["student", "librarian", "faculty", "admin", "other"];
+const ALLOWED_ROLES: Role[] = [
+  "student",
+  "assistant_librarian",
+  "librarian",
+  "faculty",
+  "admin",
+  "other",
+];
 
 /**
  * ✅ Effective AUTH role for guards/authorization:
@@ -92,15 +116,17 @@ const ALLOWED_ROLES: Role[] = ["student", "librarian", "faculty", "admin", "othe
  * - Else if account_type is staff role use it
  * - Else if legacy role exists use it (student/other)
  * - Else fallback to account_type
- *
- * This fixes admin accounts that have account_type="other/student"
- * but role="admin".
  */
-function computeEffectiveRoleFromRow(row: Pick<UserRow, "account_type" | "role">): Role {
+function computeEffectiveRoleFromRow(
+  row: Pick<UserRow, "account_type" | "role">
+): Role {
   const accountType = normalizeRole(row.account_type);
 
   const legacyRaw = row.role;
-  const legacyHasValue = legacyRaw !== undefined && legacyRaw !== null && String(legacyRaw).trim().length > 0;
+  const legacyHasValue =
+    legacyRaw !== undefined &&
+    legacyRaw !== null &&
+    String(legacyRaw).trim().length > 0;
 
   const legacyRole = normalizeRole(legacyRaw);
 
@@ -112,7 +138,9 @@ function computeEffectiveRoleFromRow(row: Pick<UserRow, "account_type" | "role">
 }
 
 function isExemptFromApproval(role: Role) {
-  return role === "librarian" || role === "admin";
+  return (
+    role === "assistant_librarian" || role === "librarian" || role === "admin"
+  );
 }
 
 /* ---------------- Session / guards ---------------- */
@@ -133,7 +161,11 @@ function readSession(req: express.Request): SessionPayload | null {
   }
 }
 
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+function requireAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
   const s = readSession(req);
   if (!s) {
     return res.status(401).json({ ok: false, message: "Not authenticated." });
@@ -164,9 +196,10 @@ function requireRole(roles: Role[]) {
       }
       const effective = computeEffectiveRoleFromRow(r.rows[0]);
       if (!roles.includes(effective)) {
-        return res.status(403).json({ ok: false, message: "Forbidden: insufficient role." });
+        return res
+          .status(403)
+          .json({ ok: false, message: "Forbidden: insufficient role." });
       }
-      // keep effective role in request context
       (req as any).sessionUser = { ...s, role: effective };
       next();
     } catch (err) {
@@ -198,17 +231,12 @@ function escapeHtml(input: string) {
 }
 
 function getClientBaseUrl() {
-  return (process.env.CLIENT_ORIGIN || "http://localhost:5173").toString().replace(/\/+$/, "");
+  return (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .toString()
+    .replace(/\/+$/, "");
 }
 
 function getLoginUrl() {
-  /**
-   * ✅ FIX:
-   * Your React app routes login at "/auth" (no "/auth/login").
-   * - Optional override:
-   *   - CLIENT_LOGIN_URL: full URL (e.g. https://bookhive.jrmsu-tc.cloud/auth)
-   *   - CLIENT_LOGIN_PATH: path only (e.g. /auth)
-   */
   const full = String(process.env.CLIENT_LOGIN_URL ?? "").trim();
   if (full) return full.replace(/\/+$/, "");
 
@@ -231,13 +259,16 @@ function readIdParam(raw: unknown): string | null {
   return id;
 }
 
-function safeAccountType(raw: unknown): "student" | "other" {
+function safeAccountType(
+  raw: unknown
+): "student" | "assistant_librarian" | "other" {
   const r = normalizeRole(raw);
-  return r === "student" ? "student" : "other";
+  if (r === "student") return "student";
+  if (r === "assistant_librarian") return "assistant_librarian";
+  return "other";
 }
 
 function generateTemporaryPassword(len = 12) {
-  // Readable, strong temp password (avoid ambiguous chars)
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
   const bytes = crypto.randomBytes(Math.max(16, len));
   let out = "";
@@ -246,7 +277,6 @@ function generateTemporaryPassword(len = 12) {
 }
 
 async function invalidateEmailVerificationTokens(userId: string) {
-  // Mark all unused tokens used so only the newest can be used.
   await query(
     `UPDATE email_verifications
      SET used = TRUE
@@ -256,11 +286,10 @@ async function invalidateEmailVerificationTokens(userId: string) {
 }
 
 async function createEmailVerificationToken(userId: string) {
-  // Invalidate existing unused tokens first
   await invalidateEmailVerificationTokens(userId);
 
   const token = crypto.randomBytes(32).toString("hex");
-  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
   await query(
     `INSERT INTO email_verifications (user_id, token, expires_at)
@@ -268,15 +297,24 @@ async function createEmailVerificationToken(userId: string) {
     [userId, token, expiresAt]
   );
 
-  const confirmUrl = `${getClientBaseUrl()}/auth/verify-email/callback?token=${encodeURIComponent(token)}`;
+  const confirmUrl = `${getClientBaseUrl()}/auth/verify-email/callback?token=${encodeURIComponent(
+    token
+  )}`;
 
   return { token, expiresAt, confirmUrl };
 }
 
-async function createAndSendVerifyEmail(userId: string, email: string, fullName?: string) {
+async function createAndSendVerifyEmail(
+  userId: string,
+  email: string,
+  fullName?: string
+) {
   const { confirmUrl } = await createEmailVerificationToken(userId);
 
-  const safeName = fullName && fullName.trim().length > 0 ? escapeHtml(fullName.trim()) : "there";
+  const safeName =
+    fullName && fullName.trim().length > 0
+      ? escapeHtml(fullName.trim())
+      : "there";
 
   const html = `
     <p>Hi ${safeName},</p>
@@ -296,8 +334,8 @@ async function createAndSendVerifyEmail(userId: string, email: string, fullName?
 /**
  * ✅ IMPORTANT:
  * Return BOTH:
- * - accountType: based on DB `account_type` (often student/other)
- * - role: effective auth role (what the frontend must guard/redirect with)
+ * - accountType: based on DB `account_type`
+ * - role: effective auth role
  */
 function toMeDTO(row: UserRow) {
   const role = computeEffectiveRoleFromRow(row);
@@ -309,11 +347,10 @@ function toMeDTO(row: UserRow) {
     fullName: row.full_name,
 
     accountType,
-    role, // ✅ NEW
+    role,
 
     isEmailVerified: Boolean(row.is_email_verified),
 
-    // ✅ NEW
     isApproved: Boolean(row.is_approved),
     approvedAt: row.approved_at ?? null,
 
@@ -334,11 +371,10 @@ function toUserListDTO(row: UserRow) {
     fullName: row.full_name,
 
     accountType,
-    role, // ✅ NEW (handy for admin UI)
+    role,
 
     avatarUrl: row.avatar_url ?? null,
 
-    // ✅ NEW
     isApproved: Boolean(row.is_approved),
     approvedAt: row.approved_at ?? null,
     createdAt: row.created_at ?? null,
@@ -377,7 +413,7 @@ async function fetchMeAuthRow(userId: string) {
 
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (/^image\//i.test(file.mimetype)) return cb(null, true);
     cb(new Error("Only image uploads are allowed."));
@@ -388,12 +424,6 @@ const avatarUpload = multer({
 
 /**
  * PATCH /api/users/me
- * Update personal info for the current user.
- *
- * ✅ Supported body keys:
- * - fullName?, email?, course?
- * - yearLevel? OR year_level?
- * - studentId? OR student_id?
  */
 router.patch("/me", requireAuth, async (req, res, next) => {
   try {
@@ -410,8 +440,6 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     const fullNameRaw = req.body?.fullName;
     const emailRaw = req.body?.email;
     const courseRaw = req.body?.course;
-
-    // ✅ accept camelCase OR snake_case
     const yearLevelRaw = req.body?.yearLevel ?? req.body?.year_level;
     const studentIdRaw = req.body?.studentId ?? req.body?.student_id;
 
@@ -424,7 +452,9 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (fullNameRaw !== undefined) {
       const fullName = String(fullNameRaw || "").trim();
       if (!fullName) {
-        return res.status(400).json({ ok: false, message: "fullName cannot be empty." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "fullName cannot be empty." });
       }
       updates.push(`full_name = $${i++}`);
       values.push(fullName);
@@ -433,26 +463,34 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (emailRaw !== undefined) {
       const nextEmailRaw = String(emailRaw || "").trim();
       if (!nextEmailRaw) {
-        return res.status(400).json({ ok: false, message: "email cannot be empty." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "email cannot be empty." });
       }
       if (!isValidEmail(nextEmailRaw)) {
-        return res.status(400).json({ ok: false, message: "Invalid email address." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "Invalid email address." });
       }
 
       const nextEmail = nextEmailRaw.toLowerCase();
       const currentEmail = String(row.email || "").trim().toLowerCase();
 
       if (nextEmail !== currentEmail) {
-        const dupe = await query(`SELECT 1 FROM users WHERE email = $1 AND id <> $2 LIMIT 1`, [nextEmail, s.sub]);
+        const dupe = await query(
+          `SELECT 1 FROM users WHERE email = $1 AND id <> $2 LIMIT 1`,
+          [nextEmail, s.sub]
+        );
         if (dupe.rowCount) {
-          return res.status(409).json({ ok: false, message: "Email already in use." });
+          return res
+            .status(409)
+            .json({ ok: false, message: "Email already in use." });
         }
 
         emailChanged = true;
         updates.push(`email = $${i++}`);
         values.push(nextEmail);
 
-        // mark unverified + clear verified timestamp
         updates.push(`is_email_verified = FALSE`);
         updates.push(`email_verified_at = NULL`);
       }
@@ -461,7 +499,9 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (courseRaw !== undefined) {
       const course = cleanOptionalText(courseRaw);
       if (effectiveRole === "student" && !course) {
-        return res.status(400).json({ ok: false, message: "course is required for students." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "course is required for students." });
       }
       updates.push(`course = $${i++}`);
       values.push(course);
@@ -470,30 +510,34 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     if (yearLevelRaw !== undefined) {
       const yearLevel = cleanOptionalText(yearLevelRaw);
       if (effectiveRole === "student" && !yearLevel) {
-        return res.status(400).json({ ok: false, message: "yearLevel is required for students." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "yearLevel is required for students." });
       }
       updates.push(`year_level = $${i++}`);
       values.push(yearLevel);
     }
 
-    // ✅ FIX: allow updating student_id and ensure it persists
     if (studentIdRaw !== undefined) {
       const nextStudentId = cleanOptionalText(studentIdRaw);
       if (effectiveRole === "student" && !nextStudentId) {
-        return res.status(400).json({ ok: false, message: "studentId is required for students." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "studentId is required for students." });
       }
 
       const currentStudentId = cleanOptionalText((row as any).student_id);
 
-      // Only check duplicates + update if actually changed
       if (nextStudentId !== currentStudentId) {
         if (nextStudentId) {
-          const sidDupe = await query(`SELECT 1 FROM users WHERE student_id = $1 AND id <> $2 LIMIT 1`, [
-            nextStudentId,
-            s.sub,
-          ]);
+          const sidDupe = await query(
+            `SELECT 1 FROM users WHERE student_id = $1 AND id <> $2 LIMIT 1`,
+            [nextStudentId, s.sub]
+          );
           if (sidDupe.rowCount) {
-            return res.status(409).json({ ok: false, message: "Student ID already in use." });
+            return res
+              .status(409)
+              .json({ ok: false, message: "Student ID already in use." });
           }
         }
 
@@ -515,7 +559,6 @@ router.patch("/me", requireAuth, async (req, res, next) => {
       [...values, s.sub]
     );
 
-    // If email changed: invalidate all old tokens
     if (emailChanged) {
       await invalidateEmailVerificationTokens(s.sub);
     }
@@ -565,7 +608,9 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
     const newPassword = String(req.body?.newPassword ?? "");
 
     if (!currentPassword.trim()) {
-      return res.status(400).json({ ok: false, message: "Current password is required." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Current password is required." });
     }
     if (newPassword.length < 8) {
       return res.status(400).json({
@@ -582,7 +627,9 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
     const user = meRow.rows[0];
     const ok = await bcrypt.compare(currentPassword, user.password_hash);
     if (!ok) {
-      return res.status(401).json({ ok: false, message: "Current password is incorrect." });
+      return res
+        .status(401)
+        .json({ ok: false, message: "Current password is incorrect." });
     }
 
     const hash = await bcrypt.hash(newPassword, 10);
@@ -603,37 +650,42 @@ router.patch("/me/password", requireAuth, async (req, res, next) => {
 /**
  * POST /api/users/me/avatar
  */
-router.post("/me/avatar", requireAuth, avatarUpload.single("avatar"), async (req, res, next) => {
-  try {
-    const s = (req as any).sessionUser as SessionPayload;
+router.post(
+  "/me/avatar",
+  requireAuth,
+  avatarUpload.single("avatar"),
+  async (req, res, next) => {
+    try {
+      const s = (req as any).sessionUser as SessionPayload;
 
-    if (!req.file) {
-      return res.status(400).json({ ok: false, message: "Missing avatar file." });
-    }
+      if (!req.file) {
+        return res.status(400).json({ ok: false, message: "Missing avatar file." });
+      }
 
-    const url = await uploadImageToS3({
-      buffer: req.file.buffer,
-      contentType: req.file.mimetype,
-      folder: "avatars",
-    });
+      const url = await uploadImageToS3({
+        buffer: req.file.buffer,
+        contentType: req.file.mimetype,
+        folder: "avatars",
+      });
 
-    await query(
-      `UPDATE users
+      await query(
+        `UPDATE users
          SET avatar_url = $1, updated_at = NOW()
          WHERE id = $2`,
-      [url, s.sub]
-    );
+        [url, s.sub]
+      );
 
-    const refreshed = await fetchMeRow(s.sub);
-    if (!refreshed.rowCount) {
-      return res.status(401).json({ ok: false, message: "Not authenticated." });
+      const refreshed = await fetchMeRow(s.sub);
+      if (!refreshed.rowCount) {
+        return res.status(401).json({ ok: false, message: "Not authenticated." });
+      }
+
+      return res.json({ ok: true, user: toMeDTO(refreshed.rows[0]) });
+    } catch (err) {
+      next(err);
     }
-
-    return res.json({ ok: true, user: toMeDTO(refreshed.rows[0]) });
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 /**
  * DELETE /api/users/me/avatar
@@ -661,17 +713,12 @@ router.delete("/me/avatar", requireAuth, async (req, res, next) => {
 });
 
 /* =======================================================================
-   ✅ NEW (ADMIN): Create user + Change role + Send/Resend Credentials
+   ✅ ADMIN: Create user + Change role + Send/Resend Credentials
    ======================================================================= */
 
 /**
  * POST /api/users
  * Admin-only: create a new user (add new user).
- *
- * ✅ NEW:
- * - sendLoginCredentials?: boolean (default TRUE)
- * - autoGeneratePassword?: boolean
- *   If true AND password is missing, backend generates a temporary password.
  */
 router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => {
   try {
@@ -680,35 +727,48 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
     const fullName = String(req.body?.fullName ?? "").trim();
     const emailRaw = String(req.body?.email ?? "").trim();
 
-    const roleRaw = req.body?.role ?? req.body?.userRole ?? req.body?.accountType ?? "student";
+    const roleRaw =
+      req.body?.role ?? req.body?.userRole ?? req.body?.accountType ?? "student";
     const role = normalizeRole(roleRaw);
 
-    // accountType is informational only (prefer explicit accountType, fallback derived)
     const accountTypeRaw = req.body?.accountType ?? req.body?.account_type;
-    const accountType = accountTypeRaw !== undefined ? safeAccountType(accountTypeRaw) : role === "student" ? "student" : "other";
+    const accountType =
+      accountTypeRaw !== undefined
+        ? safeAccountType(accountTypeRaw)
+        : role === "student"
+          ? "student"
+          : role === "assistant_librarian"
+            ? "assistant_librarian"
+            : "other";
 
     const isApprovedRaw = req.body?.isApproved;
 
-    // Student fields depend on "student-ness" (role OR accountType)
     const needsStudentFields = role === "student" || accountType === "student";
-    const studentId = cleanOptionalText(req.body?.studentId ?? req.body?.student_id);
+    const studentId = cleanOptionalText(
+      req.body?.studentId ?? req.body?.student_id
+    );
     const course = cleanOptionalText(req.body?.course);
-    const yearLevel = cleanOptionalText(req.body?.yearLevel ?? req.body?.year_level);
+    const yearLevel = cleanOptionalText(
+      req.body?.yearLevel ?? req.body?.year_level
+    );
 
     const sendLoginCredentials = req.body?.sendLoginCredentials !== false;
     const autoGeneratePassword = req.body?.autoGeneratePassword === true;
 
     if (!fullName) {
-      return res.status(400).json({ ok: false, message: "Full name is required." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Full name is required." });
     }
     if (!emailRaw || !isValidEmail(emailRaw)) {
-      return res.status(400).json({ ok: false, message: "Valid email is required." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Valid email is required." });
     }
     if (!ALLOWED_ROLES.includes(role)) {
       return res.status(400).json({ ok: false, message: "Invalid role." });
     }
 
-    // Student fields required if "student"
     if (needsStudentFields) {
       if (!studentId || !course || !yearLevel) {
         return res.status(400).json({
@@ -716,24 +776,26 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
           message: "Student fields are required (studentId, course, yearLevel).",
         });
       }
-      const sidDupe = await query(`SELECT 1 FROM users WHERE student_id = $1 LIMIT 1`, [studentId]);
+      const sidDupe = await query(
+        `SELECT 1 FROM users WHERE student_id = $1 LIMIT 1`,
+        [studentId]
+      );
       if (sidDupe.rowCount) {
-        return res.status(409).json({ ok: false, message: "Student ID already in use." });
+        return res
+          .status(409)
+          .json({ ok: false, message: "Student ID already in use." });
       }
     }
 
     const email = emailRaw.toLowerCase();
 
-    const emailDupe = await query(`SELECT 1 FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const emailDupe = await query(`SELECT 1 FROM users WHERE email = $1 LIMIT 1`, [
+      email,
+    ]);
     if (emailDupe.rowCount) {
       return res.status(409).json({ ok: false, message: "Email already in use." });
     }
 
-    // Password rules:
-    // - If password is provided: must be >= 8
-    // - If missing: allow auto-generate when:
-    //   - autoGeneratePassword is true OR sendLoginCredentials is true
-    //   - otherwise require admin to provide a password (since no one will receive it)
     const providedPasswordRaw = String(req.body?.password ?? "");
     const providedPassword = providedPasswordRaw.trim();
     let effectivePassword = providedPassword;
@@ -746,7 +808,8 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
       } else {
         return res.status(400).json({
           ok: false,
-          message: "Password is required when not sending login credentials (or enable auto-generate).",
+          message:
+            "Password is required when not sending login credentials (or enable auto-generate).",
         });
       }
     } else if (effectivePassword.length < 8) {
@@ -756,18 +819,15 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
       });
     }
 
-    // Approval rules:
-    // - Admin/librarian are exempt => approved true
-    // - otherwise admin can choose isApproved (default false)
-    const approved = isExemptFromApproval(role) ? true : Boolean(isApprovedRaw === true);
+    const approved = isExemptFromApproval(role)
+      ? true
+      : Boolean(isApprovedRaw === true);
 
     const approvedAt = approved ? new Date() : null;
     const approvedBy = approved ? s.sub : null;
 
     const hash = await bcrypt.hash(effectivePassword, 10);
 
-    // Create user. We set BOTH account_type + role for compatibility.
-    // is_email_verified stays FALSE; user must verify email.
     const ins = await query<UserRow>(
       `INSERT INTO users
        (full_name, email, password_hash,
@@ -793,8 +853,8 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
         fullName,
         email,
         hash,
-        accountType, // informational only
-        role, // auth role
+        accountType,
+        role,
         needsStudentFields ? studentId : null,
         needsStudentFields ? course : null,
         needsStudentFields ? yearLevel : null,
@@ -806,7 +866,6 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
 
     const user = ins.rows[0];
 
-    // Email results (so frontend can show accurate toast)
     let credentialsSent = false;
     let credentialsError: string | null = null;
 
@@ -833,10 +892,11 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
 
         credentialsSent = true;
       } catch (e: any) {
-        credentialsError = e?.message ? String(e.message) : "Failed to send login credentials email.";
+        credentialsError = e?.message
+          ? String(e.message)
+          : "Failed to send login credentials email.";
         console.warn("Failed sending login credentials email (admin create):", e);
 
-        // Fallback: still try to send a verify email (best-effort)
         try {
           await createAndSendVerifyEmail(user.id, user.email, user.full_name);
         } catch (err) {
@@ -844,7 +904,6 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
         }
       }
     } else {
-      // Best-effort verify email only
       try {
         await createAndSendVerifyEmail(user.id, user.email, user.full_name);
       } catch (e) {
@@ -870,93 +929,96 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
 /**
  * POST /api/users/:id/send-login-credentials
  * Admin-only: send (or re-send) login credentials.
- *
- * ✅ Behavior:
- * - If body.password is provided: sets that as the NEW password (min 8 chars)
- * - Otherwise: generates a NEW temporary password
- * - Emails the user their email + temporary password
- * - If user isn't verified yet, includes a fresh verify-email link
  */
-router.post("/:id/send-login-credentials", requireAuth, requireRole(["admin"]), async (req, res, next) => {
-  try {
-    const targetId = readIdParam(req.params.id);
-    if (!targetId) {
-      return res.status(400).json({ ok: false, message: "Invalid user id." });
-    }
+router.post(
+  "/:id/send-login-credentials",
+  requireAuth,
+  requireRole(["admin"]),
+  async (req, res, next) => {
+    try {
+      const targetId = readIdParam(req.params.id);
+      if (!targetId) {
+        return res.status(400).json({ ok: false, message: "Invalid user id." });
+      }
 
-    const found = await query<{
-      id: string;
-      email: string;
-      full_name: string;
-      is_email_verified: boolean;
-    }>(
-      `SELECT id, email, full_name, is_email_verified
+      const found = await query<{
+        id: string;
+        email: string;
+        full_name: string;
+        is_email_verified: boolean;
+      }>(
+        `SELECT id, email, full_name, is_email_verified
          FROM users
          WHERE id = $1
          LIMIT 1`,
-      [targetId]
-    );
+        [targetId]
+      );
 
-    if (!found.rowCount) {
-      return res.status(404).json({ ok: false, message: "User not found." });
-    }
+      if (!found.rowCount) {
+        return res.status(404).json({ ok: false, message: "User not found." });
+      }
 
-    const user = found.rows[0];
+      const user = found.rows[0];
 
-    const providedRaw = req.body?.password;
-    const provided = typeof providedRaw === "string" ? providedRaw.trim() : "";
+      const providedRaw = req.body?.password;
+      const provided = typeof providedRaw === "string" ? providedRaw.trim() : "";
 
-    let nextPassword = provided;
-    let passwordGenerated = false;
+      let nextPassword = provided;
+      let passwordGenerated = false;
 
-    if (!nextPassword) {
-      nextPassword = generateTemporaryPassword();
-      passwordGenerated = true;
-    } else if (nextPassword.length < 8) {
-      return res.status(400).json({
-        ok: false,
-        message: "Password must be at least 8 characters.",
-      });
-    }
+      if (!nextPassword) {
+        nextPassword = generateTemporaryPassword();
+        passwordGenerated = true;
+      } else if (nextPassword.length < 8) {
+        return res.status(400).json({
+          ok: false,
+          message: "Password must be at least 8 characters.",
+        });
+      }
 
-    const hash = await bcrypt.hash(nextPassword, 10);
+      const hash = await bcrypt.hash(nextPassword, 10);
 
-    await query(
-      `UPDATE users
+      await query(
+        `UPDATE users
          SET password_hash = $1, updated_at = NOW()
          WHERE id = $2`,
-      [hash, targetId]
-    );
+        [hash, targetId]
+      );
 
-    const loginUrl = getLoginUrl();
+      const loginUrl = getLoginUrl();
 
-    let verifyUrl: string | null = null;
-    if (!user.is_email_verified) {
-      const { confirmUrl } = await createEmailVerificationToken(user.id);
-      verifyUrl = confirmUrl;
+      let verifyUrl: string | null = null;
+      if (!user.is_email_verified) {
+        const { confirmUrl } = await createEmailVerificationToken(user.id);
+        verifyUrl = confirmUrl;
+      }
+
+      const tpl = buildLoginCredentialsEmail({
+        appName: "JRMSU-TC Book-Hive",
+        fullName: user.full_name,
+        email: user.email,
+        temporaryPassword: nextPassword,
+        loginUrl,
+        verifyEmailUrl: verifyUrl,
+      });
+
+      await sendMail({
+        to: user.email,
+        subject: tpl.subject,
+        html: tpl.html,
+        text: tpl.text,
+      });
+
+      return res.json({
+        ok: true,
+        message: "Login credentials sent.",
+        passwordGenerated,
+      });
+    } catch (err) {
+      next(err);
     }
-
-    const tpl = buildLoginCredentialsEmail({
-      appName: "JRMSU-TC Book-Hive",
-      fullName: user.full_name,
-      email: user.email,
-      temporaryPassword: nextPassword,
-      loginUrl,
-      verifyEmailUrl: verifyUrl,
-    });
-
-    await sendMail({
-      to: user.email,
-      subject: tpl.subject,
-      html: tpl.html,
-      text: tpl.text,
-    });
-
-    return res.json({ ok: true, message: "Login credentials sent.", passwordGenerated });
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 /**
  * PATCH /api/users/:id/role
@@ -972,7 +1034,6 @@ router.patch("/:id/role", requireAuth, requireRole(["admin"]), async (req, res, 
       return res.status(400).json({ ok: false, message: "Invalid user id." });
     }
 
-    // Safety: prevent changing your own role (avoids lock-out)
     if (String(s.sub) === targetId) {
       return res.status(400).json({
         ok: false,
@@ -1001,7 +1062,6 @@ router.patch("/:id/role", requireAuth, requireRole(["admin"]), async (req, res, 
       return res.status(404).json({ ok: false, message: "User not found." });
     }
 
-    // If switching INTO an exempt role => force approve true.
     const forceApprove = isExemptFromApproval(nextRole);
 
     await query(
@@ -1064,7 +1124,6 @@ router.get("/pending", requireAuth, requireRole(["librarian", "admin"]), async (
     const pending = result.rows
       .map((r) => {
         const eff = computeEffectiveRoleFromRow(r);
-        // Don’t show exempt roles as "pending" even if data is weird
         if (isExemptFromApproval(eff)) return null;
         return toUserListDTO(r);
       })
@@ -1187,7 +1246,9 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
     }
 
     if (String(s.sub) === targetId) {
-      return res.status(400).json({ ok: false, message: "You cannot delete your own account." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "You cannot delete your own account." });
     }
 
     const found = await query<UserRow>(
@@ -1205,7 +1266,6 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
     const row = found.rows[0];
     const effRole = computeEffectiveRoleFromRow(row);
 
-    // Librarian restriction: only delete NOT approved + NOT exempt
     if (s.role === "librarian") {
       if (row.is_approved) {
         return res.status(403).json({
@@ -1216,7 +1276,7 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
       if (isExemptFromApproval(effRole)) {
         return res.status(403).json({
           ok: false,
-          message: "Cannot delete librarian/admin accounts.",
+          message: "Cannot delete assistant librarian/librarian/admin accounts.",
         });
       }
     }
@@ -1234,7 +1294,9 @@ router.get("/check-student-id", async (req, res, next) => {
     const studentId = String(req.query.studentId || "").trim();
     if (!studentId) return res.status(400).json({ available: false });
 
-    const found = await query(`SELECT 1 FROM users WHERE student_id = $1 LIMIT 1`, [studentId]);
+    const found = await query(`SELECT 1 FROM users WHERE student_id = $1 LIMIT 1`, [
+      studentId,
+    ]);
     res.json({ available: found.rowCount === 0 });
   } catch (err) {
     next(err);

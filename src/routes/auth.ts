@@ -8,7 +8,13 @@ import { sendMail } from "../email";
 
 const router = express.Router();
 
-type Role = "student" | "librarian" | "faculty" | "admin" | "other";
+type Role =
+  | "student"
+  | "assistant_librarian"
+  | "librarian"
+  | "faculty"
+  | "admin"
+  | "other";
 
 type UserRow = {
   id: string;
@@ -51,6 +57,13 @@ type UserRow = {
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
+  if (
+    v === "assistant_librarian" ||
+    v === "assistant librarian" ||
+    v === "assistant-librarian"
+  ) {
+    return "assistant_librarian";
+  }
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
@@ -58,17 +71,22 @@ function normalizeRole(raw: unknown): Role {
 }
 
 function isStaffRole(role: Role) {
-  return role === "admin" || role === "librarian" || role === "faculty";
+  return (
+    role === "admin" ||
+    role === "librarian" ||
+    role === "assistant_librarian" ||
+    role === "faculty"
+  );
 }
 
 /**
  * ✅ Effective AUTH role for guards/redirects:
- * - Prefer `user.role` if it is a staff role (admin/librarian/faculty)
+ * - Prefer `user.role` if it is a staff role (admin/librarian/assistant_librarian/faculty)
  * - Otherwise, if account_type is a staff role, use it
  * - Otherwise, if user.role exists (student/other), use it
  * - Otherwise fallback to account_type (or student)
  *
- * This fixes the bug where an admin user might still have account_type="other"
+ * This fixes the bug where a staff user might still have account_type="other"
  * and gets routed to the student/guest dashboard.
  */
 function getEffectiveRole(user: UserRow): Role {
@@ -265,7 +283,9 @@ function readSession(
 }
 
 function isExemptFromApproval(role: Role) {
-  return role === "librarian" || role === "admin";
+  return (
+    role === "assistant_librarian" || role === "librarian" || role === "admin"
+  );
 }
 
 // --- Routes ---
@@ -291,7 +311,7 @@ router.get("/me", async (req, res, next) => {
     // ✅ role is authoritative for routing/guarding
     const role = getEffectiveRole(user);
 
-    // keep whatever your DB says for account_type (often student/other)
+    // keep whatever your DB says for account_type
     const accountType = normalizeRole(user.account_type);
 
     return res.json({
@@ -302,11 +322,11 @@ router.get("/me", async (req, res, next) => {
         fullName: user.full_name,
 
         accountType,
-        role, // ✅ NEW: client must use this for redirects/guards
+        role, // ✅ client must use this for redirects/guards
 
         isEmailVerified: user.is_email_verified,
 
-        // ✅ NEW: approval status
+        // ✅ approval status
         isApproved: Boolean(user.is_approved),
         approvedAt: user.approved_at ?? null,
 
@@ -361,6 +381,7 @@ router.post("/register", async (req, res, next) => {
 
     const allowed: Role[] = [
       "student",
+      "assistant_librarian",
       "librarian",
       "faculty",
       "admin",
@@ -424,7 +445,7 @@ router.post("/register", async (req, res, next) => {
 
     const hash = await bcrypt.hash(String(password), 10);
 
-    // ✅ NEW: approval logic
+    // ✅ approval logic
     const roleForApproval = accountType as Role;
     const approved = isExemptFromApproval(roleForApproval);
 
@@ -467,20 +488,17 @@ router.post("/register", async (req, res, next) => {
         fullName: user.full_name,
 
         accountType: accountTypeNormalized,
-        role, // ✅ NEW
+        role,
 
         isEmailVerified: user.is_email_verified,
 
-        // ✅ NEW
         isApproved: Boolean(user.is_approved),
         approvedAt: user.approved_at ?? null,
 
-        // ✅ include registration/profile info
         studentId: user.student_id,
         course: user.course,
         yearLevel: user.year_level,
 
-        // ✅ NEW
         avatarUrl: user.avatar_url,
       },
     });
@@ -507,7 +525,6 @@ router.post("/login", async (req, res, next) => {
     );
 
     if (!found.rowCount) {
-      // ✅ Explicit "user not found" for login
       return res.status(404).json({
         ok: false,
         message:
@@ -523,18 +540,15 @@ router.post("/login", async (req, res, next) => {
         .json({ ok: false, message: "Invalid email or password." });
     }
 
-    // Block login until email is verified
     if (!user.is_email_verified) {
       return res
         .status(403)
         .json({ ok: false, message: "Please verify your email to continue." });
     }
 
-    // ✅ compute effective auth role (prefer `role`)
     const role = getEffectiveRole(user);
     const accountType = normalizeRole(user.account_type);
 
-    // ✅ NEW: Block login until librarian approves (EXCEPT librarian/admin)
     const approved = Boolean((user as any).is_approved);
     if (!isExemptFromApproval(role) && !approved) {
       return res.status(403).json({
@@ -561,20 +575,17 @@ router.post("/login", async (req, res, next) => {
         fullName: user.full_name,
 
         accountType,
-        role, // ✅ NEW
+        role,
 
         isEmailVerified: user.is_email_verified,
 
-        // ✅ NEW
         isApproved: Boolean((user as any).is_approved),
         approvedAt: (user as any).approved_at ?? null,
 
-        // ✅ include registration/profile info
         studentId: user.student_id,
         course: user.course,
         yearLevel: user.year_level,
 
-        // ✅ NEW
         avatarUrl: user.avatar_url,
       },
     });
@@ -660,7 +671,6 @@ router.post("/verify-email/confirm", async (req, res, next) => {
 });
 
 // GET /api/auth/verify-email/confirm?token=...
-// (kept for compatibility, but new emails will no longer point here directly)
 router.get("/verify-email/confirm", async (req, res, next) => {
   try {
     const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
@@ -726,7 +736,6 @@ router.post("/forgot-password", async (req, res, next) => {
     );
 
     if (!found.rowCount) {
-      // ✅ Explicit "user not found" for forgot-password flow
       return res.status(404).json({
         ok: false,
         message:
@@ -806,7 +815,6 @@ router.post("/reset-password", async (req, res, next) => {
       row.id,
     ]);
 
-    // Force re-login after password reset
     clearSessionCookie(res);
 
     return res.json({ ok: true, message: "Password updated." });

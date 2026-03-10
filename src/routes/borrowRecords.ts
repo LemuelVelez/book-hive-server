@@ -4,7 +4,14 @@ import { pool, query } from "../db";
 
 const router = express.Router();
 
-type Role = "student" | "guest" | "librarian" | "faculty" | "admin" | "other";
+type Role =
+  | "student"
+  | "guest"
+  | "assistant_librarian"
+  | "librarian"
+  | "faculty"
+  | "admin"
+  | "other";
 
 // Include legacy "pending" plus new granular states.
 type BorrowStatus =
@@ -95,6 +102,13 @@ function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
   if (v === "guest") return "guest";
+  if (
+    v === "assistant_librarian" ||
+    v === "assistant librarian" ||
+    v === "assistant-librarian"
+  ) {
+    return "assistant_librarian";
+  }
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
@@ -132,16 +146,14 @@ function requireAuth(
 
 /**
  * ✅ FIX: normalize role strings coming from DB (account_type / role)
- * so values like "Student" / "Faculty" / "Guest" don't break authorization.
+ * so values like "Student" / "Faculty" / "Guest" / "Assistant Librarian" don't break authorization.
  */
 function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
   const primary = normalizeRole(row.account_type ?? "student");
   const legacy = row.role != null ? normalizeRole(row.role) : undefined;
 
-  // Prefer a non-student, non-other primary role (e.g. faculty/guest/librarian/admin)
   if (primary !== "student" && primary !== "other") return primary;
 
-  // If primary is student, allow legacy to elevate (e.g. legacy faculty/guest)
   if (
     primary === "student" &&
     legacy &&
@@ -151,12 +163,10 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
     return legacy;
   }
 
-  // If primary is "other" but legacy is valid, prefer legacy (safety for messy DB values)
   if (primary === "other" && legacy && legacy !== "other") {
     return legacy;
   }
 
-  // Default
   return primary !== "other" ? primary : "student";
 }
 
@@ -389,7 +399,6 @@ function parseBorrowQuantity(body: any): number {
   const q = Math.floor(Number(raw));
   if (!Number.isFinite(q) || q <= 0) return 1;
 
-  // Safety cap (optional)
   const cap = Math.floor(
     Number(process.env.BORROW_MAX_COPIES_PER_ACTION ?? 10)
   );
@@ -488,12 +497,12 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
 
 /**
  * GET /api/borrow-records
- * List all borrow records (librarian/admin).
+ * List all borrow records (assistant_librarian/librarian/admin).
  */
 router.get(
   "/",
   requireAuth,
-  requireRole(["librarian", "admin"]),
+  requireRole(["assistant_librarian", "librarian", "admin"]),
   async (_req, res, next) => {
     try {
       const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
@@ -1118,13 +1127,13 @@ router.post(
 
 /**
  * POST /api/borrow-records/:id/request-return
- * Librarian/Admin can request the borrower to return the book.
+ * assistant_librarian/librarian/admin can request the borrower to return the book.
  * This uses status = 'pending_return' and records request metadata.
  */
 router.post(
   "/:id/request-return",
   requireAuth,
-  requireRole(["librarian", "admin"]),
+  requireRole(["assistant_librarian", "librarian", "admin"]),
   async (req, res, next) => {
     const client = await dbPool.connect();
     try {
@@ -1236,7 +1245,7 @@ router.post(
 router.post(
   "/",
   requireAuth,
-  requireRole(["librarian", "admin"]),
+  requireRole(["assistant_librarian", "librarian", "admin"]),
   async (req, res, next) => {
     const client = await dbPool.connect();
     try {
@@ -1309,7 +1318,6 @@ router.post(
         });
       }
 
-      // ✅ Insert 1 record per copy
       const ins = await client.query<{ id: string }>(
         `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
          SELECT $1, $2, COALESCE($3::date, CURRENT_DATE), $4::date, 'borrowed'
@@ -1476,6 +1484,12 @@ router.post("/self", requireAuth, async (req, res, next) => {
 /**
  * PATCH /api/borrow-records/:id
  * Availability is recomputed when status changes.
+ *
+ * assistant_librarian:
+ * - can manage borrow/return workflow
+ * - cannot approve/disapprove extensions
+ * - cannot change due date
+ * - cannot override fine
  */
 router.patch("/:id", requireAuth, async (req, res, next) => {
   const client = await dbPool.connect();
@@ -1530,9 +1544,12 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     }
 
     const isOwner = Number(current.user_id) === Number(session.sub);
-    const isAdminLike = effectiveRole === "librarian" || effectiveRole === "admin";
+    const isPrivilegedStaff =
+      effectiveRole === "librarian" || effectiveRole === "admin";
+    const isAssistantLibrarian = effectiveRole === "assistant_librarian";
+    const canManageBorrowAndReturn = isPrivilegedStaff || isAssistantLibrarian;
 
-    if (!isOwner && !isAdminLike) {
+    if (!isOwner && !canManageBorrowAndReturn) {
       await client.query("ROLLBACK");
       return res.status(403).json({
         ok: false,
@@ -1540,10 +1557,51 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       });
     }
 
-    if (!isAdminLike) {
-      const desiredStatus =
-        status !== undefined ? String(status).toLowerCase() : undefined;
+    const desiredStatus =
+      status !== undefined ? String(status).toLowerCase() : undefined;
 
+    if (isAssistantLibrarian) {
+      const allowedAssistantStatuses: BorrowStatus[] = [
+        "borrowed",
+        "pending_pickup",
+        "pending_return",
+        "returned",
+      ];
+
+      if (
+        desiredStatus &&
+        !allowedAssistantStatuses.includes(desiredStatus as BorrowStatus)
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message:
+            "Assistant librarian can only manage borrow and return statuses.",
+        });
+      }
+
+      if (dueDate !== undefined || fine !== undefined) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message:
+            "Assistant librarian cannot change the due date or override the fine amount.",
+        });
+      }
+
+      if (
+        returnDate !== undefined &&
+        desiredStatus !== "returned" &&
+        current.status !== "returned"
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message:
+            "Assistant librarian can only set the return date when marking a record as returned.",
+        });
+      }
+    } else if (!isPrivilegedStaff) {
       if (
         desiredStatus &&
         desiredStatus !== "pending" &&
