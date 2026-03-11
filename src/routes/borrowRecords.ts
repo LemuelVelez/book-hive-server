@@ -13,6 +13,14 @@ type Role =
   | "admin"
   | "other";
 
+type BorrowPolicyRole =
+  | "student"
+  | "guest"
+  | "librarian"
+  | "faculty"
+  | "admin"
+  | "other";
+
 // Include legacy "pending" plus new granular states.
 type BorrowStatus =
   | "borrowed"
@@ -34,6 +42,13 @@ type UserRoleRow = {
   id: string;
   account_type: any;
   role?: any | null;
+};
+
+type BorrowPolicyDTO = {
+  role: BorrowPolicyRole;
+  maxActiveBorrows: number;
+  defaultBorrowDurationDays: number;
+  maxPerAction: number;
 };
 
 type BorrowRowJoined = {
@@ -101,6 +116,45 @@ const dbPool = pool as unknown as DBPool;
 const HOUR_MS = 1000 * 60 * 60;
 const DAY_MS = HOUR_MS * 24;
 
+const DEFAULT_BORROW_POLICIES: Record<BorrowPolicyRole, BorrowPolicyDTO> = {
+  student: {
+    role: "student",
+    maxActiveBorrows: 3,
+    defaultBorrowDurationDays: 7,
+    maxPerAction: 3,
+  },
+  faculty: {
+    role: "faculty",
+    maxActiveBorrows: 10,
+    defaultBorrowDurationDays: 30,
+    maxPerAction: 10,
+  },
+  librarian: {
+    role: "librarian",
+    maxActiveBorrows: 10,
+    defaultBorrowDurationDays: 30,
+    maxPerAction: 10,
+  },
+  admin: {
+    role: "admin",
+    maxActiveBorrows: 10,
+    defaultBorrowDurationDays: 30,
+    maxPerAction: 10,
+  },
+  guest: {
+    role: "guest",
+    maxActiveBorrows: 1,
+    defaultBorrowDurationDays: 3,
+    maxPerAction: 1,
+  },
+  other: {
+    role: "other",
+    maxActiveBorrows: 1,
+    defaultBorrowDurationDays: 7,
+    maxPerAction: 1,
+  },
+};
+
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
@@ -116,6 +170,54 @@ function normalizeRole(raw: unknown): Role {
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
   return "other";
+}
+
+function toBorrowPolicyRole(role: unknown): BorrowPolicyRole {
+  const normalized = normalizeRole(role);
+  if (normalized === "assistant_librarian") return "librarian";
+  if (normalized === "student") return "student";
+  if (normalized === "guest") return "guest";
+  if (normalized === "librarian") return "librarian";
+  if (normalized === "faculty") return "faculty";
+  if (normalized === "admin") return "admin";
+  return "other";
+}
+
+function parseBorrowPolicyRoleParam(raw: unknown): BorrowPolicyRole | null {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "student") return "student";
+  if (v === "guest") return "guest";
+  if (v === "faculty") return "faculty";
+  if (v === "librarian") return "librarian";
+  if (v === "admin") return "admin";
+  if (v === "other") return "other";
+  if (
+    v === "assistant_librarian" ||
+    v === "assistant librarian" ||
+    v === "assistant-librarian"
+  ) {
+    return "librarian";
+  }
+  return null;
+}
+
+function getBorrowPolicy(role: unknown): BorrowPolicyDTO {
+  return DEFAULT_BORROW_POLICIES[toBorrowPolicyRole(role)];
+}
+
+function listBorrowPolicies(): BorrowPolicyDTO[] {
+  return [
+    DEFAULT_BORROW_POLICIES.student,
+    DEFAULT_BORROW_POLICIES.faculty,
+    DEFAULT_BORROW_POLICIES.librarian,
+    DEFAULT_BORROW_POLICIES.admin,
+    DEFAULT_BORROW_POLICIES.guest,
+    DEFAULT_BORROW_POLICIES.other,
+  ];
+}
+
+function formatBorrowPolicyRoleLabel(role: BorrowPolicyRole): string {
+  return role.charAt(0).toUpperCase() + role.slice(1);
 }
 
 function readSession(req: express.Request): SessionPayload | null {
@@ -264,6 +366,62 @@ function computeBorrowFineMetrics(
     overdueDays,
     computedFine,
   };
+}
+
+function parsePositiveInteger(raw: unknown): number | null {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+function resolveBorrowDurationDays(
+  role: unknown,
+  bookBorrowDurationDays: unknown
+): number {
+  const fromBook = parsePositiveInteger(bookBorrowDurationDays);
+  if (fromBook) return fromBook;
+
+  const policy = getBorrowPolicy(role);
+  const fromPolicy = parsePositiveInteger(policy.defaultBorrowDurationDays);
+  if (fromPolicy) return fromPolicy;
+
+  const fromEnv = parsePositiveInteger(process.env.BORROW_DAYS);
+  if (fromEnv) return fromEnv;
+
+  return 7;
+}
+
+async function countActiveBorrowRecordsForUser(
+  client: DBClient,
+  userId: number
+): Promise<number> {
+  const result = await client.query<{ active_count: number }>(
+    `SELECT COUNT(*)::int AS active_count
+       FROM borrow_records
+      WHERE user_id = $1
+        AND status <> 'returned'`,
+    [userId]
+  );
+
+  const count = result.rows[0]?.active_count;
+  return typeof count === "number" && Number.isFinite(count) ? count : 0;
+}
+
+function getQuantityPolicyError(
+  quantity: number,
+  policy: BorrowPolicyDTO
+): string | null {
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    return "Quantity must be a positive whole number.";
+  }
+
+  if (quantity > policy.maxPerAction) {
+    return `${formatBorrowPolicyRoleLabel(policy.role)} can only borrow up to ${
+      policy.maxPerAction
+    } book${policy.maxPerAction === 1 ? "" : "s"} per request.`;
+  }
+
+  return null;
 }
 
 async function fetchBorrowRecordJoined(
@@ -485,7 +643,8 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     overdueDays: metrics.overdueDays,
 
     extensionCount:
-      typeof row.extension_count === "number" && Number.isFinite(row.extension_count)
+      typeof row.extension_count === "number" &&
+      Number.isFinite(row.extension_count)
         ? row.extension_count
         : 0,
     extensionTotalDays:
@@ -647,6 +806,36 @@ router.get("/my", requireAuth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+/**
+ * GET /api/borrow-records/policies
+ * Return role-based borrowing rules expected by the frontend.
+ */
+router.get("/policies", requireAuth, async (_req, res) => {
+  return res.json({
+    ok: true,
+    policies: listBorrowPolicies(),
+  });
+});
+
+/**
+ * GET /api/borrow-records/policies/:role
+ * Return a single role policy.
+ * assistant_librarian is normalized to librarian policy.
+ */
+router.get("/policies/:role", requireAuth, async (req, res) => {
+  const role = parseBorrowPolicyRoleParam(req.params.role);
+  if (!role) {
+    return res
+      .status(404)
+      .json({ ok: false, message: "Borrow policy not found for this role." });
+  }
+
+  return res.json({
+    ok: true,
+    policy: getBorrowPolicy(role),
+  });
 });
 
 /**
@@ -1276,6 +1465,7 @@ router.post(
  * POST /api/borrow-records
  * Create borrow record(s) (transaction).
  * ✅ Now supports borrowing multiple copies in one request.
+ * ✅ Enforces role-based max active borrows and per-request limits.
  */
 router.post(
   "/",
@@ -1298,12 +1488,47 @@ router.post(
 
       await client.query("BEGIN");
 
-      const u = await client.query(`SELECT id FROM users WHERE id=$1 LIMIT 1`, [
-        uid,
-      ]);
+      const u = await client.query<UserRoleRow>(
+        `SELECT id, account_type, role
+           FROM users
+          WHERE id = $1
+          LIMIT 1`,
+        [uid]
+      );
+
       if (!u.rowCount) {
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, message: "User not found." });
+      }
+
+      const targetPolicy = getBorrowPolicy(
+        computeEffectiveRoleFromRow(u.rows[0])
+      );
+      const quantityError = getQuantityPolicyError(qty, targetPolicy);
+
+      if (quantityError) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ ok: false, message: quantityError });
+      }
+
+      const activeForUser = await countActiveBorrowRecordsForUser(client, uid);
+      const remainingSlots = Math.max(
+        0,
+        targetPolicy.maxActiveBorrows - activeForUser
+      );
+
+      if (qty > remainingSlots) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message: `${formatBorrowPolicyRoleLabel(
+            targetPolicy.role
+          )} can only have up to ${
+            targetPolicy.maxActiveBorrows
+          } active borrow record${
+            targetPolicy.maxActiveBorrows === 1 ? "" : "s"
+          }. Remaining allowed: ${remainingSlots}.`,
+        });
       }
 
       const b = await client.query<{
@@ -1392,6 +1617,8 @@ router.post(
 /**
  * POST /api/borrow-records/self
  * ✅ Now supports borrowing multiple copies in one request.
+ * ✅ Computes due date from per-book duration first, then role policy fallback.
+ * ✅ Enforces role-based max active borrows and per-request limits.
  */
 router.post("/self", requireAuth, async (req, res, next) => {
   const s = (req as any).sessionUser as SessionPayload;
@@ -1408,12 +1635,46 @@ router.post("/self", requireAuth, async (req, res, next) => {
   try {
     await client.query("BEGIN");
 
-    const u = await client.query(`SELECT id FROM users WHERE id=$1 LIMIT 1`, [
-      userId,
-    ]);
+    const u = await client.query<UserRoleRow>(
+      `SELECT id, account_type, role
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+      [userId]
+    );
+
     if (!u.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, message: "User not found." });
+    }
+
+    const effectiveRole = computeEffectiveRoleFromRow(u.rows[0]);
+    const targetPolicy = getBorrowPolicy(effectiveRole);
+    const quantityError = getQuantityPolicyError(qty, targetPolicy);
+
+    if (quantityError) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: quantityError });
+    }
+
+    const activeForUser = await countActiveBorrowRecordsForUser(client, userId);
+    const remainingSlots = Math.max(
+      0,
+      targetPolicy.maxActiveBorrows - activeForUser
+    );
+
+    if (qty > remainingSlots) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        message: `${formatBorrowPolicyRoleLabel(
+          targetPolicy.role
+        )} can only have up to ${
+          targetPolicy.maxActiveBorrows
+        } active borrow record${
+          targetPolicy.maxActiveBorrows === 1 ? "" : "s"
+        }. Remaining allowed: ${remainingSlots}.`,
+      });
     }
 
     const b = await client.query<{
@@ -1465,18 +1726,12 @@ router.post("/self", requireAuth, async (req, res, next) => {
     }
 
     const today = new Date();
-
-    let borrowDays = Number(
-      b.rows[0].borrow_duration_days ?? process.env.BORROW_DAYS ?? 7
+    const borrowDays = resolveBorrowDurationDays(
+      effectiveRole,
+      b.rows[0].borrow_duration_days
     );
-    if (!Number.isFinite(borrowDays) || borrowDays <= 0) {
-      borrowDays = 7;
-    } else {
-      borrowDays = Math.floor(borrowDays);
-    }
 
-    const due = new Date(today);
-    due.setDate(due.getDate() + borrowDays);
+    const due = new Date(today.getTime() + borrowDays * DAY_MS);
 
     const borrowDateStr = today.toISOString().slice(0, 10);
     const dueDateStr = due.toISOString().slice(0, 10);
