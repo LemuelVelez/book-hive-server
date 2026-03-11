@@ -5,7 +5,12 @@ import { query } from "../db";
 const router = express.Router();
 
 type Role = "student" | "librarian" | "faculty" | "admin" | "other";
-type BorrowStatus = "borrowed" | "pending" | "returned";
+type BorrowStatus =
+  | "borrowed"
+  | "pending"
+  | "pending_pickup"
+  | "pending_return"
+  | "returned";
 
 /**
  * Over-the-counter only:
@@ -39,6 +44,7 @@ type FineRowJoined = {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+  official_receipt_number: string | null;
 
   // joined
   borrow_status: BorrowStatus | null;
@@ -53,6 +59,8 @@ type FineRowJoined = {
 
 /* ---------------- helpers ---------------- */
 
+const HOUR_MS = 1000 * 60 * 60;
+
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
@@ -60,6 +68,39 @@ function normalizeRole(raw: unknown): Role {
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
   return "other";
+}
+
+function normalizeOfficialReceiptNumber(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  const value = String(raw).trim();
+  return value.length > 0 ? value : null;
+}
+
+function getBorrowFinePerHour(): number {
+  const raw = Number(process.env.BORROW_FINE_PER_HOUR ?? 10);
+  if (!Number.isFinite(raw) || raw < 0) return 10;
+  return raw;
+}
+
+function endOfUtcDay(dateStr: string): Date {
+  return new Date(`${dateStr}T23:59:59.999Z`);
+}
+
+function computeBorrowOverdueMetrics(
+  dueDate: string | null,
+  returnDate: string | null
+): { overdueHours: number | null; overdueDays: number | null } {
+  if (!dueDate) {
+    return { overdueHours: null, overdueDays: null };
+  }
+
+  const dueCutoff = endOfUtcDay(dueDate);
+  const end = returnDate ? endOfUtcDay(returnDate) : new Date();
+  const overdueMs = Math.max(0, end.getTime() - dueCutoff.getTime());
+  const overdueHours = overdueMs > 0 ? Math.ceil(overdueMs / HOUR_MS) : 0;
+  const overdueDays = overdueHours > 0 ? Math.ceil(overdueHours / 24) : 0;
+
+  return { overdueHours, overdueDays };
 }
 
 function isStaffRole(role: Role) {
@@ -178,6 +219,11 @@ function requireRole(roles: Role[]) {
 /* ---------------- mapping ---------------- */
 
 function fineToDTO(row: FineRowJoined) {
+  const metrics = computeBorrowOverdueMetrics(
+    row.borrow_due_date,
+    row.borrow_return_date
+  );
+
   return {
     id: String(row.id),
     userId: String(row.user_id),
@@ -193,6 +239,7 @@ function fineToDTO(row: FineRowJoined) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     resolvedAt: row.resolved_at,
+    officialReceiptNumber: row.official_receipt_number,
 
     studentEmail: row.email,
     studentId: row.student_id,
@@ -203,6 +250,10 @@ function fineToDTO(row: FineRowJoined) {
     borrowStatus: row.borrow_status,
     borrowDueDate: row.borrow_due_date,
     borrowReturnDate: row.borrow_return_date,
+
+    finePerHour: row.borrow_record_id ? getBorrowFinePerHour() : null,
+    overdueHours: metrics.overdueHours,
+    overdueDays: metrics.overdueDays,
   };
 }
 
@@ -218,6 +269,7 @@ const BASE_SELECT = `
     f.created_at,
     f.updated_at,
     f.resolved_at,
+    f.official_receipt_number,
     br.status AS borrow_status,
     br.due_date AS borrow_due_date,
     br.return_date AS borrow_return_date,
@@ -317,12 +369,14 @@ router.get(
 /**
  * PATCH /api/fines/:id
  * Update a fine (librarian/admin).
- * Body: { status?, amount?, reason? }
+ * Body: { status?, amount?, reason?, officialReceiptNumber? }
  * - status: active | paid | cancelled
  * - amount: updated fine amount (>= 0)
  * - reason: optional description / note
+ * - officialReceiptNumber/orNumber/receiptNumber: cashier OR number
  *
  * When status becomes 'paid' or 'cancelled', resolved_at is set to NOW().
+ * When status becomes 'paid', official receipt number is required.
  */
 router.patch(
   "/:id",
@@ -336,13 +390,41 @@ router.patch(
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
+      const currentFineResult = await query<{
+        id: string;
+        status: FineStatus;
+        official_receipt_number: string | null;
+      }>(
+        `SELECT id, status, official_receipt_number
+         FROM fines
+         WHERE id = $1
+         LIMIT 1`,
+        [fid]
+      );
+
+      if (!currentFineResult.rowCount) {
+        return res.status(404).json({ ok: false, message: "Fine not found." });
+      }
+
+      const currentFine = currentFineResult.rows[0];
       const { status, amount, reason } = req.body || {};
+
+      const requestedOfficialReceiptNumberRaw =
+        (req.body || {}).officialReceiptNumber ??
+        (req.body || {}).orNumber ??
+        (req.body || {}).receiptNumber;
+
+      const requestedOfficialReceiptNumber =
+        requestedOfficialReceiptNumberRaw === undefined
+          ? undefined
+          : normalizeOfficialReceiptNumber(requestedOfficialReceiptNumberRaw);
 
       const updates: string[] = [];
       const values: any[] = [];
       let i = 1;
 
       let normalizedStatus: FineStatus | undefined;
+      let nextStatus: FineStatus = currentFine.status;
 
       if (amount !== undefined) {
         const num = Number(amount);
@@ -371,6 +453,7 @@ router.patch(
           });
         }
         normalizedStatus = st as FineStatus;
+        nextStatus = normalizedStatus;
         updates.push(`status = $${i++}`);
         values.push(normalizedStatus);
 
@@ -379,6 +462,54 @@ router.patch(
         } else {
           updates.push(`resolved_at = NULL`);
         }
+      }
+
+      const finalOfficialReceiptNumber =
+        nextStatus === "paid"
+          ? requestedOfficialReceiptNumber !== undefined
+            ? requestedOfficialReceiptNumber
+            : currentFine.official_receipt_number
+          : null;
+
+      if (nextStatus === "paid" && !finalOfficialReceiptNumber) {
+        return res.status(400).json({
+          ok: false,
+          message: "Official receipt number is required when marking a fine as paid.",
+        });
+      }
+
+      if (nextStatus !== "paid" && requestedOfficialReceiptNumber) {
+        return res.status(400).json({
+          ok: false,
+          message: "Official receipt number can only be set when the fine status is paid.",
+        });
+      }
+
+      if (finalOfficialReceiptNumber) {
+        const duplicate = await query<{ id: string }>(
+          `SELECT id
+           FROM fines
+           WHERE LOWER(BTRIM(official_receipt_number)) = LOWER(BTRIM($1))
+             AND id <> $2
+           LIMIT 1`,
+          [finalOfficialReceiptNumber, fid]
+        );
+
+        if (duplicate.rowCount) {
+          return res.status(409).json({
+            ok: false,
+            message: "Official receipt number already exists on another fine.",
+          });
+        }
+      }
+
+      if (nextStatus === "paid") {
+        if (requestedOfficialReceiptNumber !== undefined || normalizedStatus === "paid") {
+          updates.push(`official_receipt_number = $${i++}`);
+          values.push(finalOfficialReceiptNumber);
+        }
+      } else if (normalizedStatus !== undefined || requestedOfficialReceiptNumber !== undefined) {
+        updates.push(`official_receipt_number = NULL`);
       }
 
       if (updates.length === 0) {
@@ -403,6 +534,7 @@ router.patch(
                    created_at,
                    updated_at,
                    resolved_at,
+                   official_receipt_number,
                    NULL::text AS borrow_status,
                    NULL::date AS borrow_due_date,
                    NULL::date AS borrow_return_date,

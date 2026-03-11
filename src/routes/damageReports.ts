@@ -139,6 +139,12 @@ function normalizeRole(raw: unknown): Role {
   return "other";
 }
 
+function normalizeOfficialReceiptNumber(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  const value = String(raw).trim();
+  return value.length > 0 ? value : null;
+}
+
 function readSession(req: express.Request): SessionPayload | null {
   const token = (req.cookies as any)?.["bh_session"];
   if (!token) return null;
@@ -337,7 +343,10 @@ async function fetchOneById(id: number): Promise<DamageUnionRow | null> {
 
 /* ---------------- fine sync helper ---------------- */
 
-async function syncFineForDamageReport(row: DamageUnionRow): Promise<void> {
+async function syncFineForDamageReport(
+  row: DamageUnionRow,
+  options?: { officialReceiptNumber?: string | null }
+): Promise<void> {
   const damageIdNum = Number(row.id);
 
   const liableIdNum =
@@ -369,8 +378,8 @@ async function syncFineForDamageReport(row: DamageUnionRow): Promise<void> {
 
   const resolvedAt = fineStatus === "paid" ? new Date() : null;
 
-  const existing = await query<{ id: string }>(
-    `SELECT id
+  const existing = await query<{ id: string; official_receipt_number: string | null }>(
+    `SELECT id, official_receipt_number
      FROM fines
      WHERE damage_report_id = $1
      ORDER BY created_at ASC
@@ -378,11 +387,54 @@ async function syncFineForDamageReport(row: DamageUnionRow): Promise<void> {
     [damageIdNum]
   );
 
+  const existingFineId = existing.rowCount ? Number(existing.rows[0].id) : null;
+
+  const finalOfficialReceiptNumber =
+    fineStatus === "paid"
+      ? options?.officialReceiptNumber ?? existing.rows[0]?.official_receipt_number ?? null
+      : null;
+
+  if (fineStatus === "paid" && !finalOfficialReceiptNumber) {
+    throw new Error("Official receipt number is required when marking a damage report as paid.");
+  }
+
+  if (finalOfficialReceiptNumber) {
+    const duplicate = await query<{ id: string }>(
+      `SELECT id
+       FROM fines
+       WHERE LOWER(BTRIM(official_receipt_number)) = LOWER(BTRIM($1))
+         AND ($2::bigint IS NULL OR id <> $2::bigint)
+       LIMIT 1`,
+      [finalOfficialReceiptNumber, existingFineId]
+    );
+
+    if (duplicate.rowCount) {
+      throw new Error("Official receipt number already exists on another fine.");
+    }
+  }
+
   if (!existing.rowCount) {
     await query(
-      `INSERT INTO fines (user_id, borrow_record_id, damage_report_id, amount, status, reason, resolved_at)
-       VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
-      [liableIdNum, damageIdNum, feeNum, fineStatus, reason, resolvedAt]
+      `INSERT INTO fines (
+         user_id,
+         borrow_record_id,
+         damage_report_id,
+         amount,
+         status,
+         reason,
+         resolved_at,
+         official_receipt_number
+       )
+       VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)`,
+      [
+        liableIdNum,
+        damageIdNum,
+        feeNum,
+        fineStatus,
+        reason,
+        resolvedAt,
+        finalOfficialReceiptNumber,
+      ]
     );
   } else {
     const fid = Number(existing.rows[0].id);
@@ -393,9 +445,10 @@ async function syncFineForDamageReport(row: DamageUnionRow): Promise<void> {
            status = $3,
            reason = $4,
            resolved_at = $5,
+           official_receipt_number = $6,
            updated_at = NOW()
-       WHERE id = $6`,
-      [liableIdNum, feeNum, fineStatus, reason, resolvedAt, fid]
+       WHERE id = $7`,
+      [liableIdNum, feeNum, fineStatus, reason, resolvedAt, finalOfficialReceiptNumber, fid]
     );
   }
 }
@@ -544,6 +597,14 @@ router.patch(
 
       const { status, severity, fee, notes, damageType } = req.body || {};
 
+      const requestedOfficialReceiptNumberRaw =
+        (req.body && (req.body.officialReceiptNumber ?? req.body.orNumber ?? req.body.receiptNumber)) ??
+        undefined;
+      const requestedOfficialReceiptNumber =
+        requestedOfficialReceiptNumberRaw === undefined
+          ? undefined
+          : normalizeOfficialReceiptNumber(requestedOfficialReceiptNumberRaw);
+
       // Support both liableUserId and liable_user_id from clients
       const rawLiable =
         (req.body && (req.body.liableUserId ?? req.body.liable_user_id)) ?? undefined;
@@ -565,8 +626,24 @@ router.patch(
         if (!["pending", "assessed", "paid"].includes(st)) {
           return res.status(400).json({ ok: false, message: "Invalid status." });
         }
+        if (st === "paid" && !requestedOfficialReceiptNumber) {
+          return res.status(400).json({
+            ok: false,
+            message: "Official receipt number is required when marking a damage report as paid.",
+          });
+        }
         updates.push(`status = $${i++}`);
         values.push(st);
+      }
+
+      if (
+        requestedOfficialReceiptNumber !== undefined &&
+        String(status ?? "").toLowerCase() !== "paid"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          message: "Official receipt number can only be submitted when marking as paid.",
+        });
       }
 
       if (severity !== undefined) {
@@ -679,11 +756,9 @@ router.patch(
       const joinedRow = activeRowRes.rows[0];
 
       // Keep fines in sync with the LIABLE user
-      try {
-        await syncFineForDamageReport(joinedRow);
-      } catch (syncErr) {
-        console.error("[damage-reports] Failed to sync fine:", syncErr);
-      }
+      await syncFineForDamageReport(joinedRow, {
+        officialReceiptNumber: requestedOfficialReceiptNumber,
+      });
 
       // If paid => move to archive table and remove from active
       if (joinedRow.status === "paid") {

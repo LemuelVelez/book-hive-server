@@ -98,6 +98,9 @@ const dbPool = pool as unknown as DBPool;
 
 /* ---------------- Helpers ---------------- */
 
+const HOUR_MS = 1000 * 60 * 60;
+const DAY_MS = HOUR_MS * 24;
+
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
@@ -230,6 +233,37 @@ async function getEffectiveRole(userId: string, fallback: Role): Promise<Role> {
     // ignore
   }
   return fallback;
+}
+
+function getBorrowFinePerHour(): number {
+  const raw = Number(process.env.BORROW_FINE_PER_HOUR ?? 10);
+  if (!Number.isFinite(raw) || raw < 0) return 10;
+  return raw;
+}
+
+function endOfUtcDay(dateStr: string): Date {
+  return new Date(`${dateStr}T23:59:59.999Z`);
+}
+
+function computeBorrowFineMetrics(
+  dueDate: string,
+  returnDate: string | null,
+  finePerHour: number
+) {
+  const dueCutoff = endOfUtcDay(dueDate);
+
+  const end = returnDate ? endOfUtcDay(returnDate) : new Date();
+  const overdueMs = Math.max(0, end.getTime() - dueCutoff.getTime());
+  const overdueHours = overdueMs > 0 ? Math.ceil(overdueMs / HOUR_MS) : 0;
+  const overdueDays = overdueHours > 0 ? Math.ceil(overdueHours / 24) : 0;
+  const computedFine = overdueHours * finePerHour;
+
+  return {
+    overdueMs,
+    overdueHours,
+    overdueDays,
+    computedFine,
+  };
 }
 
 async function fetchBorrowRecordJoined(
@@ -410,21 +444,19 @@ function parseBorrowQuantity(body: any): number {
 /**
  * Convert a DB row into the DTO the client expects.
  */
-function toDTO(row: BorrowRowJoined, finePerDay: number) {
-  const due = new Date(row.due_date + "T00:00:00Z");
-  const end = new Date(
-    (row.return_date || new Date().toISOString().slice(0, 10)) + "T00:00:00Z"
+function toDTO(row: BorrowRowJoined, finePerHour: number) {
+  const metrics = computeBorrowFineMetrics(
+    row.due_date,
+    row.return_date,
+    finePerHour
   );
-  const ms = Math.max(0, end.getTime() - due.getTime());
-  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
-  const computedFine = days * finePerDay;
 
   let fine: number;
   if (row.status === "returned" && row.fine != null) {
     const stored = Number(row.fine);
-    fine = Number.isNaN(stored) ? computedFine : stored;
+    fine = Number.isNaN(stored) ? metrics.computedFine : stored;
   } else {
-    fine = computedFine;
+    fine = metrics.computedFine;
   }
 
   const safeReqStatus = ((): ExtensionRequestStatus => {
@@ -448,6 +480,9 @@ function toDTO(row: BorrowRowJoined, finePerDay: number) {
     returnDate: row.return_date,
     status: row.status,
     fine,
+    finePerHour,
+    overdueHours: metrics.overdueHours,
+    overdueDays: metrics.overdueDays,
 
     extensionCount:
       typeof row.extension_count === "number" && Number.isFinite(row.extension_count)
@@ -505,7 +540,7 @@ router.get(
   requireRole(["assistant_librarian", "librarian", "admin"]),
   async (_req, res, next) => {
     try {
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const finePerHour = getBorrowFinePerHour();
 
       const result = await dbQuery<BorrowRowJoined>(
         `SELECT br.id,
@@ -547,7 +582,7 @@ router.get(
          ORDER BY br.borrow_date DESC, br.id DESC`
       );
 
-      const records = result.rows.map((r) => toDTO(r, finePerDay));
+      const records = result.rows.map((r) => toDTO(r, finePerHour));
       res.json({ ok: true, records });
     } catch (err) {
       next(err);
@@ -563,7 +598,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
   try {
     const s = (req as any).sessionUser as SessionPayload;
     const userId = Number(s.sub);
-    const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+    const finePerHour = getBorrowFinePerHour();
 
     const result = await dbQuery<BorrowRowJoined>(
       `SELECT br.id,
@@ -607,7 +642,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
       [userId]
     );
 
-    const records = result.rows.map((r) => toDTO(r, finePerDay));
+    const records = result.rows.map((r) => toDTO(r, finePerHour));
     res.json({ ok: true, records });
   } catch (err) {
     next(err);
@@ -784,12 +819,12 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
 
       await client.query("COMMIT");
 
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const finePerHour = getBorrowFinePerHour();
       const joinedRow = await fetchBorrowRecordJoined(rid);
       if (!joinedRow) {
         return res.status(404).json({ ok: false, message: "Record not found." });
       }
-      const record = toDTO(joinedRow, finePerDay);
+      const record = toDTO(joinedRow, finePerHour);
       return res.json({
         ok: true,
         record,
@@ -824,12 +859,12 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
 
     await client.query("COMMIT");
 
-    const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+    const finePerHour = getBorrowFinePerHour();
     const joinedRow = await fetchBorrowRecordJoined(rid);
     if (!joinedRow) {
       return res.status(404).json({ ok: false, message: "Record not found." });
     }
-    const record = toDTO(joinedRow, finePerDay);
+    const record = toDTO(joinedRow, finePerHour);
     return res.json({ ok: true, record });
   } catch (err) {
     try {
@@ -1002,12 +1037,12 @@ router.post(
 
       await client.query("COMMIT");
 
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const finePerHour = getBorrowFinePerHour();
       const joinedRow = await fetchBorrowRecordJoined(rid);
       if (!joinedRow) {
         return res.status(404).json({ ok: false, message: "Record not found." });
       }
-      const record = toDTO(joinedRow, finePerDay);
+      const record = toDTO(joinedRow, finePerHour);
       return res.json({ ok: true, record });
     } catch (err) {
       try {
@@ -1105,12 +1140,12 @@ router.post(
 
       await client.query("COMMIT");
 
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const finePerHour = getBorrowFinePerHour();
       const joinedRow = await fetchBorrowRecordJoined(rid);
       if (!joinedRow) {
         return res.status(404).json({ ok: false, message: "Record not found." });
       }
-      const record = toDTO(joinedRow, finePerDay);
+      const record = toDTO(joinedRow, finePerHour);
       return res.json({ ok: true, record });
     } catch (err) {
       try {
@@ -1212,13 +1247,13 @@ router.post(
 
       await client.query("COMMIT");
 
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const finePerHour = getBorrowFinePerHour();
       const joinedRow = await fetchBorrowRecordJoined(rid);
       if (!joinedRow) {
         return res.status(404).json({ ok: false, message: "Record not found." });
       }
 
-      const record = toDTO(joinedRow, finePerDay);
+      const record = toDTO(joinedRow, finePerHour);
       return res.json({
         ok: true,
         record,
@@ -1331,9 +1366,9 @@ router.post(
       await client.query("COMMIT");
 
       const ids = ins.rows.map((r) => Number(r.id));
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+      const finePerHour = getBorrowFinePerHour();
       const joinedRows = await fetchBorrowRecordsJoined(ids);
-      const records = joinedRows.map((r) => toDTO(r, finePerDay));
+      const records = joinedRows.map((r) => toDTO(r, finePerHour));
 
       res.status(201).json({
         ok: true,
@@ -1459,9 +1494,9 @@ router.post("/self", requireAuth, async (req, res, next) => {
     await client.query("COMMIT");
 
     const ids = ins.rows.map((r) => Number(r.id));
-    const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+    const finePerHour = getBorrowFinePerHour();
     const joinedRows = await fetchBorrowRecordsJoined(ids);
-    const records = joinedRows.map((r) => toDTO(r, finePerDay));
+    const records = joinedRows.map((r) => toDTO(r, finePerHour));
 
     res.status(201).json({
       ok: true,
@@ -1749,23 +1784,25 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     const updatedRow = upd.rows[0];
 
     if (newStatus === "returned") {
-      const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
-
-      const due = new Date(updatedRow.due_date + "T00:00:00Z");
-      const end = new Date(
-        (updatedRow.return_date || new Date().toISOString().slice(0, 10)) +
-          "T00:00:00Z"
+      const finePerHour = getBorrowFinePerHour();
+      const metrics = computeBorrowFineMetrics(
+        updatedRow.due_date,
+        updatedRow.return_date,
+        finePerHour
       );
-      const ms = Math.max(0, end.getTime() - due.getTime());
-      const days = Math.floor(ms / (1000 * 60 * 60 * 24));
-      const computedFine = days * finePerDay;
 
-      let finalFine = computedFine;
+      let finalFine = metrics.computedFine;
+
       if (fine !== undefined) {
         const parsedFine = Number(fine);
-        if (!Number.isNaN(parsedFine) && parsedFine >= 0) {
-          finalFine = parsedFine;
+        if (!Number.isFinite(parsedFine) || parsedFine < 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            message: "fine must be a non-negative number.",
+          });
         }
+        finalFine = parsedFine;
       }
 
       await client.query(
@@ -1777,19 +1814,28 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
 
       if (finalFine > 0) {
         await client.query(
-          `INSERT INTO fines (user_id, borrow_record_id, amount, status, reason)
-             VALUES ($1, $2, $3, 'active', $4)
-             ON CONFLICT (borrow_record_id) WHERE borrow_record_id IS NOT NULL DO UPDATE
-               SET amount = EXCLUDED.amount,
-                   status = 'active',
-                   reason = EXCLUDED.reason,
-                   resolved_at = NULL,
-                   updated_at = NOW()`,
+          `INSERT INTO fines (
+             user_id,
+             borrow_record_id,
+             amount,
+             status,
+             reason,
+             resolved_at,
+             official_receipt_number
+           )
+           VALUES ($1, $2, $3, 'active', $4, NULL, NULL)
+           ON CONFLICT (borrow_record_id) WHERE borrow_record_id IS NOT NULL DO UPDATE
+             SET amount = EXCLUDED.amount,
+                 status = 'active',
+                 reason = EXCLUDED.reason,
+                 resolved_at = NULL,
+                 official_receipt_number = NULL,
+                 updated_at = NOW()`,
           [
             current.user_id,
             rid,
             finalFine,
-            `Overdue fine for borrow record #${rid}`,
+            `Overdue fine for borrow record #${rid} (${metrics.overdueHours} hour(s), ${metrics.overdueDays} day(s))`,
           ]
         );
       } else {
@@ -1798,6 +1844,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
              SET amount = 0,
                  status = 'cancelled',
                  resolved_at = NOW(),
+                 official_receipt_number = NULL,
                  updated_at = NOW()
            WHERE borrow_record_id = $1`,
           [rid]
@@ -1811,12 +1858,12 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
 
     await client.query("COMMIT");
 
-    const finePerDay = Number(process.env.BORROW_FINE_PER_DAY || 5);
+    const finePerHour = getBorrowFinePerHour();
     const joinedRow = await fetchBorrowRecordJoined(rid);
     if (!joinedRow) {
       return res.status(404).json({ ok: false, message: "Record not found." });
     }
-    const record = toDTO(joinedRow, finePerDay);
+    const record = toDTO(joinedRow, finePerHour);
     res.json({ ok: true, record });
   } catch (err) {
     try {
