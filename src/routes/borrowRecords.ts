@@ -1534,8 +1534,9 @@ router.post(
       const b = await client.query<{
         id: number;
         number_of_copies: number | null;
+        is_library_use_only: boolean | null;
       }>(
-        `SELECT id, number_of_copies
+        `SELECT id, number_of_copies, is_library_use_only
            FROM books
            WHERE id=$1
            FOR UPDATE`,
@@ -1545,6 +1546,15 @@ router.post(
       if (!b.rowCount) {
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, message: "Book not found." });
+      }
+
+      if (Boolean(b.rows[0].is_library_use_only)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          message:
+            "This book is marked as Library Use Only and cannot be borrowed.",
+        });
       }
 
       const copies =
@@ -1681,8 +1691,9 @@ router.post("/self", requireAuth, async (req, res, next) => {
       id: number;
       borrow_duration_days: number | null;
       number_of_copies: number | null;
+      is_library_use_only: boolean | null;
     }>(
-      `SELECT id, borrow_duration_days, number_of_copies
+      `SELECT id, borrow_duration_days, number_of_copies, is_library_use_only
          FROM books
          WHERE id = $1
          FOR UPDATE`,
@@ -1692,6 +1703,15 @@ router.post("/self", requireAuth, async (req, res, next) => {
     if (!b.rowCount) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, message: "Book not found." });
+    }
+
+    if (Boolean(b.rows[0].is_library_use_only)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        message:
+          "This book is marked as Library Use Only and cannot be borrowed.",
+      });
     }
 
     const copies =

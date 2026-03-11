@@ -31,6 +31,15 @@ const LIBRARY_AREAS = new Set<LibraryArea>([
   "fiction",
 ]);
 
+const LIBRARY_USE_ONLY_AREAS = new Set<LibraryArea>([
+  "periodicals",
+  "thesis_dissertations",
+  "rizaliana",
+  "special_collection",
+  "fil_gen_reference",
+  "general_reference",
+]);
+
 type BookRow = {
   id: string;
   title: string;
@@ -69,6 +78,7 @@ type BookRow = {
   publication_year: number;
   available: boolean;
   borrow_duration_days: number | null;
+  is_library_use_only: boolean;
 
   created_at: string;
   updated_at: string;
@@ -76,6 +86,7 @@ type BookRow = {
 
 type BookRowWithCounts = BookRow & {
   active_count?: number | null;
+  total_borrow_count?: number | null;
   available_copies?: number | null;
   computed_available?: boolean | null;
 };
@@ -156,6 +167,36 @@ function normalizeLibraryArea(raw: unknown): LibraryArea | null {
   return null;
 }
 
+function isLibraryUseOnlyArea(area: LibraryArea | null | undefined): boolean {
+  return !!area && LIBRARY_USE_ONLY_AREAS.has(area);
+}
+
+function parseOptionalBoolean(raw: unknown): boolean | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return false;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number") return raw !== 0;
+
+  const v = String(raw).trim().toLowerCase();
+
+  if (!v) return false;
+  if (["true", "1", "yes", "y", "on"].includes(v)) return true;
+  if (["false", "0", "no", "n", "off"].includes(v)) return false;
+
+  return Boolean(v);
+}
+
+function resolveLibraryUseOnlyFlag(
+  rawFlag: unknown,
+  area: LibraryArea | null,
+  fallback = false
+): boolean {
+  const explicit = parseOptionalBoolean(rawFlag);
+  if (explicit !== undefined) return explicit;
+  if (isLibraryUseOnlyArea(area)) return true;
+  return fallback;
+}
+
 function trimToNull(raw: unknown): string | null {
   if (raw === undefined || raw === null) return null;
   const value = String(raw).trim();
@@ -231,11 +272,20 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
     return primary;
   }
 
-  if (primary === "student" && legacy && legacy !== "student" && legacy !== "other") {
+  if (
+    primary === "student" &&
+    legacy &&
+    legacy !== "student" &&
+    legacy !== "other"
+  ) {
     return legacy;
   }
 
-  return primary !== "other" ? primary : legacy !== "other" ? legacy || "student" : "student";
+  return primary !== "other"
+    ? primary
+    : legacy !== "other"
+      ? legacy || "student"
+      : "student";
 }
 
 function requireRole(_roles: Role[]) {
@@ -290,32 +340,46 @@ async function computeCopyStateForBook(
 ): Promise<{
   totalCopies: number;
   activeCount: number;
+  totalBorrowCount: number;
   remainingCopies: number;
   available: boolean;
 }> {
   const copies =
-    typeof copiesTotal === "number" && Number.isFinite(copiesTotal) && copiesTotal > 0
+    typeof copiesTotal === "number" &&
+    Number.isFinite(copiesTotal) &&
+    copiesTotal > 0
       ? Math.floor(copiesTotal)
       : 1;
 
-  const activeRes = await client.query<{ active_count: number }>(
-    `SELECT COUNT(*)::int AS active_count
+  const statsRes = await client.query<{
+    active_count: number;
+    total_borrow_count: number;
+  }>(
+    `SELECT COUNT(*) FILTER (WHERE status <> 'returned')::int AS active_count,
+            COUNT(*)::int AS total_borrow_count
        FROM borrow_records
-       WHERE book_id = $1
-         AND status <> 'returned'`,
+       WHERE book_id = $1`,
     [bookId]
   );
 
   const active =
-    typeof activeRes.rows[0]?.active_count === "number" &&
-    Number.isFinite(activeRes.rows[0].active_count)
-      ? activeRes.rows[0].active_count
+    typeof statsRes.rows[0]?.active_count === "number" &&
+    Number.isFinite(statsRes.rows[0].active_count)
+      ? statsRes.rows[0].active_count
+      : 0;
+
+  const totalBorrowCount =
+    typeof statsRes.rows[0]?.total_borrow_count === "number" &&
+    Number.isFinite(statsRes.rows[0].total_borrow_count)
+      ? statsRes.rows[0].total_borrow_count
       : 0;
 
   const remaining = Math.max(0, copies - active);
+
   return {
     totalCopies: copies,
     activeCount: active,
+    totalBorrowCount,
     remainingCopies: remaining,
     available: remaining > 0,
   };
@@ -328,25 +392,32 @@ function toDTO(row: BookRow | BookRowWithCounts) {
       : 1;
 
   const activeCountRaw = (row as BookRowWithCounts).active_count;
+  const totalBorrowCountRaw = (row as BookRowWithCounts).total_borrow_count;
   const availableCopiesRaw = (row as BookRowWithCounts).available_copies;
   const computedAvailableRaw = (row as BookRowWithCounts).computed_available;
 
   const activeCount =
     typeof activeCountRaw === "number" && Number.isFinite(activeCountRaw)
       ? activeCountRaw
-      : null;
+      : 0;
+
+  const totalBorrowCount =
+    typeof totalBorrowCountRaw === "number" && Number.isFinite(totalBorrowCountRaw)
+      ? totalBorrowCountRaw
+      : 0;
 
   const remainingCopies =
     typeof availableCopiesRaw === "number" && Number.isFinite(availableCopiesRaw)
       ? availableCopiesRaw
-      : activeCount !== null
-        ? Math.max(0, totalCopies - activeCount)
-        : totalCopies;
+      : Math.max(0, totalCopies - activeCount);
 
   const available =
     typeof computedAvailableRaw === "boolean"
       ? computedAvailableRaw
       : remainingCopies > 0;
+
+  const isLibraryUseOnly = Boolean(row.is_library_use_only);
+  const canBorrow = !isLibraryUseOnly;
 
   return {
     id: String(row.id),
@@ -390,7 +461,12 @@ function toDTO(row: BookRow | BookRowWithCounts) {
 
     numberOfCopies: remainingCopies,
     totalCopies,
-    borrowedCopies: activeCount !== null ? activeCount : undefined,
+    borrowedCopies: activeCount,
+
+    isLibraryUseOnly,
+    canBorrow,
+    activeBorrowCount: activeCount,
+    totalBorrowCount,
   };
 }
 
@@ -425,6 +501,7 @@ const BOOK_RETURNING = `
   number_of_copies,
   available,
   borrow_duration_days,
+  is_library_use_only,
   created_at,
   updated_at
 `;
@@ -460,6 +537,7 @@ const BOOK_RETURNING_B = `
   b.number_of_copies,
   b.available,
   b.borrow_duration_days,
+  b.is_library_use_only,
   b.created_at,
   b.updated_at
 `;
@@ -470,16 +548,19 @@ router.get("/", async (_req, res, next) => {
       `
       SELECT
         ${BOOK_RETURNING_B},
-        COALESCE(active.active_count, 0)::int AS active_count,
-        GREATEST(b.number_of_copies - COALESCE(active.active_count, 0), 0)::int AS available_copies,
-        (COALESCE(active.active_count, 0) < b.number_of_copies) AS computed_available
+        COALESCE(stats.active_count, 0)::int AS active_count,
+        COALESCE(stats.total_borrow_count, 0)::int AS total_borrow_count,
+        GREATEST(b.number_of_copies - COALESCE(stats.active_count, 0), 0)::int AS available_copies,
+        (COALESCE(stats.active_count, 0) < b.number_of_copies) AS computed_available
       FROM books b
       LEFT JOIN (
-        SELECT book_id, COUNT(*)::int AS active_count
+        SELECT
+          book_id,
+          COUNT(*) FILTER (WHERE status <> 'returned')::int AS active_count,
+          COUNT(*)::int AS total_borrow_count
         FROM borrow_records
-        WHERE status <> 'returned'
         GROUP BY book_id
-      ) active ON active.book_id = b.id
+      ) stats ON stats.book_id = b.id
       ORDER BY b.created_at DESC, b.id DESC
       `
     );
@@ -526,6 +607,7 @@ router.post(
         libraryArea,
 
         numberOfCopies,
+        isLibraryUseOnly,
       } = req.body || {};
 
       const resolvedTitle = title ? String(title).trim() : "";
@@ -618,6 +700,11 @@ router.post(
       const categoryVal = classification?.category ?? null;
 
       const libArea = normalizeLibraryArea(libraryArea);
+      const libraryUseOnlyVal = resolveLibraryUseOnlyFlag(
+        isLibraryUseOnly,
+        libArea,
+        false
+      );
 
       const availableVal = true;
 
@@ -652,12 +739,13 @@ router.post(
              library_area,
              number_of_copies,
              available,
-             borrow_duration_days
+             borrow_duration_days,
+             is_library_use_only
            )
            VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
              $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,$25,$26,$27,$28,$29
+             $21,$22,$23,$24,$25,$26,$27,$28,$29,$30
            )
            RETURNING ${BOOK_RETURNING}`,
           [
@@ -690,11 +778,13 @@ router.post(
             copiesTotal,
             availableVal,
             borrowDurationVal,
+            libraryUseOnlyVal,
           ]
         );
 
         const row = ins.rows[0] as BookRowWithCounts;
         row.active_count = 0;
+        row.total_borrow_count = 0;
         row.available_copies = copiesTotal;
         row.computed_available = true;
 
@@ -778,6 +868,7 @@ router.post(
 
       const finalRow = finalRes.rows[0] as BookRowWithCounts;
       finalRow.active_count = state.activeCount;
+      finalRow.total_borrow_count = state.totalBorrowCount;
       finalRow.available_copies = state.remainingCopies;
       finalRow.computed_available = state.available;
 
@@ -840,6 +931,7 @@ router.patch(
 
         numberOfCopies,
         copiesToAdd,
+        isLibraryUseOnly,
       } = req.body || {};
 
       if (numberOfCopies !== undefined && copiesToAdd !== undefined) {
@@ -848,6 +940,28 @@ router.patch(
           message: "Provide either numberOfCopies OR copiesToAdd, not both.",
         });
       }
+
+      await client.query("BEGIN");
+
+      const currentBookResult = await client.query<{
+        id: number;
+        number_of_copies: number;
+        is_library_use_only: boolean;
+        library_area: LibraryArea | null;
+      }>(
+        `SELECT id, number_of_copies, is_library_use_only, library_area
+           FROM books
+           WHERE id = $1
+           FOR UPDATE`,
+        [bookId]
+      );
+
+      if (!currentBookResult.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Book not found." });
+      }
+
+      const currentBook = currentBookResult.rows[0];
 
       const updates: string[] = [];
       const values: any[] = [];
@@ -918,6 +1032,7 @@ router.patch(
       if (publicationYear !== undefined) {
         const yearNum = Number(publicationYear);
         if (!Number.isFinite(yearNum) || yearNum < 1000 || yearNum > 9999) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "publicationYear must be a valid 4-digit year.",
@@ -938,6 +1053,7 @@ router.patch(
           yearNum !== null &&
           (!Number.isFinite(yearNum) || yearNum < 1000 || yearNum > 9999)
         ) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "copyrightYear must be a valid 4-digit year.",
@@ -956,6 +1072,7 @@ router.patch(
       if (pages !== undefined) {
         const pagesNum = pages ? Math.floor(Number(pages)) : null;
         if (pagesNum !== null && (!Number.isFinite(pagesNum) || pagesNum <= 0)) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "pages must be a positive number.",
@@ -1003,6 +1120,7 @@ router.patch(
       if (copyNumber !== undefined) {
         const copyNum = copyNumber ? Math.floor(Number(copyNumber)) : null;
         if (copyNum !== null && (!Number.isFinite(copyNum) || copyNum <= 0)) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "copyNumber must be a positive number.",
@@ -1017,15 +1135,31 @@ router.patch(
         values.push(volumeNumber ? String(volumeNumber).trim() : null);
       }
 
-      if (libraryArea !== undefined) {
-        const libArea = normalizeLibraryArea(libraryArea);
-        updates.push(`library_area = $${idx++}`);
-        values.push(libArea);
+      if (libraryArea !== undefined || isLibraryUseOnly !== undefined) {
+        const resolvedLibraryArea =
+          libraryArea !== undefined
+            ? normalizeLibraryArea(libraryArea)
+            : currentBook.library_area ?? null;
+
+        if (libraryArea !== undefined) {
+          updates.push(`library_area = $${idx++}`);
+          values.push(resolvedLibraryArea);
+        }
+
+        const resolvedLibraryUseOnly = resolveLibraryUseOnlyFlag(
+          isLibraryUseOnly,
+          resolvedLibraryArea,
+          Boolean(currentBook.is_library_use_only)
+        );
+
+        updates.push(`is_library_use_only = $${idx++}`);
+        values.push(resolvedLibraryUseOnly);
       }
 
       if (numberOfCopies !== undefined) {
         const copiesTotal = Math.floor(Number(numberOfCopies));
         if (!Number.isFinite(copiesTotal) || copiesTotal <= 0) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "numberOfCopies must be a positive number.",
@@ -1038,6 +1172,7 @@ router.patch(
       if (copiesToAdd !== undefined) {
         const inc = Math.floor(Number(copiesToAdd));
         if (!Number.isFinite(inc) || inc <= 0) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "copiesToAdd must be a positive number.",
@@ -1050,6 +1185,7 @@ router.patch(
       if (borrowDurationDays !== undefined) {
         const parsed = Number(borrowDurationDays);
         if (!Number.isFinite(parsed) || parsed <= 0) {
+          await client.query("ROLLBACK");
           return res.status(400).json({
             ok: false,
             message: "borrowDurationDays must be a positive number of days.",
@@ -1060,6 +1196,7 @@ router.patch(
       }
 
       if (updates.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
           message: "No updatable fields provided.",
@@ -1075,8 +1212,6 @@ router.patch(
         RETURNING ${BOOK_RETURNING}
       `;
       values.push(bookId);
-
-      await client.query("BEGIN");
 
       let updated: BookRow;
       try {
@@ -1119,6 +1254,7 @@ router.patch(
 
       const finalRow = final.rows[0] as BookRowWithCounts;
       finalRow.active_count = state.activeCount;
+      finalRow.total_borrow_count = state.totalBorrowCount;
       finalRow.available_copies = state.remainingCopies;
       finalRow.computed_available = state.available;
 
