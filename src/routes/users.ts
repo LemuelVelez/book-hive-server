@@ -110,6 +110,20 @@ const ALLOWED_ROLES: Role[] = [
   "other",
 ];
 
+const ASSIGNABLE_ROLES: Role[] = [
+  "student",
+  "assistant_librarian",
+  "librarian",
+  "faculty",
+  "admin",
+];
+
+const LIBRARIAN_ASSIGNABLE_ROLES: Role[] = [
+  "student",
+  "assistant_librarian",
+  "faculty",
+];
+
 const ARCHIVED_USER_EMAIL_DOMAIN = "bookhive.local";
 const ARCHIVED_USER_EMAIL_REGEX_SQL = "^deleted\\+.*@bookhive\\.local$";
 
@@ -268,6 +282,12 @@ function safeAccountType(
   const r = normalizeRole(raw);
   if (r === "student") return "student";
   if (r === "assistant_librarian") return "assistant_librarian";
+  return "other";
+}
+
+function accountTypeFromRole(role: Role): "student" | "assistant_librarian" | "other" {
+  if (role === "student") return "student";
+  if (role === "assistant_librarian") return "assistant_librarian";
   return "other";
 }
 
@@ -1078,8 +1098,9 @@ router.post(
  * PATCH /api/users/:id/role
  * Admin/librarian: change a user's role.
  * - Admin can change any role except their own.
- * - Librarian can change student/other/faculty users and can only assign
- *   student/other/faculty roles.
+ * - Librarian can change eligible student/faculty users and can assign
+ *   student/faculty/assistant_librarian roles.
+ * - Keep account_type in sync so effective-role resolution reflects the change.
  * Body: { role }
  */
 router.patch("/:id/role", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
@@ -1099,7 +1120,7 @@ router.patch("/:id/role", requireAuth, requireRole(["librarian", "admin"]), asyn
     }
 
     const nextRole = normalizeRole(req.body?.role);
-    if (!ALLOWED_ROLES.includes(nextRole)) {
+    if (!ASSIGNABLE_ROLES.includes(nextRole)) {
       return res.status(400).json({ ok: false, message: "Invalid role." });
     }
 
@@ -1131,32 +1152,34 @@ router.patch("/:id/role", requireAuth, requireRole(["librarian", "admin"]), asyn
         });
       }
 
-      if (isExemptFromApproval(nextRole)) {
+      if (!LIBRARIAN_ASSIGNABLE_ROLES.includes(nextRole)) {
         return res.status(403).json({
           ok: false,
           message:
-            "Librarians can only assign student, other, or faculty roles.",
+            "Librarians can only assign student, faculty, or assistant librarian roles.",
         });
       }
     }
 
+    const nextAccountType = accountTypeFromRole(nextRole);
     const forceApprove = isExemptFromApproval(nextRole);
 
     await query(
       `UPDATE users
          SET role = $1,
-             is_approved = CASE WHEN $2 THEN TRUE ELSE is_approved END,
+             account_type = $2,
+             is_approved = CASE WHEN $3 THEN TRUE ELSE is_approved END,
              approved_at = CASE
-               WHEN $2 AND approved_at IS NULL THEN NOW()
+               WHEN $3 AND approved_at IS NULL THEN NOW()
                ELSE approved_at
              END,
              approved_by = CASE
-               WHEN $2 AND approved_by IS NULL THEN $3
+               WHEN $3 AND approved_by IS NULL THEN $4
                ELSE approved_by
              END,
              updated_at = NOW()
-         WHERE id = $4`,
-      [nextRole, forceApprove, s.sub, targetId]
+         WHERE id = $5`,
+      [nextRole, nextAccountType, forceApprove, s.sub, targetId]
     );
 
     const refreshed = await fetchMeRow(targetId);
