@@ -1076,10 +1076,13 @@ router.post(
 
 /**
  * PATCH /api/users/:id/role
- * Admin-only: change a user's role.
+ * Admin/librarian: change a user's role.
+ * - Admin can change any role except their own.
+ * - Librarian can change student/other/faculty users and can only assign
+ *   student/other/faculty roles.
  * Body: { role }
  */
-router.patch("/:id/role", requireAuth, requireRole(["admin"]), async (req, res, next) => {
+router.patch("/:id/role", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
   try {
     const s = (req as any).sessionUser as SessionPayload;
     const targetId = readIdParam(req.params.id);
@@ -1114,6 +1117,27 @@ router.patch("/:id/role", requireAuth, requireRole(["admin"]), async (req, res, 
 
     if (!found.rowCount) {
       return res.status(404).json({ ok: false, message: "User not found." });
+    }
+
+    const currentUser = found.rows[0];
+    const currentRole = computeEffectiveRoleFromRow(currentUser);
+
+    if (s.role === "librarian") {
+      if (isExemptFromApproval(currentRole)) {
+        return res.status(403).json({
+          ok: false,
+          message:
+            "Only admins can change assistant librarian, librarian, or admin accounts.",
+        });
+      }
+
+      if (isExemptFromApproval(nextRole)) {
+        return res.status(403).json({
+          ok: false,
+          message:
+            "Librarians can only assign student, other, or faculty roles.",
+        });
+      }
     }
 
     const forceApprove = isExemptFromApproval(nextRole);
