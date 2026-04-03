@@ -96,6 +96,7 @@ type BorrowRowJoined = {
   email: string | null;
   student_id: string | null;
   full_name: string | null;
+  course: string | null;
   title: string | null;
 };
 
@@ -468,6 +469,7 @@ async function fetchBorrowRecordJoined(
             u.email,
             u.student_id,
             u.full_name,
+            u.course,
             b.title
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
@@ -517,6 +519,7 @@ async function fetchBorrowRecordsJoined(
             u.email,
             u.student_id,
             u.full_name,
+            u.course,
             b.title
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
@@ -640,6 +643,7 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     studentEmail: row.email,
     studentId: row.student_id,
     studentName: row.full_name,
+    course: row.course ?? null,
     bookId: String(row.book_id),
     bookTitle: row.title,
     borrowDate: row.borrow_date,
@@ -742,6 +746,7 @@ router.get(
                 u.email,
                 u.student_id,
                 u.full_name,
+                u.course,
                 b.title
          FROM borrow_records br
          LEFT JOIN users u ON u.id = br.user_id
@@ -2174,6 +2179,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
                    NULL::text AS email,
                    NULL::text AS student_id,
                    NULL::text AS full_name,
+                   NULL::text AS course,
                    NULL::text AS title`,
       [...values, rid]
     );
