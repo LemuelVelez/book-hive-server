@@ -165,12 +165,23 @@ function escapeHtml(input: string) {
     .replace(/'/g, "&#39;");
 }
 
+async function invalidateEmailVerificationTokens(userId: string) {
+  await query(
+    `UPDATE email_verifications
+       SET used = TRUE
+     WHERE user_id = $1
+       AND used = FALSE`,
+    [userId]
+  );
+}
+
 async function createAndSendVerifyEmail(
   userId: string,
   email: string,
   fullName?: string
 ) {
-  // Create token row
+  await invalidateEmailVerificationTokens(userId);
+
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
 
@@ -212,17 +223,23 @@ async function createAndSendVerifyEmail(
   });
 }
 
+async function invalidatePasswordResetTokens(userId: string) {
+  await query(
+    `UPDATE password_resets
+       SET used_at = COALESCE(used_at, NOW())
+     WHERE user_id = $1
+       AND used_at IS NULL`,
+    [userId]
+  );
+}
+
 /** Create a password reset token row and email the user a link */
 async function createAndSendPasswordResetEmail(
   userId: string,
   email: string,
   fullName?: string
 ) {
-  await query(
-    `UPDATE password_resets SET used_at = NOW()
-     WHERE user_id = $1 AND used_at IS NULL AND expires_at < NOW()`,
-    [userId]
-  );
+  await invalidatePasswordResetTokens(userId);
 
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
@@ -237,11 +254,12 @@ async function createAndSendPasswordResetEmail(
     `[password-reset] token created for user=${userId} token=${token}`
   );
 
-  const client = process.env.CLIENT_ORIGIN || "http://localhost:5173";
-  const resetUrl = `${client.replace(
-    /\/+$/,
-    ""
-  )}/auth/reset-password?token=${encodeURIComponent(token)}`;
+  const client = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .toString()
+    .replace(/\/+$/, "");
+  const resetUrl = `${client}/auth/reset-password?token=${encodeURIComponent(
+    token
+  )}`;
 
   const safeName =
     fullName && fullName.trim().length > 0
@@ -511,25 +529,23 @@ router.post("/register", async (req, res, next) => {
 router.post("/login", async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ ok: false, message: "Email and password are required." });
-    }
 
-    const normalizedEmail = String(email).trim().toLowerCase();
+    if (!email || !password) {
+      return res.status(400).json({
+        ok: false,
+        message: "Email and password are required.",
+      });
+    }
 
     const found = await query<UserRow>(
       `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-      [normalizedEmail]
+      [String(email).trim().toLowerCase()]
     );
 
     if (!found.rowCount) {
-      return res.status(404).json({
-        ok: false,
-        message:
-          "We couldn't find an account with that email. Please check for typos or register first.",
-      });
+      return res
+        .status(401)
+        .json({ ok: false, message: "Invalid email or password." });
     }
 
     const user = found.rows[0];
@@ -610,10 +626,7 @@ router.post("/verify-email", async (req, res, next) => {
     }
     const user = found.rows[0];
 
-    await query(
-      `UPDATE email_verifications SET used = TRUE WHERE user_id = $1 AND used = FALSE`,
-      [user.id]
-    );
+    await invalidateEmailVerificationTokens(user.id);
 
     await createAndSendVerifyEmail(user.id, user.email, user.full_name);
     res.json({ ok: true, message: "Verification email sent." });
@@ -644,9 +657,7 @@ router.post("/verify-email/confirm", async (req, res, next) => {
     const row = t.rows[0];
 
     if (row.used) {
-      return res
-        .status(400)
-        .json({ ok: false, message: "Token already used." });
+      return res.status(400).json({ ok: false, message: "Token already used." });
     }
     if (new Date(row.expires_at).getTime() < Date.now()) {
       return res.status(400).json({ ok: false, message: "Token expired." });
@@ -781,29 +792,53 @@ router.post("/reset-password", async (req, res, next) => {
       });
     }
 
-    const t = await query<{
+    const usedTokenResult = await query<{
       id: string;
       user_id: string;
       token: string;
       created_at: string;
       expires_at: string;
       used_at: string | null;
-    }>(`SELECT * FROM password_resets WHERE token = $1 LIMIT 1`, [token]);
+    }>(
+      `UPDATE password_resets
+          SET used_at = NOW()
+        WHERE id = (
+          SELECT id
+          FROM password_resets
+          WHERE token = $1
+            AND used_at IS NULL
+            AND expires_at >= NOW()
+          LIMIT 1
+        )
+        RETURNING id, user_id, token, created_at, expires_at, used_at`,
+      [token]
+    );
 
-    if (!t.rowCount) {
-      return res.status(400).json({ ok: false, message: "Invalid token." });
-    }
-    const row = t.rows[0];
+    if (!usedTokenResult.rowCount) {
+      const tokenLookup = await query<{
+        id: string;
+        user_id: string;
+        token: string;
+        created_at: string;
+        expires_at: string;
+        used_at: string | null;
+      }>(`SELECT * FROM password_resets WHERE token = $1 LIMIT 1`, [token]);
 
-    if (row.used_at) {
-      return res
-        .status(400)
-        .json({ ok: false, message: "Token already used." });
-    }
-    if (new Date(row.expires_at).getTime() < Date.now()) {
+      if (!tokenLookup.rowCount) {
+        return res.status(400).json({ ok: false, message: "Invalid token." });
+      }
+
+      const existing = tokenLookup.rows[0];
+      if (existing.used_at) {
+        return res
+          .status(400)
+          .json({ ok: false, message: "Token already used." });
+      }
+
       return res.status(400).json({ ok: false, message: "Token expired." });
     }
 
+    const row = usedTokenResult.rows[0];
     const hash = await bcrypt.hash(password, 10);
 
     await query(
@@ -811,9 +846,7 @@ router.post("/reset-password", async (req, res, next) => {
       [hash, row.user_id]
     );
 
-    await query(`UPDATE password_resets SET used_at = NOW() WHERE id = $1`, [
-      row.id,
-    ]);
+    await invalidatePasswordResetTokens(row.user_id);
 
     clearSessionCookie(res);
 
