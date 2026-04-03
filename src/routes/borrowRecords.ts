@@ -51,6 +51,22 @@ type BorrowPolicyDTO = {
   maxPerAction: number;
 };
 
+type BorrowNotificationSummary = {
+  pendingPickupCount: number;
+  pendingReturnCount: number;
+  pendingExtensionCount: number;
+  pendingLegacyCount: number;
+  actionableCount: number;
+};
+
+type BorrowNotificationSummaryRow = {
+  pending_pickup_count: number | string | null;
+  pending_return_count: number | string | null;
+  pending_extension_count: number | string | null;
+  pending_legacy_count: number | string | null;
+  actionable_count: number | string | null;
+};
+
 type BorrowRowJoined = {
   id: string;
   user_id: string;
@@ -218,6 +234,31 @@ function listBorrowPolicies(): BorrowPolicyDTO[] {
 
 function formatBorrowPolicyRoleLabel(role: BorrowPolicyRole): string {
   return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function normalizeNotificationSummaryCount(value: unknown): number {
+  const numeric = Math.floor(Number(value));
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function toBorrowNotificationSummary(
+  row?: BorrowNotificationSummaryRow | null
+): BorrowNotificationSummary {
+  return {
+    pendingPickupCount: normalizeNotificationSummaryCount(
+      row?.pending_pickup_count
+    ),
+    pendingReturnCount: normalizeNotificationSummaryCount(
+      row?.pending_return_count
+    ),
+    pendingExtensionCount: normalizeNotificationSummaryCount(
+      row?.pending_extension_count
+    ),
+    pendingLegacyCount: normalizeNotificationSummaryCount(
+      row?.pending_legacy_count
+    ),
+    actionableCount: normalizeNotificationSummaryCount(row?.actionable_count),
+  };
 }
 
 function readSession(req: express.Request): SessionPayload | null {
@@ -807,6 +848,42 @@ router.get("/my", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+/**
+ * GET /api/borrow-records/notifications/summary
+ * Returns the actionable borrow-record notifications for assistant_librarian/librarian/admin.
+ */
+router.get(
+  "/notifications/summary",
+  requireAuth,
+  requireRole(["assistant_librarian", "librarian", "admin"]),
+  async (_req, res, next) => {
+    try {
+      const result = await dbQuery<BorrowNotificationSummaryRow>(
+        `SELECT COUNT(*) FILTER (WHERE br.status = 'pending_pickup') AS pending_pickup_count,
+                COUNT(*) FILTER (WHERE br.status = 'pending_return') AS pending_return_count,
+                COUNT(*) FILTER (
+                  WHERE COALESCE(br.extension_request_status, 'none') = 'pending'
+                ) AS pending_extension_count,
+                COUNT(*) FILTER (WHERE br.status = 'pending') AS pending_legacy_count,
+                COUNT(*) FILTER (
+                  WHERE br.status IN ('pending_pickup', 'pending_return', 'pending')
+                     OR COALESCE(br.extension_request_status, 'none') = 'pending'
+                ) AS actionable_count
+           FROM borrow_records br
+          WHERE br.return_date IS NULL
+             OR br.status <> 'returned'`
+      );
+
+      return res.json({
+        ok: true,
+        summary: toBorrowNotificationSummary(result.rows[0]),
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 /**
  * GET /api/borrow-records/policies
