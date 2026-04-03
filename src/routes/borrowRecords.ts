@@ -51,20 +51,13 @@ type BorrowPolicyDTO = {
   maxPerAction: number;
 };
 
-type BorrowNotificationSummary = {
-  pendingPickupCount: number;
-  pendingReturnCount: number;
-  pendingExtensionCount: number;
-  pendingLegacyCount: number;
-  actionableCount: number;
-};
 
-type BorrowNotificationSummaryRow = {
-  pending_pickup_count: number | string | null;
-  pending_return_count: number | string | null;
-  pending_extension_count: number | string | null;
-  pending_legacy_count: number | string | null;
-  actionable_count: number | string | null;
+type BorrowNotificationsSummaryRow = {
+  total_records: number;
+  pending_pickup_count: number;
+  pending_return_count: number;
+  pending_extension_count: number;
+  action_required_count: number;
 };
 
 type BorrowRowJoined = {
@@ -234,31 +227,6 @@ function listBorrowPolicies(): BorrowPolicyDTO[] {
 
 function formatBorrowPolicyRoleLabel(role: BorrowPolicyRole): string {
   return role.charAt(0).toUpperCase() + role.slice(1);
-}
-
-function normalizeNotificationSummaryCount(value: unknown): number {
-  const numeric = Math.floor(Number(value));
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
-}
-
-function toBorrowNotificationSummary(
-  row?: BorrowNotificationSummaryRow | null
-): BorrowNotificationSummary {
-  return {
-    pendingPickupCount: normalizeNotificationSummaryCount(
-      row?.pending_pickup_count
-    ),
-    pendingReturnCount: normalizeNotificationSummaryCount(
-      row?.pending_return_count
-    ),
-    pendingExtensionCount: normalizeNotificationSummaryCount(
-      row?.pending_extension_count
-    ),
-    pendingLegacyCount: normalizeNotificationSummaryCount(
-      row?.pending_legacy_count
-    ),
-    actionableCount: normalizeNotificationSummaryCount(row?.actionable_count),
-  };
 }
 
 function readSession(req: express.Request): SessionPayload | null {
@@ -790,6 +758,119 @@ router.get(
   }
 );
 
+
+/**
+ * GET /api/borrow-records/summary
+ * Notification/read-unread style counts for the borrow records workflow.
+ *
+ * unreadCount = records that still need staff action
+ * readCount = records that are already handled / not waiting on staff
+ *
+ * assistant_librarian:
+ * - sees pending pickup + pending return counts
+ *
+ * librarian/admin:
+ * - also sees pending extension requests
+ */
+router.get(
+  "/summary",
+  requireAuth,
+  requireRole(["assistant_librarian", "librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const session = (req as any).sessionUser as SessionPayload;
+      const effectiveRole = await getEffectiveRole(session.sub, session.role);
+      const canManageExtensions =
+        effectiveRole === "librarian" || effectiveRole === "admin";
+
+      const result = await dbQuery<BorrowNotificationsSummaryRow>(
+        `SELECT COUNT(*)::int AS total_records,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND br.status = 'pending_pickup'
+                )::int AS pending_pickup_count,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND br.status IN ('pending_return', 'pending')
+                )::int AS pending_return_count,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND br.extension_request_status = 'pending'
+                )::int AS pending_extension_count,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND (
+                      br.status = 'pending_pickup'
+                      OR br.status IN ('pending_return', 'pending')
+                      OR ($1::boolean AND br.extension_request_status = 'pending')
+                    )
+                )::int AS action_required_count
+         FROM borrow_records br`,
+        [canManageExtensions]
+      );
+
+      const row = result.rows[0] ?? {
+        total_records: 0,
+        pending_pickup_count: 0,
+        pending_return_count: 0,
+        pending_extension_count: 0,
+        action_required_count: 0,
+      };
+
+      const unreadCount =
+        typeof row.action_required_count === "number" &&
+        Number.isFinite(row.action_required_count)
+          ? row.action_required_count
+          : 0;
+
+      const totalRecords =
+        typeof row.total_records === "number" && Number.isFinite(row.total_records)
+          ? row.total_records
+          : 0;
+
+      const handledCount = Math.max(0, totalRecords - unreadCount);
+
+      return res.json({
+        ok: true,
+        summary: {
+          role: effectiveRole,
+          canManageExtensions,
+          totalRecords,
+          actionRequiredCount: unreadCount,
+          unreadCount,
+          handledCount,
+          readCount: handledCount,
+          pendingPickupCount:
+            typeof row.pending_pickup_count === "number" &&
+            Number.isFinite(row.pending_pickup_count)
+              ? row.pending_pickup_count
+              : 0,
+          pendingReturnCount:
+            typeof row.pending_return_count === "number" &&
+            Number.isFinite(row.pending_return_count)
+              ? row.pending_return_count
+              : 0,
+          pendingExtensionCount: canManageExtensions &&
+            typeof row.pending_extension_count === "number" &&
+            Number.isFinite(row.pending_extension_count)
+              ? row.pending_extension_count
+              : 0,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 /**
  * GET /api/borrow-records/my
  * List borrow records for the current authenticated user (any role).
@@ -848,42 +929,6 @@ router.get("/my", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
-
-/**
- * GET /api/borrow-records/notifications/summary
- * Returns the actionable borrow-record notifications for assistant_librarian/librarian/admin.
- */
-router.get(
-  "/notifications/summary",
-  requireAuth,
-  requireRole(["assistant_librarian", "librarian", "admin"]),
-  async (_req, res, next) => {
-    try {
-      const result = await dbQuery<BorrowNotificationSummaryRow>(
-        `SELECT COUNT(*) FILTER (WHERE br.status = 'pending_pickup') AS pending_pickup_count,
-                COUNT(*) FILTER (WHERE br.status = 'pending_return') AS pending_return_count,
-                COUNT(*) FILTER (
-                  WHERE COALESCE(br.extension_request_status, 'none') = 'pending'
-                ) AS pending_extension_count,
-                COUNT(*) FILTER (WHERE br.status = 'pending') AS pending_legacy_count,
-                COUNT(*) FILTER (
-                  WHERE br.status IN ('pending_pickup', 'pending_return', 'pending')
-                     OR COALESCE(br.extension_request_status, 'none') = 'pending'
-                ) AS actionable_count
-           FROM borrow_records br
-          WHERE br.return_date IS NULL
-             OR br.status <> 'returned'`
-      );
-
-      return res.json({
-        ok: true,
-        summary: toBorrowNotificationSummary(result.rows[0]),
-      });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
 
 /**
  * GET /api/borrow-records/policies
