@@ -613,23 +613,40 @@ router.post("/login", async (req, res, next) => {
 // POST /api/auth/verify-email  (re-send)
 router.post("/verify-email", async (req, res, next) => {
   try {
-    const { email } = req.body || {};
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({ ok: false, message: "Email is required." });
+    const emailRaw = String(req.body?.email ?? "").trim();
+    const email = emailRaw.toLowerCase();
+
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ ok: false, message: "Please enter a valid email address." });
     }
+
     const found = await query<UserRow>(
       `SELECT * FROM users WHERE email = $1 LIMIT 1`,
-      [email.trim().toLowerCase()]
+      [email]
     );
+
     if (!found.rowCount) {
-      return res.status(404).json({ ok: false, message: "Account not found." });
+      return res.status(404).json({
+        ok: false,
+        message: "The current email is not registered. Please check the email or register first.",
+      });
     }
+
     const user = found.rows[0];
 
-    await invalidateEmailVerificationTokens(user.id);
+    if (user.is_email_verified) {
+      return res.status(409).json({
+        ok: false,
+        message: "This email is already verified. You can log in now.",
+      });
+    }
 
     await createAndSendVerifyEmail(user.id, user.email, user.full_name);
-    res.json({ ok: true, message: "Verification email sent." });
+
+    return res.json({
+      ok: true,
+      message: "Verification email sent. Please check your inbox and spam folder.",
+    });
   } catch (err) {
     next(err);
   }
@@ -750,7 +767,7 @@ router.post("/forgot-password", async (req, res, next) => {
       return res.status(404).json({
         ok: false,
         message:
-          "We couldn't find an account with that email. Please double-check or register first.",
+          "The current email is not registered. Please check the email or register first.",
       });
     }
 
