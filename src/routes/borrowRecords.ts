@@ -51,7 +51,6 @@ type BorrowPolicyDTO = {
   maxPerAction: number;
 };
 
-
 type BorrowNotificationsSummaryRow = {
   total_records: number;
   pending_pickup_count: number;
@@ -97,6 +96,7 @@ type BorrowRowJoined = {
   student_id: string | null;
   full_name: string | null;
   course: string | null;
+  college?: string | null;
   title: string | null;
 };
 
@@ -125,6 +125,56 @@ const dbPool = pool as unknown as DBPool;
 
 const HOUR_MS = 1000 * 60 * 60;
 const DAY_MS = HOUR_MS * 24;
+
+const PROGRAM_TO_COLLEGE = new Map<string, string>([
+  ["bsba", "College of Business Administration"],
+  ["bsam", "College of Business Administration"],
+  ["bshm", "College of Business Administration"],
+  ["bsed filipino", "College of Teacher Education"],
+  ["bsed english", "College of Teacher Education"],
+  ["bsed math", "College of Teacher Education"],
+  ["bsed social studies", "College of Teacher Education"],
+  ["bachelor of physical education", "College of Teacher Education"],
+  ["beed", "College of Teacher Education"],
+  ["bs information systems", "College of Computing Studies"],
+  ["bs computer science", "College of Computing Studies"],
+  ["bs agriculture", "College of Agriculture and Forestry"],
+  ["bs forestry", "College of Agriculture and Forestry"],
+  ["baels", "College of Liberal Arts, Mathematics and Sciences"],
+  ["agricultural biosystems engineering", "School of Engineering"],
+  ["bs criminology", "School of Criminal Justice Education"],
+]);
+
+const COLLEGE_KEYWORDS: Array<{ label: string; terms: string[] }> = [
+  {
+    label: "College of Business Administration",
+    terms: ["college of business administration", "cba", "business", "marketing", "accounting"],
+  },
+  {
+    label: "College of Teacher Education",
+    terms: ["college of teacher education", "cted", "education", "teacher", "beed", "bsed"],
+  },
+  {
+    label: "College of Computing Studies",
+    terms: ["college of computing studies", "ccs", "information systems", "computer science", "computing"],
+  },
+  {
+    label: "College of Agriculture and Forestry",
+    terms: ["college of agriculture and forestry", "caf", "agriculture", "forestry"],
+  },
+  {
+    label: "College of Liberal Arts, Mathematics and Sciences",
+    terms: ["college of liberal arts, mathematics and sciences", "clams", "baels", "liberal arts"],
+  },
+  {
+    label: "School of Engineering",
+    terms: ["school of engineering", "soe", "engineering"],
+  },
+  {
+    label: "School of Criminal Justice Education",
+    terms: ["school of criminal justice education", "scje", "criminology", "criminal justice"],
+  },
+];
 
 const DEFAULT_BORROW_POLICIES: Record<BorrowPolicyRole, BorrowPolicyDTO> = {
   student: {
@@ -180,6 +230,33 @@ function normalizeRole(raw: unknown): Role {
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
   return "other";
+}
+
+function normalizeSpace(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function normalizeLookupValue(value: string) {
+  return normalizeSpace(value).toLowerCase();
+}
+
+function deriveCollegeFromCourse(course?: string | null): string | null {
+  const raw = String(course ?? "").trim();
+  if (!raw) return null;
+
+  const normalized = normalizeLookupValue(raw);
+
+  if (PROGRAM_TO_COLLEGE.has(normalized)) {
+    return PROGRAM_TO_COLLEGE.get(normalized) ?? null;
+  }
+
+  for (const entry of COLLEGE_KEYWORDS) {
+    if (entry.terms.some((term) => normalized.includes(term))) {
+      return entry.label;
+    }
+  }
+
+  return null;
 }
 
 function toBorrowPolicyRole(role: unknown): BorrowPolicyRole {
@@ -637,6 +714,8 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     return "none";
   })();
 
+  const college = row.college ?? deriveCollegeFromCourse(row.course);
+
   return {
     id: String(row.id),
     userId: String(row.user_id),
@@ -644,6 +723,7 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     studentId: row.student_id,
     studentName: row.full_name,
     course: row.course ?? null,
+    college,
     bookId: String(row.book_id),
     bookTitle: row.title,
     borrowDate: row.borrow_date,
@@ -763,7 +843,6 @@ router.get(
   }
 );
 
-
 /**
  * GET /api/borrow-records/summary
  * Notification/read-unread style counts for the borrow records workflow.
@@ -863,7 +942,8 @@ router.get(
             Number.isFinite(row.pending_return_count)
               ? row.pending_return_count
               : 0,
-          pendingExtensionCount: canManageExtensions &&
+          pendingExtensionCount:
+            canManageExtensions &&
             typeof row.pending_extension_count === "number" &&
             Number.isFinite(row.pending_extension_count)
               ? row.pending_extension_count
@@ -918,6 +998,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
               u.email,
               u.student_id,
               u.full_name,
+              u.course,
               b.title
        FROM borrow_records br
        LEFT JOIN users u ON u.id = br.user_id
@@ -2017,55 +2098,41 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
         });
       }
 
+      if (dueDate !== undefined) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message: "Assistant librarian cannot change the due date.",
+        });
+      }
+
+      if (fine !== undefined) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({
+          ok: false,
+          message: "Assistant librarian cannot override the fine.",
+        });
+      }
+    }
+
+    if (!isPrivilegedStaff) {
       if (dueDate !== undefined || fine !== undefined) {
         await client.query("ROLLBACK");
         return res.status(403).json({
           ok: false,
-          message:
-            "Assistant librarian cannot change the due date or override the fine amount.",
+          message: "Forbidden: only librarian or admin can change due date or fine.",
         });
       }
 
       if (
-        returnDate !== undefined &&
-        desiredStatus !== "returned" &&
-        current.status !== "returned"
+        desiredStatus !== undefined &&
+        desiredStatus !== "pending_return" &&
+        desiredStatus !== "returned"
       ) {
         await client.query("ROLLBACK");
         return res.status(403).json({
           ok: false,
-          message:
-            "Assistant librarian can only set the return date when marking a record as returned.",
-        });
-      }
-    } else if (!isPrivilegedStaff) {
-      if (
-        desiredStatus &&
-        desiredStatus !== "pending" &&
-        desiredStatus !== "pending_return"
-      ) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          ok: false,
-          message:
-            "Only librarians can change the borrow status. Your online action should create a pending return request.",
-        });
-      }
-
-      if (returnDate !== undefined) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          ok: false,
-          message: "Only librarians can set the return date.",
-        });
-      }
-
-      if (dueDate !== undefined || fine !== undefined) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({
-          ok: false,
-          message:
-            "Only librarians can change the due date or finalize the fine amount.",
+          message: "Forbidden: you can only request or confirm returns for your own record.",
         });
       }
     }
@@ -2073,12 +2140,10 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     const updates: string[] = [];
     const values: any[] = [];
     let i = 1;
-
-    let newStatus: BorrowStatus = current.status;
+    let newStatus = current.status;
 
     if (status !== undefined) {
-      const sVal = String(status).toLowerCase() as BorrowStatus;
-
+      const sVal = String(status).toLowerCase();
       const allowedStatuses: BorrowStatus[] = [
         "borrowed",
         "pending",
@@ -2087,12 +2152,12 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
         "returned",
       ];
 
-      if (!allowedStatuses.includes(sVal)) {
+      if (!allowedStatuses.includes(sVal as BorrowStatus)) {
         await client.query("ROLLBACK");
         return res.status(400).json({ ok: false, message: "Invalid status." });
       }
 
-      newStatus = sVal;
+      newStatus = sVal as BorrowStatus;
 
       updates.push(`status = $${i++}`);
       values.push(sVal);
@@ -2180,6 +2245,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
                    NULL::text AS student_id,
                    NULL::text AS full_name,
                    NULL::text AS course,
+                   NULL::text AS college,
                    NULL::text AS title`,
       [...values, rid]
     );
