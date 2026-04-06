@@ -1,5 +1,6 @@
 import express from "express";
 import jwt from "jsonwebtoken";
+import { sendMail } from "../email";
 import { pool, query } from "../db";
 
 const router = express.Router();
@@ -57,6 +58,30 @@ type BorrowNotificationsSummaryRow = {
   pending_return_count: number;
   pending_extension_count: number;
   action_required_count: number;
+};
+
+
+type BorrowDueCountsRow = {
+  due_today_count: number;
+  overdue_count: number;
+};
+
+type BorrowNotificationEmailRow = {
+  id: string;
+  user_id: string;
+  due_date: string;
+  status: BorrowStatus;
+  return_requested_at: string | null;
+  return_requested_by: number | null;
+  return_request_note: string | null;
+  email: string | null;
+  full_name: string | null;
+  title: string | null;
+};
+
+type UserIdentityRow = UserRoleRow & {
+  email: string | null;
+  full_name: string | null;
 };
 
 type BorrowRowJoined = {
@@ -125,6 +150,16 @@ const dbPool = pool as unknown as DBPool;
 
 const HOUR_MS = 1000 * 60 * 60;
 const DAY_MS = HOUR_MS * 24;
+const APP_TIME_ZONE = "Asia/Manila";
+const BORROW_EMAIL_NOTIFICATION_CACHE = new Map<string, number>();
+const BORROW_EMAIL_NOTIFICATION_COOLDOWN_MS = Math.max(
+  HOUR_MS,
+  Number(process.env.BORROW_NOTIFICATION_EMAIL_COOLDOWN_MS ?? 20 * HOUR_MS)
+);
+const BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT = Math.max(
+  3,
+  Math.min(20, Number(process.env.BORROW_NOTIFICATION_EMAIL_DETAIL_LIMIT ?? 10))
+);
 
 const PROGRAM_TO_COLLEGE = new Map<string, string>([
   ["bsba", "College of Business Administration"],
@@ -428,6 +463,441 @@ function getBorrowFinePerHour(): number {
   const raw = Number(process.env.BORROW_FINE_PER_HOUR ?? 10);
   if (!Number.isFinite(raw) || raw < 0) return 10;
   return raw;
+}
+
+
+function escapeHtml(input: string) {
+  return String(input ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function getDateOnlyInTimeZone(date = new Date(), timeZone = APP_TIME_ZONE) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value ?? "0000";
+  const month = parts.find((part) => part.type === "month")?.value ?? "01";
+  const day = parts.find((part) => part.type === "day")?.value ?? "01";
+
+  return `${year}-${month}-${day}`;
+}
+
+function dateOnlyToUtcMs(value: string) {
+  const [year, month, day] = String(value)
+    .split("-")
+    .map((part) => Number(part));
+
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    return Number.NaN;
+  }
+
+  return Date.UTC(year, month - 1, day);
+}
+
+function compareDateOnly(left: string, right: string) {
+  return dateOnlyToUtcMs(left) - dateOnlyToUtcMs(right);
+}
+
+function getDueNotificationKind(
+  dueDate: string | null | undefined,
+  todayDateOnly: string
+): "due_today" | "overdue" | null {
+  if (!dueDate) return null;
+
+  const diff = compareDateOnly(dueDate, todayDateOnly);
+  if (Number.isNaN(diff)) return null;
+  if (diff < 0) return "overdue";
+  if (diff === 0) return "due_today";
+  return null;
+}
+
+function getBorrowRecordTitle(row: {
+  title?: string | null;
+  id?: string | number | null;
+}) {
+  const title = String(row.title ?? "").trim();
+  if (title) return title;
+  return `Borrow record #${row.id ?? "—"}`;
+}
+
+function trimText(value: string | null | undefined, max = 160) {
+  const normalized = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+}
+
+function pruneBorrowNotificationEmailCache(now = Date.now()) {
+  for (const [key, timestamp] of BORROW_EMAIL_NOTIFICATION_CACHE.entries()) {
+    if (now - timestamp >= BORROW_EMAIL_NOTIFICATION_COOLDOWN_MS) {
+      BORROW_EMAIL_NOTIFICATION_CACHE.delete(key);
+    }
+  }
+}
+
+function claimBorrowNotificationEmailSlot(key: string) {
+  const now = Date.now();
+  pruneBorrowNotificationEmailCache(now);
+
+  const lastSentAt = BORROW_EMAIL_NOTIFICATION_CACHE.get(key);
+  if (
+    typeof lastSentAt === "number" &&
+    Number.isFinite(lastSentAt) &&
+    now - lastSentAt < BORROW_EMAIL_NOTIFICATION_COOLDOWN_MS
+  ) {
+    return false;
+  }
+
+  BORROW_EMAIL_NOTIFICATION_CACHE.set(key, now);
+  return true;
+}
+
+function formatBorrowEmailLine(
+  row: BorrowNotificationEmailRow,
+  kind: "due_today" | "overdue" | "return_requested"
+) {
+  const title = getBorrowRecordTitle(row);
+  const due = row.due_date ? `Due ${row.due_date}` : "No due date";
+  const borrower = row.full_name ? ` • Borrower: ${row.full_name}` : "";
+  const note =
+    kind === "return_requested" && row.return_request_note
+      ? ` • Note: ${trimText(row.return_request_note, 90)}`
+      : "";
+  return `• ${title} (Borrow ID ${row.id} • ${due}${borrower}${note})`;
+}
+
+function buildBorrowerDashboardEmail(opts: {
+  fullName?: string | null;
+  todayDateOnly: string;
+  dueTodayRows: BorrowNotificationEmailRow[];
+  overdueRows: BorrowNotificationEmailRow[];
+  returnRequestRows: BorrowNotificationEmailRow[];
+}) {
+  const dueTodayCount = opts.dueTodayRows.length;
+  const overdueCount = opts.overdueRows.length;
+  const returnRequestCount = opts.returnRequestRows.length;
+
+  const subjectParts: string[] = [];
+  if (overdueCount > 0) {
+    subjectParts.push(`${overdueCount} overdue book${overdueCount === 1 ? "" : "s"}`);
+  }
+  if (dueTodayCount > 0) {
+    subjectParts.push(`${dueTodayCount} due today`);
+  }
+  if (returnRequestCount > 0) {
+    subjectParts.push(`${returnRequestCount} return request${returnRequestCount === 1 ? "" : "s"}`);
+  }
+
+  const subject = `Book-Hive reminder: ${subjectParts.join(" • ")}`;
+  const greetingName = trimText(opts.fullName, 80) || "Borrower";
+
+  const textSections = [
+    dueTodayCount > 0
+      ? [`Books due today (${dueTodayCount})`, ...opts.dueTodayRows.map((row) => formatBorrowEmailLine(row, "due_today"))].join("\n")
+      : "",
+    overdueCount > 0
+      ? [`Overdue books (${overdueCount})`, ...opts.overdueRows.map((row) => formatBorrowEmailLine(row, "overdue"))].join("\n")
+      : "",
+    returnRequestCount > 0
+      ? [
+          `Librarian return requests (${returnRequestCount})`,
+          ...opts.returnRequestRows.map((row) => formatBorrowEmailLine(row, "return_requested")),
+        ].join("\n")
+      : "",
+  ].filter(Boolean);
+
+  const text = [
+    `Hello ${greetingName},`,
+    "",
+    `These borrow notifications currently match what is showing in your Book-Hive dashboard as of ${opts.todayDateOnly}.`,
+    "",
+    ...textSections.flatMap((section) => [section, ""]),
+    "Please open your Book-Hive circulation dashboard to review the full details.",
+  ].join("\n");
+
+  const renderList = (
+    title: string,
+    rows: BorrowNotificationEmailRow[],
+    kind: "due_today" | "overdue" | "return_requested"
+  ) => {
+    if (!rows.length) return "";
+    return `
+      <div style="margin-top:16px;">
+        <div style="font-size:14px;font-weight:700;margin-bottom:8px;">${escapeHtml(title)}</div>
+        <ul style="margin:0;padding-left:18px;color:#111827;">
+          ${rows
+            .map((row) => `<li style="margin-bottom:6px;">${escapeHtml(formatBorrowEmailLine(row, kind).replace(/^•\s*/, ""))}</li>`)
+            .join("")}
+        </ul>
+      </div>
+    `;
+  };
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;color:#111827;">
+      <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;">
+        <div style="font-size:20px;font-weight:700;margin-bottom:8px;">Book-Hive borrow reminder</div>
+        <div style="font-size:14px;line-height:1.6;color:#334155;">
+          Hello ${escapeHtml(greetingName)},<br /><br />
+          These borrow notifications currently match what is showing in your Book-Hive dashboard as of
+          <strong>${escapeHtml(opts.todayDateOnly)}</strong>.
+        </div>
+        ${renderList("Books due today", opts.dueTodayRows, "due_today")}
+        ${renderList("Overdue books", opts.overdueRows, "overdue")}
+        ${renderList(
+          "Librarian return requests",
+          opts.returnRequestRows,
+          "return_requested"
+        )}
+        <div style="margin-top:18px;font-size:13px;color:#475569;line-height:1.6;">
+          Please open your Book-Hive circulation dashboard to review the full details.
+        </div>
+      </div>
+    </div>
+  `;
+
+  return { subject, text, html };
+}
+
+function buildStaffDashboardEmail(opts: {
+  fullName?: string | null;
+  todayDateOnly: string;
+  pendingPickupCount: number;
+  pendingReturnCount: number;
+  pendingExtensionCount: number;
+  dueTodayCount: number;
+  overdueCount: number;
+  dueRows: BorrowNotificationEmailRow[];
+}) {
+  const totalNotifications =
+    opts.pendingPickupCount +
+    opts.pendingReturnCount +
+    opts.pendingExtensionCount +
+    opts.dueTodayCount +
+    opts.overdueCount;
+
+  const subject = `Book-Hive librarian alert: ${totalNotifications} notification${totalNotifications === 1 ? "" : "s"} need attention`;
+  const greetingName = trimText(opts.fullName, 80) || "Library staff";
+
+  const dashboardCounts = [
+    `Pending pickup: ${opts.pendingPickupCount}`,
+    `Pending return: ${opts.pendingReturnCount}`,
+    `Pending extension: ${opts.pendingExtensionCount}`,
+    `Due today: ${opts.dueTodayCount}`,
+    `Overdue: ${opts.overdueCount}`,
+  ];
+
+  const dueTodayRows = opts.dueRows.filter(
+    (row) => getDueNotificationKind(row.due_date, opts.todayDateOnly) === "due_today"
+  );
+  const overdueRows = opts.dueRows.filter(
+    (row) => getDueNotificationKind(row.due_date, opts.todayDateOnly) === "overdue"
+  );
+
+  const text = [
+    `Hello ${greetingName},`,
+    "",
+    `Here is your Book-Hive borrow records digest for ${opts.todayDateOnly}.`,
+    "",
+    "Dashboard counts:",
+    ...dashboardCounts.map((line) => `• ${line}`),
+    "",
+    ...(dueTodayRows.length
+      ? [
+          `Due today (${dueTodayRows.length})`,
+          ...dueTodayRows.map((row) => formatBorrowEmailLine(row, "due_today")),
+          "",
+        ]
+      : []),
+    ...(overdueRows.length
+      ? [
+          `Overdue (${overdueRows.length})`,
+          ...overdueRows.map((row) => formatBorrowEmailLine(row, "overdue")),
+          "",
+        ]
+      : []),
+    "Please open the Borrow Records dashboard to review and process these items.",
+  ].join("\n");
+
+  const renderDueList = (
+    title: string,
+    rows: BorrowNotificationEmailRow[],
+    kind: "due_today" | "overdue"
+  ) => {
+    if (!rows.length) return "";
+    return `
+      <div style="margin-top:16px;">
+        <div style="font-size:14px;font-weight:700;margin-bottom:8px;">${escapeHtml(title)}</div>
+        <ul style="margin:0;padding-left:18px;color:#111827;">
+          ${rows
+            .map((row) => `<li style="margin-bottom:6px;">${escapeHtml(formatBorrowEmailLine(row, kind).replace(/^•\s*/, ""))}</li>`)
+            .join("")}
+        </ul>
+      </div>
+    `;
+  };
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;color:#111827;">
+      <div style="max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;">
+        <div style="font-size:20px;font-weight:700;margin-bottom:8px;">Book-Hive borrow records alert</div>
+        <div style="font-size:14px;line-height:1.6;color:#334155;">
+          Hello ${escapeHtml(greetingName)},<br /><br />
+          Here is your borrow records digest for <strong>${escapeHtml(opts.todayDateOnly)}</strong>.
+        </div>
+        <div style="margin-top:16px;padding:16px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc;">
+          <div style="font-size:14px;font-weight:700;margin-bottom:8px;">Dashboard counts</div>
+          <ul style="margin:0;padding-left:18px;color:#111827;">
+            ${dashboardCounts.map((line) => `<li style="margin-bottom:6px;">${escapeHtml(line)}</li>`).join("")}
+          </ul>
+        </div>
+        ${renderDueList("Due today", dueTodayRows, "due_today")}
+        ${renderDueList("Overdue", overdueRows, "overdue")}
+        <div style="margin-top:18px;font-size:13px;color:#475569;line-height:1.6;">
+          Please open the Borrow Records dashboard to review and process these items.
+        </div>
+      </div>
+    </div>
+  `;
+
+  return { subject, text, html, totalNotifications };
+}
+
+async function sendBorrowNotificationEmail(args: {
+  to: string | null | undefined;
+  subject: string;
+  text: string;
+  html: string;
+}) {
+  const recipient = String(args.to ?? "").trim();
+  if (!recipient) return false;
+
+  try {
+    await sendMail({
+      to: recipient,
+      subject: args.subject,
+      text: args.text,
+      html: args.html,
+    });
+    return true;
+  } catch (error) {
+    console.error("[borrow-records] notification email failed", {
+      to: recipient,
+      error,
+    });
+    return false;
+  }
+}
+
+async function sendBorrowWorkflowEmail(args: {
+  joinedRow: BorrowRowJoined;
+  event:
+    | "return_requested_by_staff"
+    | "extension_approved"
+    | "extension_disapproved"
+    | "due_date_updated"
+    | "return_confirmed";
+}) {
+  const recipient = String(args.joinedRow.email ?? "").trim();
+  if (!recipient) return false;
+
+  const borrowerName = trimText(args.joinedRow.full_name, 80) || "Borrower";
+  const bookTitle = getBorrowRecordTitle(args.joinedRow);
+  const dueDate = args.joinedRow.due_date ?? "—";
+  const returnDate = args.joinedRow.return_date ?? "—";
+  const note = trimText(args.joinedRow.extension_decision_note ?? args.joinedRow.return_request_note ?? "", 180);
+
+  let title = "Book-Hive notification";
+  let intro = "There is an update on your borrow record.";
+  let details: string[] = [];
+
+  if (args.event === "return_requested_by_staff") {
+    title = `Book-Hive: return requested for "${bookTitle}"`;
+    intro = "A librarian requested that you return this book.";
+    details = [
+      `Borrow ID: ${args.joinedRow.id}`,
+      `Book: ${bookTitle}`,
+      `Current due date: ${dueDate}`,
+      note ? `Staff note: ${note}` : "",
+    ].filter(Boolean);
+  } else if (args.event === "extension_approved") {
+    title = `Book-Hive: extension approved for "${bookTitle}"`;
+    intro = "Your borrow extension request was approved.";
+    details = [
+      `Borrow ID: ${args.joinedRow.id}`,
+      `Book: ${bookTitle}`,
+      `New due date: ${dueDate}`,
+      note ? `Decision note: ${note}` : "",
+    ].filter(Boolean);
+  } else if (args.event === "extension_disapproved") {
+    title = `Book-Hive: extension not approved for "${bookTitle}"`;
+    intro = "Your borrow extension request was not approved.";
+    details = [
+      `Borrow ID: ${args.joinedRow.id}`,
+      `Book: ${bookTitle}`,
+      `Current due date: ${dueDate}`,
+      note ? `Decision note: ${note}` : "",
+    ].filter(Boolean);
+  } else if (args.event === "due_date_updated") {
+    title = `Book-Hive: due date updated for "${bookTitle}"`;
+    intro = "A librarian updated the due date of your borrow record.";
+    details = [
+      `Borrow ID: ${args.joinedRow.id}`,
+      `Book: ${bookTitle}`,
+      `Updated due date: ${dueDate}`,
+    ];
+  } else if (args.event === "return_confirmed") {
+    title = `Book-Hive: return confirmed for "${bookTitle}"`;
+    intro = "Your book return has been recorded.";
+    details = [
+      `Borrow ID: ${args.joinedRow.id}`,
+      `Book: ${bookTitle}`,
+      `Return date: ${returnDate}`,
+      `Fine: ₱${Number(args.joinedRow.fine ?? 0).toFixed(2)}`,
+    ];
+  }
+
+  const text = [
+    `Hello ${borrowerName},`,
+    "",
+    intro,
+    "",
+    ...details.map((line) => `• ${line}`),
+    "",
+    "Please open your Book-Hive circulation dashboard to review the full details.",
+  ].join("\n");
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;color:#111827;">
+      <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;">
+        <div style="font-size:20px;font-weight:700;margin-bottom:8px;">${escapeHtml(title)}</div>
+        <div style="font-size:14px;line-height:1.6;color:#334155;">
+          Hello ${escapeHtml(borrowerName)},<br /><br />
+          ${escapeHtml(intro)}
+        </div>
+        <ul style="margin:16px 0 0;padding-left:18px;color:#111827;">
+          ${details.map((line) => `<li style="margin-bottom:6px;">${escapeHtml(line)}</li>`).join("")}
+        </ul>
+        <div style="margin-top:18px;font-size:13px;color:#475569;line-height:1.6;">
+          Please open your Book-Hive circulation dashboard to review the full details.
+        </div>
+      </div>
+    </div>
+  `;
+
+  return sendBorrowNotificationEmail({
+    to: recipient,
+    subject: title,
+    text,
+    html,
+  });
 }
 
 function endOfUtcDay(dateStr: string): Date {
@@ -1016,6 +1486,318 @@ router.get("/my", requireAuth, async (req, res, next) => {
   }
 });
 
+
+router.post("/notifications/email-sync", requireAuth, async (req, res, next) => {
+  try {
+    const session = (req as any).sessionUser as SessionPayload;
+    const effectiveRole = await getEffectiveRole(session.sub, session.role);
+    const todayDateOnly = getDateOnlyInTimeZone();
+
+    const identityResult = await dbQuery<UserIdentityRow>(
+      `SELECT id, account_type, role, email, full_name
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+      [session.sub]
+    );
+
+    const identity = identityResult.rows[0] ?? null;
+    const recipient = String(identity?.email ?? session.email ?? "").trim() || null;
+    const fullName = identity?.full_name ?? null;
+
+    const basePayload = {
+      recipient,
+      emailSent: false,
+      suppressed: false,
+      dueTodayCount: 0,
+      overdueCount: 0,
+      pendingPickupCount: 0,
+      pendingReturnCount: 0,
+      pendingExtensionCount: 0,
+    };
+
+    const isStaffRole =
+      effectiveRole === "assistant_librarian" ||
+      effectiveRole === "librarian" ||
+      effectiveRole === "admin";
+
+    if (!recipient) {
+      return res.json({
+        ok: true,
+        sync: {
+          role: isStaffRole ? "staff" : "borrower",
+          ...basePayload,
+          totalNotifications: 0,
+          message: "No email address is available for the signed-in account.",
+        },
+      });
+    }
+
+    if (isStaffRole) {
+      const canManageExtensions =
+        effectiveRole === "librarian" || effectiveRole === "admin";
+
+      const summaryResult = await dbQuery<BorrowNotificationsSummaryRow>(
+        `SELECT COUNT(*)::int AS total_records,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND br.status = 'pending_pickup'
+                )::int AS pending_pickup_count,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND br.status IN ('pending_return', 'pending')
+                )::int AS pending_return_count,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND br.extension_request_status = 'pending'
+                )::int AS pending_extension_count,
+
+                COUNT(*) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND br.status <> 'returned'
+                    AND (
+                      br.status = 'pending_pickup'
+                      OR br.status IN ('pending_return', 'pending')
+                      OR ($1::boolean AND br.extension_request_status = 'pending')
+                    )
+                )::int AS action_required_count
+         FROM borrow_records br`,
+        [canManageExtensions]
+      );
+
+      const summaryRow = summaryResult.rows[0] ?? {
+        total_records: 0,
+        pending_pickup_count: 0,
+        pending_return_count: 0,
+        pending_extension_count: 0,
+        action_required_count: 0,
+      };
+
+      const dueCountsResult = await dbQuery<BorrowDueCountsRow>(
+        `SELECT COUNT(*) FILTER (WHERE br.due_date = $1::date)::int AS due_today_count,
+                COUNT(*) FILTER (WHERE br.due_date < $1::date)::int AS overdue_count
+           FROM borrow_records br
+           WHERE br.return_date IS NULL
+             AND br.status <> 'returned'
+             AND br.due_date <= $1::date`,
+        [todayDateOnly]
+      );
+
+      const dueCountRow = dueCountsResult.rows[0] ?? {
+        due_today_count: 0,
+        overdue_count: 0,
+      };
+
+      const dueRowsResult = await dbQuery<BorrowNotificationEmailRow>(
+        `SELECT br.id,
+                br.user_id,
+                br.due_date,
+                br.status,
+                br.return_requested_at,
+                br.return_requested_by,
+                br.return_request_note,
+                u.email,
+                u.full_name,
+                b.title
+           FROM borrow_records br
+           LEFT JOIN users u ON u.id = br.user_id
+           LEFT JOIN books b ON b.id = br.book_id
+           WHERE br.return_date IS NULL
+             AND br.status <> 'returned'
+             AND br.due_date <= $1::date
+           ORDER BY br.due_date ASC, br.id DESC
+           LIMIT $2`,
+        [todayDateOnly, BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT]
+      );
+
+      const pendingPickupCount = Number(summaryRow.pending_pickup_count) || 0;
+      const pendingReturnCount = Number(summaryRow.pending_return_count) || 0;
+      const pendingExtensionCount = canManageExtensions
+        ? Number(summaryRow.pending_extension_count) || 0
+        : 0;
+      const dueTodayCount = Number(dueCountRow.due_today_count) || 0;
+      const overdueCount = Number(dueCountRow.overdue_count) || 0;
+
+      const emailContent = buildStaffDashboardEmail({
+        fullName,
+        todayDateOnly,
+        pendingPickupCount,
+        pendingReturnCount,
+        pendingExtensionCount,
+        dueTodayCount,
+        overdueCount,
+        dueRows: dueRowsResult.rows,
+      });
+
+      const totalNotifications = emailContent.totalNotifications;
+      if (totalNotifications <= 0) {
+        return res.json({
+          ok: true,
+          sync: {
+            role: "staff",
+            ...basePayload,
+            pendingPickupCount,
+            pendingReturnCount,
+            pendingExtensionCount,
+            dueTodayCount,
+            overdueCount,
+            totalNotifications: 0,
+            message: "No borrow dashboard notifications currently need an email.",
+          },
+        });
+      }
+
+      const signature = JSON.stringify({
+        pendingPickupCount,
+        pendingReturnCount,
+        pendingExtensionCount,
+        dueTodayCount,
+        overdueCount,
+        rows: dueRowsResult.rows.map((row) => `${row.id}:${row.due_date}`),
+      });
+      const cacheKey = `staff:${session.sub}:${todayDateOnly}:${signature}`;
+      const suppressed = !claimBorrowNotificationEmailSlot(cacheKey);
+      const emailSent = suppressed
+        ? false
+        : await sendBorrowNotificationEmail({
+            to: recipient,
+            subject: emailContent.subject,
+            text: emailContent.text,
+            html: emailContent.html,
+          });
+
+      return res.json({
+        ok: true,
+        sync: {
+          role: "staff",
+          recipient,
+          emailSent,
+          suppressed,
+          totalNotifications,
+          dueTodayCount,
+          overdueCount,
+          pendingPickupCount,
+          pendingReturnCount,
+          pendingExtensionCount,
+          message: suppressed
+            ? "Borrow dashboard email was already synced recently."
+            : emailSent
+              ? "Borrow dashboard email notification synced successfully."
+              : "Borrow dashboard email could not be sent.",
+        },
+      });
+    }
+
+    const borrowerRowsResult = await dbQuery<BorrowNotificationEmailRow>(
+      `SELECT br.id,
+              br.user_id,
+              br.due_date,
+              br.status,
+              br.return_requested_at,
+              br.return_requested_by,
+              br.return_request_note,
+              u.email,
+              u.full_name,
+              b.title
+         FROM borrow_records br
+         LEFT JOIN users u ON u.id = br.user_id
+         LEFT JOIN books b ON b.id = br.book_id
+         WHERE br.user_id = $1
+           AND br.return_date IS NULL
+           AND br.status <> 'returned'
+           AND (
+             br.due_date <= $2::date
+             OR br.return_requested_at IS NOT NULL
+           )
+         ORDER BY br.due_date ASC, br.id DESC`,
+      [session.sub, todayDateOnly]
+    );
+
+    const dueTodayRows = borrowerRowsResult.rows.filter(
+      (row) => getDueNotificationKind(row.due_date, todayDateOnly) === "due_today"
+    );
+    const overdueRows = borrowerRowsResult.rows.filter(
+      (row) => getDueNotificationKind(row.due_date, todayDateOnly) === "overdue"
+    );
+    const returnRequestRows = borrowerRowsResult.rows.filter(
+      (row) =>
+        Boolean(row.return_requested_at) &&
+        Number(row.return_requested_by) !== Number(session.sub)
+    );
+
+    const totalNotifications =
+      dueTodayRows.length + overdueRows.length + returnRequestRows.length;
+
+    if (totalNotifications <= 0) {
+      return res.json({
+        ok: true,
+        sync: {
+          role: "borrower",
+          ...basePayload,
+          totalNotifications: 0,
+          message: "No circulation dashboard notifications currently need an email.",
+        },
+      });
+    }
+
+    const emailContent = buildBorrowerDashboardEmail({
+      fullName,
+      todayDateOnly,
+      dueTodayRows: dueTodayRows.slice(0, BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT),
+      overdueRows: overdueRows.slice(0, BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT),
+      returnRequestRows: returnRequestRows.slice(
+        0,
+        BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT
+      ),
+    });
+
+    const signature = JSON.stringify({
+      dueToday: dueTodayRows.map((row) => `${row.id}:${row.due_date}`),
+      overdue: overdueRows.map((row) => `${row.id}:${row.due_date}`),
+      returnRequests: returnRequestRows.map((row) => `${row.id}:${row.return_requested_at}`),
+    });
+    const cacheKey = `borrower:${session.sub}:${todayDateOnly}:${signature}`;
+    const suppressed = !claimBorrowNotificationEmailSlot(cacheKey);
+    const emailSent = suppressed
+      ? false
+      : await sendBorrowNotificationEmail({
+          to: recipient,
+          subject: emailContent.subject,
+          text: emailContent.text,
+          html: emailContent.html,
+        });
+
+    return res.json({
+      ok: true,
+      sync: {
+        role: "borrower",
+        recipient,
+        emailSent,
+        suppressed,
+        totalNotifications,
+        dueTodayCount: dueTodayRows.length,
+        overdueCount: overdueRows.length,
+        pendingPickupCount: 0,
+        pendingReturnCount: returnRequestRows.length,
+        pendingExtensionCount: 0,
+        message: suppressed
+          ? "Circulation email was already synced recently."
+          : emailSent
+            ? "Circulation email notification synced successfully."
+            : "Circulation email could not be sent.",
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /**
  * GET /api/borrow-records/policies
  * Return role-based borrowing rules expected by the frontend.
@@ -1262,6 +2044,12 @@ router.post("/:id/extend", requireAuth, async (req, res, next) => {
       return res.status(404).json({ ok: false, message: "Record not found." });
     }
     const record = toDTO(joinedRow, finePerHour);
+
+    void sendBorrowWorkflowEmail({
+      joinedRow,
+      event: "extension_approved",
+    });
+
     return res.json({ ok: true, record });
   } catch (err) {
     try {
@@ -1440,6 +2228,12 @@ router.post(
         return res.status(404).json({ ok: false, message: "Record not found." });
       }
       const record = toDTO(joinedRow, finePerHour);
+
+      void sendBorrowWorkflowEmail({
+        joinedRow,
+        event: "extension_approved",
+      });
+
       return res.json({ ok: true, record });
     } catch (err) {
       try {
@@ -1543,6 +2337,12 @@ router.post(
         return res.status(404).json({ ok: false, message: "Record not found." });
       }
       const record = toDTO(joinedRow, finePerHour);
+
+      void sendBorrowWorkflowEmail({
+        joinedRow,
+        event: "extension_disapproved",
+      });
+
       return res.json({ ok: true, record });
     } catch (err) {
       try {
@@ -1651,6 +2451,12 @@ router.post(
       }
 
       const record = toDTO(joinedRow, finePerHour);
+
+      void sendBorrowWorkflowEmail({
+        joinedRow,
+        event: "return_requested_by_staff",
+      });
+
       return res.json({
         ok: true,
         record,
@@ -2141,6 +2947,8 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
     const values: any[] = [];
     let i = 1;
     let newStatus = current.status;
+    const shouldEmailDueDateUpdate = isPrivilegedStaff && dueDate !== undefined;
+    let shouldEmailReturnConfirmation = false;
 
     if (status !== undefined) {
       const sVal = String(status).toLowerCase();
@@ -2158,6 +2966,7 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       }
 
       newStatus = sVal as BorrowStatus;
+      shouldEmailReturnConfirmation = newStatus === "returned";
 
       updates.push(`status = $${i++}`);
       values.push(sVal);
@@ -2333,6 +3142,21 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
       return res.status(404).json({ ok: false, message: "Record not found." });
     }
     const record = toDTO(joinedRow, finePerHour);
+
+    if (shouldEmailDueDateUpdate) {
+      void sendBorrowWorkflowEmail({
+        joinedRow,
+        event: "due_date_updated",
+      });
+    }
+
+    if (shouldEmailReturnConfirmation) {
+      void sendBorrowWorkflowEmail({
+        joinedRow,
+        event: "return_confirmed",
+      });
+    }
+
     res.json({ ok: true, record });
   } catch (err) {
     try {
