@@ -233,6 +233,22 @@ function resolveClassificationPayload(input: {
   };
 }
 
+function shouldCreatePhysicalCopy(body: any): boolean {
+  if (!body || typeof body !== "object") return false;
+
+  return (
+    body.accessionNumber !== undefined ||
+    body.barcode !== undefined ||
+    body.copyNumber !== undefined ||
+    body.callNumber !== undefined ||
+    body.volumeNumber !== undefined ||
+    body.libraryArea !== undefined ||
+    body.borrowDurationDays !== undefined ||
+    body.isLibraryUseOnly !== undefined ||
+    body.available !== undefined
+  );
+}
+
 function readSession(req: express.Request): SessionPayload | null {
   const token = (req.cookies as any)?.["bh_session"];
   if (!token) return null;
@@ -795,7 +811,7 @@ router.post(
           return res.status(409).json({
             ok: false,
             message:
-              "A book with the same ISBN/ISSN/Accession Number/Barcode already exists.",
+              "A book with the same accession number, barcode, or another unique identifier already exists.",
           });
         }
         throw err;
@@ -816,22 +832,217 @@ router.post(
       const { id } = req.params;
       const bookId = Number(id);
 
-      const { count, copiesToAdd, numberOfCopies } = req.body || {};
-      const raw = count ?? copiesToAdd ?? numberOfCopies;
-      const inc = Math.floor(Number(raw));
-
       if (!bookId) {
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
+      const wantsPhysicalCopy = shouldCreatePhysicalCopy(req.body || {});
+
+      await client.query("BEGIN");
+
+      if (wantsPhysicalCopy) {
+        const sourceBookResult = await client.query<BookRow>(
+          `SELECT ${BOOK_RETURNING}
+             FROM books
+             WHERE id = $1
+             LIMIT 1`,
+          [bookId]
+        );
+
+        if (!sourceBookResult.rowCount) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ ok: false, message: "Book not found." });
+        }
+
+        const source = sourceBookResult.rows[0];
+        const {
+          accessionNumber,
+          copyNumber,
+          barcode,
+          callNumber,
+          volumeNumber,
+          libraryArea,
+          borrowDurationDays,
+          isLibraryUseOnly,
+        } = req.body || {};
+
+        const resolvedAccessionNumber = trimToNull(accessionNumber);
+        if (!resolvedAccessionNumber) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            message: "accessionNumber is required for the new copy.",
+          });
+        }
+
+        const resolvedBarcode = trimToNull(barcode);
+        if (!resolvedBarcode) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            message: "barcode is required for the new copy.",
+          });
+        }
+
+        const resolvedCopyNumber = Math.floor(Number(copyNumber));
+        if (!Number.isFinite(resolvedCopyNumber) || resolvedCopyNumber <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            message: "copyNumber must be a positive number.",
+          });
+        }
+
+        const resolvedCallNumber = trimToNull(callNumber) ?? source.call_number ?? null;
+        if (!resolvedCallNumber) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            ok: false,
+            message: "callNumber is required for the new copy.",
+          });
+        }
+
+        const resolvedLibraryArea =
+          libraryArea !== undefined
+            ? normalizeLibraryArea(libraryArea)
+            : source.library_area ?? null;
+
+        const resolvedLibraryUseOnly = resolveLibraryUseOnlyFlag(
+          isLibraryUseOnly,
+          resolvedLibraryArea,
+          Boolean(source.is_library_use_only)
+        );
+
+        const defaultBorrowDays = Number(process.env.BORROW_DAYS || 7);
+        let borrowDurationVal: number;
+        if (borrowDurationDays === undefined || borrowDurationDays === null) {
+          borrowDurationVal =
+            typeof source.borrow_duration_days === "number" &&
+            Number.isFinite(source.borrow_duration_days) &&
+            source.borrow_duration_days > 0
+              ? Math.floor(source.borrow_duration_days)
+              : Number.isFinite(defaultBorrowDays) && defaultBorrowDays > 0
+                ? Math.floor(defaultBorrowDays)
+                : 7;
+        } else {
+          const parsed = Number(borrowDurationDays);
+          if (!Number.isFinite(parsed) || parsed <= 0) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({
+              ok: false,
+              message: "borrowDurationDays must be a positive number of days.",
+            });
+          }
+          borrowDurationVal = Math.floor(parsed);
+        }
+
+        try {
+          const inserted = await client.query<BookRow>(
+            `INSERT INTO books (
+               title,
+               subtitle,
+               author,
+               statement_of_responsibility,
+               edition,
+               isbn,
+               issn,
+               accession_number,
+               subjects,
+               genre,
+               category,
+               place_of_publication,
+               publisher,
+               publication_year,
+               copyright_year,
+               pages,
+               physical_details,
+               dimensions,
+               notes,
+               series,
+               added_entries,
+               barcode,
+               call_number,
+               copy_number,
+               volume_number,
+               library_area,
+               number_of_copies,
+               available,
+               borrow_duration_days,
+               is_library_use_only
+             )
+             VALUES (
+               $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+               $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+               $21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+             )
+             RETURNING ${BOOK_RETURNING}`,
+            [
+              source.title,
+              source.subtitle,
+              source.author,
+              source.statement_of_responsibility,
+              source.edition,
+              source.isbn,
+              source.issn,
+              resolvedAccessionNumber,
+              source.subjects,
+              source.genre,
+              source.category,
+              source.place_of_publication,
+              source.publisher,
+              source.publication_year,
+              source.copyright_year,
+              source.pages,
+              source.physical_details,
+              source.dimensions,
+              source.notes,
+              source.series,
+              source.added_entries,
+              resolvedBarcode,
+              resolvedCallNumber,
+              resolvedCopyNumber,
+              trimToNull(volumeNumber) ?? source.volume_number ?? null,
+              resolvedLibraryArea,
+              1,
+              true,
+              borrowDurationVal,
+              resolvedLibraryUseOnly,
+            ]
+          );
+
+          await client.query("COMMIT");
+
+          const row = inserted.rows[0] as BookRowWithCounts;
+          row.active_count = 0;
+          row.total_borrow_count = 0;
+          row.available_copies = 1;
+          row.computed_available = true;
+
+          return res.status(201).json({ ok: true, book: toDTO(row) });
+        } catch (err: any) {
+          if (err && err.code === "23505") {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              ok: false,
+              message:
+                "A copy with the same accession number, barcode, or another unique identifier already exists.",
+            });
+          }
+          throw err;
+        }
+      }
+
+      const { count, copiesToAdd, numberOfCopies } = req.body || {};
+      const raw = count ?? copiesToAdd ?? numberOfCopies;
+      const inc = Math.floor(Number(raw));
+
       if (!Number.isFinite(inc) || inc <= 0) {
+        await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
           message: "count must be a positive number.",
         });
       }
-
-      await client.query("BEGIN");
 
       const updatedCopies = await client.query<BookRow>(
         `UPDATE books
@@ -1229,7 +1440,7 @@ router.patch(
           return res.status(409).json({
             ok: false,
             message:
-              "A book with the same ISBN/ISSN/Accession Number/Barcode already exists.",
+              "A book with the same accession number, barcode, or another unique identifier already exists.",
           });
         }
         throw err;
