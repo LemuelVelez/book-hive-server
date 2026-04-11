@@ -29,6 +29,7 @@ type UserRow = {
   student_id: string | null;
   course: string | null;
   year_level: string | null;
+  contact_number: string | null;
 
   // ✅ optional avatar URL
   avatar_url: string | null;
@@ -153,6 +154,18 @@ function clearSessionCookie(res: express.Response) {
     sameSite: prod ? "none" : "lax",
     partitioned: prod ? true : undefined,
   } as any);
+}
+
+function cleanOptionalText(value: unknown) {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  return s.length ? s : null;
+}
+
+function isValidContactNumber(value: string) {
+  const s = String(value || "").trim();
+  if (!s) return true;
+  return /^[0-9()+\-.\s]{7,20}$/.test(s);
 }
 
 /** Escape minimal HTML to safely inject user-provided strings */
@@ -352,6 +365,7 @@ router.get("/me", async (req, res, next) => {
         studentId: user.student_id,
         course: user.course,
         yearLevel: user.year_level,
+        contactNumber: user.contact_number,
 
         // ✅ avatar url
         avatarUrl: user.avatar_url,
@@ -379,6 +393,7 @@ router.post("/register", async (req, res, next) => {
       studentId,
       course,
       yearLevel,
+      contactNumber,
       avatarUrl, // ✅ optional
     } = req.body || {};
 
@@ -440,6 +455,14 @@ router.post("/register", async (req, res, next) => {
     let studentIdVal: string | null = null;
     let courseVal: string | null = null;
     let yearLevelVal: string | null = null;
+    const contactNumberVal = cleanOptionalText(contactNumber);
+
+    if (contactNumberVal && !isValidContactNumber(contactNumberVal)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Please enter a valid contact number.",
+      });
+    }
 
     if (accountType === "student") {
       if (!studentId || !course || !yearLevel) {
@@ -469,8 +492,8 @@ router.post("/register", async (req, res, next) => {
 
     const ins = await query<UserRow>(
       `INSERT INTO users
-       (full_name, email, password_hash, account_type, student_id, course, year_level, avatar_url, is_approved, approved_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       (full_name, email, password_hash, account_type, student_id, course, year_level, contact_number, avatar_url, is_approved, approved_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
       [
         String(fullName).trim(),
@@ -482,6 +505,7 @@ router.post("/register", async (req, res, next) => {
         studentIdVal,
         courseVal,
         yearLevelVal,
+        contactNumberVal,
         avatarUrlVal,
         approved,
         approved ? new Date() : null,
@@ -516,6 +540,7 @@ router.post("/register", async (req, res, next) => {
         studentId: user.student_id,
         course: user.course,
         yearLevel: user.year_level,
+        contactNumber: user.contact_number,
 
         avatarUrl: user.avatar_url,
       },
@@ -601,6 +626,7 @@ router.post("/login", async (req, res, next) => {
         studentId: user.student_id,
         course: user.course,
         yearLevel: user.year_level,
+        contactNumber: user.contact_number,
 
         avatarUrl: user.avatar_url,
       },
@@ -874,3 +900,4 @@ router.post("/reset-password", async (req, res, next) => {
 });
 
 export default router;
+

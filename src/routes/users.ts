@@ -32,6 +32,7 @@ type UserRow = {
   student_id?: string | null;
   course?: string | null;
   year_level?: string | null;
+  contact_number?: string | null;
 
   // ✅ email verified (for /me response)
   is_email_verified?: boolean;
@@ -59,6 +60,7 @@ type UserAuthRow = {
   student_id?: string | null;
   course?: string | null;
   year_level?: string | null;
+  contact_number?: string | null;
   is_email_verified?: boolean;
   avatar_url?: string | null;
 
@@ -238,6 +240,12 @@ function isValidEmail(email: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 }
 
+function isValidContactNumber(value: string) {
+  const s = String(value || "").trim();
+  if (!s) return true;
+  return /^[0-9()+\-.\s]{7,20}$/.test(s);
+}
+
 function escapeHtml(input: string) {
   return input
     .replace(/&/g, "&amp;")
@@ -393,6 +401,7 @@ async function archiveUserToPreserveRecords(userId: string) {
            student_id = NULL,
            course = NULL,
            year_level = NULL,
+           contact_number = NULL,
            avatar_url = NULL,
            is_email_verified = FALSE,
            email_verified_at = NULL,
@@ -431,6 +440,7 @@ function toMeDTO(row: UserRow) {
     studentId: row.student_id ?? null,
     course: row.course ?? null,
     yearLevel: row.year_level ?? null,
+    contactNumber: row.contact_number ?? null,
     avatarUrl: row.avatar_url ?? null,
   };
 }
@@ -448,6 +458,7 @@ function toUserListDTO(row: UserRow) {
     role,
 
     avatarUrl: row.avatar_url ?? null,
+    contactNumber: row.contact_number ?? null,
 
     isApproved: Boolean(row.is_approved),
     approvedAt: row.approved_at ?? null,
@@ -458,7 +469,7 @@ function toUserListDTO(row: UserRow) {
 async function fetchMeRow(userId: string) {
   return await query<UserRow>(
     `SELECT id, email, full_name, account_type, role,
-            student_id, course, year_level,
+            student_id, course, year_level, contact_number,
             is_email_verified,
             avatar_url,
             is_approved, approved_at, approved_by
@@ -472,7 +483,7 @@ async function fetchMeRow(userId: string) {
 async function fetchMeAuthRow(userId: string) {
   return await query<UserAuthRow>(
     `SELECT id, email, full_name, password_hash, account_type, role,
-            student_id, course, year_level,
+            student_id, course, year_level, contact_number,
             is_email_verified,
             avatar_url,
             is_approved, approved_at, approved_by
@@ -516,6 +527,7 @@ router.patch("/me", requireAuth, async (req, res, next) => {
     const courseRaw = req.body?.course;
     const yearLevelRaw = req.body?.yearLevel ?? req.body?.year_level;
     const studentIdRaw = req.body?.studentId ?? req.body?.student_id;
+    const contactNumberRaw = req.body?.contactNumber ?? req.body?.contact_number;
 
     const updates: string[] = [];
     const values: any[] = [];
@@ -590,6 +602,18 @@ router.patch("/me", requireAuth, async (req, res, next) => {
       }
       updates.push(`year_level = $${i++}`);
       values.push(yearLevel);
+    }
+
+    if (contactNumberRaw !== undefined) {
+      const contactNumber = cleanOptionalText(contactNumberRaw);
+      if (contactNumber && !isValidContactNumber(contactNumber)) {
+        return res.status(400).json({
+          ok: false,
+          message: "Please enter a valid contact number.",
+        });
+      }
+      updates.push(`contact_number = $${i++}`);
+      values.push(contactNumber);
     }
 
     if (studentIdRaw !== undefined) {
@@ -828,6 +852,9 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
 
     const sendLoginCredentials = req.body?.sendLoginCredentials !== false;
     const autoGeneratePassword = req.body?.autoGeneratePassword === true;
+    const contactNumber = cleanOptionalText(
+      req.body?.contactNumber ?? req.body?.contact_number
+    );
 
     if (!fullName) {
       return res
@@ -841,6 +868,12 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
     }
     if (!ALLOWED_ROLES.includes(role)) {
       return res.status(400).json({ ok: false, message: "Invalid role." });
+    }
+    if (contactNumber && !isValidContactNumber(contactNumber)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Please enter a valid contact number.",
+      });
     }
 
     if (needsStudentFields) {
@@ -906,20 +939,20 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
       `INSERT INTO users
        (full_name, email, password_hash,
         account_type, role,
-        student_id, course, year_level,
+        student_id, course, year_level, contact_number,
         is_email_verified,
         is_approved, approved_at, approved_by,
         updated_at)
        VALUES
        ($1,$2,$3,
         $4,$5,
-        $6,$7,$8,
+        $6,$7,$8,$9,
         FALSE,
-        $9,$10,$11,
+        $10,$11,$12,
         NOW())
        RETURNING
         id, email, full_name, account_type, role,
-        student_id, course, year_level,
+        student_id, course, year_level, contact_number,
         is_email_verified,
         avatar_url,
         is_approved, approved_at, approved_by`,
@@ -932,6 +965,7 @@ router.post("/", requireAuth, requireRole(["admin"]), async (req, res, next) => 
         needsStudentFields ? studentId : null,
         needsStudentFields ? course : null,
         needsStudentFields ? yearLevel : null,
+        contactNumber,
         approved,
         approvedAt,
         approvedBy,
@@ -1196,7 +1230,7 @@ router.patch("/:id/role", requireAuth, requireRole(["librarian", "admin"]), asyn
 router.get("/", requireAuth, requireRole(["librarian", "admin"]), async (_req, res, next) => {
   try {
     const result = await query<UserRow>(
-      `SELECT id, email, full_name, account_type, role, avatar_url,
+      `SELECT id, email, full_name, account_type, role, avatar_url, contact_number,
               is_approved, approved_at, approved_by,
               created_at
          FROM users
@@ -1216,7 +1250,7 @@ router.get("/", requireAuth, requireRole(["librarian", "admin"]), async (_req, r
 router.get("/pending", requireAuth, requireRole(["librarian", "admin"]), async (_req, res, next) => {
   try {
     const result = await query<UserRow>(
-      `SELECT id, email, full_name, account_type, role, avatar_url,
+      `SELECT id, email, full_name, account_type, role, avatar_url, contact_number,
               is_approved, approved_at, approved_by,
               created_at
          FROM users
@@ -1427,3 +1461,4 @@ router.get("/check-student-id", async (req, res, next) => {
 });
 
 export default router;
+
