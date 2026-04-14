@@ -558,6 +558,145 @@ const BOOK_RETURNING_B = `
   b.updated_at
 `;
 
+
+function normalizeBookGroupValue(raw: unknown) {
+  return String(raw ?? "").trim().toLowerCase();
+}
+
+function buildBookGroupKey(input: {
+  title?: unknown;
+  author?: unknown;
+  callNumber?: unknown;
+  isbn?: unknown;
+}) {
+  return [
+    normalizeBookGroupValue(input.title),
+    normalizeBookGroupValue(input.author),
+    normalizeBookGroupValue(input.callNumber),
+    normalizeBookGroupValue(input.isbn),
+  ].join("|");
+}
+
+function buildBookGroupKeyFromRow(
+  row: Pick<BookRow, "title" | "author" | "call_number" | "isbn">
+) {
+  return buildBookGroupKey({
+    title: row.title,
+    author: row.author,
+    callNumber: row.call_number,
+    isbn: row.isbn,
+  });
+}
+
+function compareBookGroupOrder(a: BookRow, b: BookRow) {
+  const createdAtDiff =
+    new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+
+  if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) {
+    return createdAtDiff;
+  }
+
+  const aId = Number(a.id);
+  const bId = Number(b.id);
+
+  if (Number.isFinite(aId) && Number.isFinite(bId) && aId !== bId) {
+    return aId - bId;
+  }
+
+  return String(a.id).localeCompare(String(b.id), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function chooseBookGroupRepresentative(rows: BookRowWithCounts[]) {
+  return [...rows].sort(compareBookGroupOrder)[0];
+}
+
+function aggregateBookGroupRows(rows: BookRowWithCounts[]) {
+  const representative = chooseBookGroupRepresentative(rows);
+  const aggregate = {
+    ...representative,
+  } as BookRowWithCounts;
+
+  let totalCopies = 0;
+  let activeCount = 0;
+  let totalBorrowCount = 0;
+
+  for (const row of rows) {
+    const rowTotalCopies =
+      typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
+        ? Math.max(1, Math.floor(row.number_of_copies))
+        : 1;
+
+    const rowActiveCount =
+      typeof row.active_count === "number" && Number.isFinite(row.active_count)
+        ? row.active_count
+        : 0;
+
+    const rowTotalBorrowCount =
+      typeof row.total_borrow_count === "number" &&
+      Number.isFinite(row.total_borrow_count)
+        ? row.total_borrow_count
+        : 0;
+
+    totalCopies += rowTotalCopies;
+    activeCount += rowActiveCount;
+    totalBorrowCount += rowTotalBorrowCount;
+  }
+
+  aggregate.number_of_copies = Math.max(1, totalCopies);
+  aggregate.active_count = activeCount;
+  aggregate.total_borrow_count = totalBorrowCount;
+  aggregate.available_copies = Math.max(0, totalCopies - activeCount);
+  aggregate.computed_available = aggregate.available_copies > 0;
+  aggregate.available = Boolean(aggregate.computed_available);
+
+  return aggregate;
+}
+
+function groupBookRows(rows: BookRowWithCounts[]) {
+  const grouped = new Map<string, BookRowWithCounts[]>();
+
+  for (const row of rows) {
+    const key = buildBookGroupKeyFromRow(row);
+    const items = grouped.get(key) ?? [];
+    items.push(row);
+    grouped.set(key, items);
+  }
+
+  return Array.from(grouped.values())
+    .map(aggregateBookGroupRows)
+    .sort((a, b) => {
+      const updatedAtDiff =
+        new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+
+      if (Number.isFinite(updatedAtDiff) && updatedAtDiff !== 0) {
+        return updatedAtDiff;
+      }
+
+      return compareBookGroupOrder(a, b);
+    });
+}
+
+async function findGroupedBookRows(
+  client: DBClient,
+  row: Pick<BookRow, "title" | "author" | "call_number" | "isbn">
+) {
+  const result = await client.query<
+    Pick<BookRow, "id" | "title" | "author" | "call_number" | "isbn">
+  >(
+    `SELECT id, title, author, call_number, isbn
+       FROM books`
+  );
+
+  const sourceKey = buildBookGroupKeyFromRow(row);
+
+  return result.rows.filter(
+    (candidate) => buildBookGroupKeyFromRow(candidate as BookRow) === sourceKey
+  );
+}
+
 router.get("/", async (_req, res, next) => {
   try {
     const result = await dbQuery<BookRowWithCounts>(
@@ -581,7 +720,7 @@ router.get("/", async (_req, res, next) => {
       `
     );
 
-    const books = result.rows.map(toDTO);
+    const books = groupBookRows(result.rows).map(toDTO);
     res.json({ ok: true, books });
   } catch (err) {
     next(err);
@@ -836,207 +975,33 @@ router.post(
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
-      const wantsPhysicalCopy = shouldCreatePhysicalCopy(req.body || {});
-
       await client.query("BEGIN");
 
-      if (wantsPhysicalCopy) {
-        const sourceBookResult = await client.query<BookRow>(
-          `SELECT ${BOOK_RETURNING}
-             FROM books
-             WHERE id = $1
-             LIMIT 1`,
-          [bookId]
-        );
+      const sourceBookResult = await client.query<BookRow>(
+        `SELECT ${BOOK_RETURNING}
+           FROM books
+           WHERE id = $1
+           LIMIT 1`,
+        [bookId]
+      );
 
-        if (!sourceBookResult.rowCount) {
-          await client.query("ROLLBACK");
-          return res.status(404).json({ ok: false, message: "Book not found." });
-        }
-
-        const source = sourceBookResult.rows[0];
-        const {
-          accessionNumber,
-          copyNumber,
-          barcode,
-          callNumber,
-          volumeNumber,
-          libraryArea,
-          borrowDurationDays,
-          isLibraryUseOnly,
-        } = req.body || {};
-
-        const resolvedAccessionNumber = trimToNull(accessionNumber);
-        if (!resolvedAccessionNumber) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            ok: false,
-            message: "accessionNumber is required for the new copy.",
-          });
-        }
-
-        const resolvedBarcode = trimToNull(barcode);
-        if (!resolvedBarcode) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            ok: false,
-            message: "barcode is required for the new copy.",
-          });
-        }
-
-        const resolvedCopyNumber = Math.floor(Number(copyNumber));
-        if (!Number.isFinite(resolvedCopyNumber) || resolvedCopyNumber <= 0) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            ok: false,
-            message: "copyNumber must be a positive number.",
-          });
-        }
-
-        const resolvedCallNumber = trimToNull(callNumber) ?? source.call_number ?? null;
-        if (!resolvedCallNumber) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            ok: false,
-            message: "callNumber is required for the new copy.",
-          });
-        }
-
-        const resolvedLibraryArea =
-          libraryArea !== undefined
-            ? normalizeLibraryArea(libraryArea)
-            : source.library_area ?? null;
-
-        const resolvedLibraryUseOnly = resolveLibraryUseOnlyFlag(
-          isLibraryUseOnly,
-          resolvedLibraryArea,
-          Boolean(source.is_library_use_only)
-        );
-
-        const defaultBorrowDays = Number(process.env.BORROW_DAYS || 7);
-        let borrowDurationVal: number;
-        if (borrowDurationDays === undefined || borrowDurationDays === null) {
-          borrowDurationVal =
-            typeof source.borrow_duration_days === "number" &&
-            Number.isFinite(source.borrow_duration_days) &&
-            source.borrow_duration_days > 0
-              ? Math.floor(source.borrow_duration_days)
-              : Number.isFinite(defaultBorrowDays) && defaultBorrowDays > 0
-                ? Math.floor(defaultBorrowDays)
-                : 7;
-        } else {
-          const parsed = Number(borrowDurationDays);
-          if (!Number.isFinite(parsed) || parsed <= 0) {
-            await client.query("ROLLBACK");
-            return res.status(400).json({
-              ok: false,
-              message: "borrowDurationDays must be a positive number of days.",
-            });
-          }
-          borrowDurationVal = Math.floor(parsed);
-        }
-
-        try {
-          const inserted = await client.query<BookRow>(
-            `INSERT INTO books (
-               title,
-               subtitle,
-               author,
-               statement_of_responsibility,
-               edition,
-               isbn,
-               issn,
-               accession_number,
-               subjects,
-               genre,
-               category,
-               place_of_publication,
-               publisher,
-               publication_year,
-               copyright_year,
-               pages,
-               physical_details,
-               dimensions,
-               notes,
-               series,
-               added_entries,
-               barcode,
-               call_number,
-               copy_number,
-               volume_number,
-               library_area,
-               number_of_copies,
-               available,
-               borrow_duration_days,
-               is_library_use_only
-             )
-             VALUES (
-               $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-               $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-               $21,$22,$23,$24,$25,$26,$27,$28,$29,$30
-             )
-             RETURNING ${BOOK_RETURNING}`,
-            [
-              source.title,
-              source.subtitle,
-              source.author,
-              source.statement_of_responsibility,
-              source.edition,
-              source.isbn,
-              source.issn,
-              resolvedAccessionNumber,
-              source.subjects,
-              source.genre,
-              source.category,
-              source.place_of_publication,
-              source.publisher,
-              source.publication_year,
-              source.copyright_year,
-              source.pages,
-              source.physical_details,
-              source.dimensions,
-              source.notes,
-              source.series,
-              source.added_entries,
-              resolvedBarcode,
-              resolvedCallNumber,
-              resolvedCopyNumber,
-              trimToNull(volumeNumber) ?? source.volume_number ?? null,
-              resolvedLibraryArea,
-              1,
-              true,
-              borrowDurationVal,
-              resolvedLibraryUseOnly,
-            ]
-          );
-
-          await client.query("COMMIT");
-
-          const row = inserted.rows[0] as BookRowWithCounts;
-          row.active_count = 0;
-          row.total_borrow_count = 0;
-          row.available_copies = 1;
-          row.computed_available = true;
-
-          return res.status(201).json({ ok: true, book: toDTO(row) });
-        } catch (err: any) {
-          if (err && err.code === "23505") {
-            await client.query("ROLLBACK");
-            return res.status(409).json({
-              ok: false,
-              message:
-                "A copy with the same accession number, barcode, or another unique identifier already exists.",
-            });
-          }
-          throw err;
-        }
+      if (!sourceBookResult.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Book not found." });
       }
 
-      const { count, copiesToAdd, numberOfCopies } = req.body || {};
-      const raw = count ?? copiesToAdd ?? numberOfCopies;
-      const inc = Math.floor(Number(raw));
+      const source = sourceBookResult.rows[0];
+      const groupedRows = await findGroupedBookRows(client, source);
+      const groupedBookIds = groupedRows
+        .map((row) => Number(row.id))
+        .filter((value) => Number.isFinite(value) && value > 0);
 
-      if (!Number.isFinite(inc) || inc <= 0) {
+      const representativeId = groupedBookIds.slice().sort((a, b) => a - b)[0] ?? bookId;
+      const { count, copiesToAdd, numberOfCopies } = req.body || {};
+      const rawCount = count ?? copiesToAdd ?? numberOfCopies ?? 1;
+      const increment = Math.floor(Number(rawCount));
+
+      if (!Number.isFinite(increment) || increment <= 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
@@ -1050,7 +1015,7 @@ router.post(
                updated_at = NOW()
          WHERE id = $2
          RETURNING ${BOOK_RETURNING}`,
-        [inc, bookId]
+        [increment, representativeId]
       );
 
       if (!updatedCopies.rowCount) {
@@ -1058,32 +1023,42 @@ router.post(
         return res.status(404).json({ ok: false, message: "Book not found." });
       }
 
-      const rowAfterCopies = updatedCopies.rows[0];
+      const state = await computeCopyStateForBook(client, representativeId);
 
-      const state = await computeCopyStateForBook(
-        client,
-        bookId,
-        rowAfterCopies.number_of_copies
-      );
-
-      const finalRes = await client.query<BookRow>(
+      await client.query(
         `UPDATE books
             SET available = $1,
                 updated_at = NOW()
-          WHERE id = $2
-          RETURNING ${BOOK_RETURNING}`,
-        [state.available, bookId]
+          WHERE id = $2`,
+        [state.available, representativeId]
+      );
+
+      const rowsForGroup = await client.query<BookRowWithCounts>(
+        `
+        SELECT
+          ${BOOK_RETURNING_B},
+          COALESCE(stats.active_count, 0)::int AS active_count,
+          COALESCE(stats.total_borrow_count, 0)::int AS total_borrow_count,
+          GREATEST(b.number_of_copies - COALESCE(stats.active_count, 0), 0)::int AS available_copies,
+          (COALESCE(stats.active_count, 0) < b.number_of_copies) AS computed_available
+        FROM books b
+        LEFT JOIN (
+          SELECT
+            book_id,
+            COUNT(*) FILTER (WHERE status <> 'returned')::int AS active_count,
+            COUNT(*)::int AS total_borrow_count
+          FROM borrow_records
+          GROUP BY book_id
+        ) stats ON stats.book_id = b.id
+        WHERE b.id = ANY($1::int[])
+        `,
+        [groupedBookIds]
       );
 
       await client.query("COMMIT");
 
-      const finalRow = finalRes.rows[0] as BookRowWithCounts;
-      finalRow.active_count = state.activeCount;
-      finalRow.total_borrow_count = state.totalBorrowCount;
-      finalRow.available_copies = state.remainingCopies;
-      finalRow.computed_available = state.available;
-
-      res.json({ ok: true, book: toDTO(finalRow) });
+      const groupedBook = aggregateBookGroupRows(rowsForGroup.rows);
+      return res.json({ ok: true, book: toDTO(groupedBook) });
     } catch (err: any) {
       try {
         await client.query("ROLLBACK");
@@ -1154,13 +1129,8 @@ router.patch(
 
       await client.query("BEGIN");
 
-      const currentBookResult = await client.query<{
-        id: number;
-        number_of_copies: number;
-        is_library_use_only: boolean;
-        library_area: LibraryArea | null;
-      }>(
-        `SELECT id, number_of_copies, is_library_use_only, library_area
+      const currentBookResult = await client.query<BookRow>(
+        `SELECT ${BOOK_RETURNING}
            FROM books
            WHERE id = $1
            FOR UPDATE`,
@@ -1173,44 +1143,53 @@ router.patch(
       }
 
       const currentBook = currentBookResult.rows[0];
+      const groupedRows = await findGroupedBookRows(client, currentBook);
+      const groupedBookIds = groupedRows
+        .map((row) => Number(row.id))
+        .filter((value) => Number.isFinite(value) && value > 0);
 
-      const updates: string[] = [];
-      const values: any[] = [];
-      let idx = 1;
+      const directUpdates: string[] = [];
+      const directValues: any[] = [];
+      let directIdx = 1;
+      let shouldRefreshAvailability = false;
+
+      const sharedUpdates: string[] = [];
+      const sharedValues: any[] = [];
+      let sharedIdx = 1;
 
       if (title !== undefined) {
-        updates.push(`title = $${idx++}`);
-        values.push(String(title).trim());
+        sharedUpdates.push(`title = $${sharedIdx++}`);
+        sharedValues.push(String(title).trim());
       }
 
       if (subtitle !== undefined) {
-        updates.push(`subtitle = $${idx++}`);
-        values.push(subtitle ? String(subtitle).trim() : null);
+        sharedUpdates.push(`subtitle = $${sharedIdx++}`);
+        sharedValues.push(subtitle ? String(subtitle).trim() : null);
       }
 
       if (author !== undefined) {
-        updates.push(`author = $${idx++}`);
-        values.push(String(author).trim());
+        sharedUpdates.push(`author = $${sharedIdx++}`);
+        sharedValues.push(String(author).trim());
       }
 
       if (edition !== undefined) {
-        updates.push(`edition = $${idx++}`);
-        values.push(edition ? String(edition).trim() : null);
+        sharedUpdates.push(`edition = $${sharedIdx++}`);
+        sharedValues.push(edition ? String(edition).trim() : null);
       }
 
       if (accessionNumber !== undefined) {
-        updates.push(`accession_number = $${idx++}`);
-        values.push(accessionNumber ? String(accessionNumber).trim() : null);
+        directUpdates.push(`accession_number = $${directIdx++}`);
+        directValues.push(accessionNumber ? String(accessionNumber).trim() : null);
       }
 
       if (isbn !== undefined) {
-        updates.push(`isbn = $${idx++}`);
-        values.push(isbn ? String(isbn).trim() : null);
+        sharedUpdates.push(`isbn = $${sharedIdx++}`);
+        sharedValues.push(isbn ? String(isbn).trim() : null);
       }
 
       if (issn !== undefined) {
-        updates.push(`issn = $${idx++}`);
-        values.push(issn ? String(issn).trim() : null);
+        sharedUpdates.push(`issn = $${sharedIdx++}`);
+        sharedValues.push(issn ? String(issn).trim() : null);
       }
 
       const classification = resolveClassificationPayload({
@@ -1220,24 +1199,24 @@ router.patch(
       });
 
       if (classification) {
-        updates.push(`subjects = $${idx++}`);
-        values.push(classification.subjects);
+        sharedUpdates.push(`subjects = $${sharedIdx++}`);
+        sharedValues.push(classification.subjects);
 
-        updates.push(`genre = $${idx++}`);
-        values.push(classification.genre);
+        sharedUpdates.push(`genre = $${sharedIdx++}`);
+        sharedValues.push(classification.genre);
 
-        updates.push(`category = $${idx++}`);
-        values.push(classification.category);
+        sharedUpdates.push(`category = $${sharedIdx++}`);
+        sharedValues.push(classification.category);
       }
 
       if (placeOfPublication !== undefined) {
-        updates.push(`place_of_publication = $${idx++}`);
-        values.push(placeOfPublication ? String(placeOfPublication).trim() : null);
+        sharedUpdates.push(`place_of_publication = $${sharedIdx++}`);
+        sharedValues.push(placeOfPublication ? String(placeOfPublication).trim() : null);
       }
 
       if (publisher !== undefined) {
-        updates.push(`publisher = $${idx++}`);
-        values.push(publisher ? String(publisher).trim() : null);
+        sharedUpdates.push(`publisher = $${sharedIdx++}`);
+        sharedValues.push(publisher ? String(publisher).trim() : null);
       }
 
       if (publicationYear !== undefined) {
@@ -1249,12 +1228,13 @@ router.patch(
             message: "publicationYear must be a valid 4-digit year.",
           });
         }
-        updates.push(`publication_year = $${idx++}`);
-        values.push(yearNum);
+
+        sharedUpdates.push(`publication_year = $${sharedIdx++}`);
+        sharedValues.push(yearNum);
 
         if (copyrightYear === undefined) {
-          updates.push(`copyright_year = $${idx++}`);
-          values.push(yearNum);
+          sharedUpdates.push(`copyright_year = $${sharedIdx++}`);
+          sharedValues.push(yearNum);
         }
       }
 
@@ -1271,12 +1251,12 @@ router.patch(
           });
         }
 
-        updates.push(`copyright_year = $${idx++}`);
-        values.push(yearNum);
+        sharedUpdates.push(`copyright_year = $${sharedIdx++}`);
+        sharedValues.push(yearNum);
 
         if (publicationYear === undefined && yearNum !== null) {
-          updates.push(`publication_year = $${idx++}`);
-          values.push(yearNum);
+          sharedUpdates.push(`publication_year = $${sharedIdx++}`);
+          sharedValues.push(yearNum);
         }
       }
 
@@ -1289,43 +1269,44 @@ router.patch(
             message: "pages must be a positive number.",
           });
         }
-        updates.push(`pages = $${idx++}`);
-        values.push(pagesNum);
+
+        sharedUpdates.push(`pages = $${sharedIdx++}`);
+        sharedValues.push(pagesNum);
       }
 
       if (otherDetails !== undefined) {
-        updates.push(`physical_details = $${idx++}`);
-        values.push(otherDetails ? String(otherDetails).trim() : null);
+        sharedUpdates.push(`physical_details = $${sharedIdx++}`);
+        sharedValues.push(otherDetails ? String(otherDetails).trim() : null);
       }
 
       if (dimensions !== undefined) {
-        updates.push(`dimensions = $${idx++}`);
-        values.push(dimensions ? String(dimensions).trim() : null);
+        sharedUpdates.push(`dimensions = $${sharedIdx++}`);
+        sharedValues.push(dimensions ? String(dimensions).trim() : null);
       }
 
       if (notes !== undefined) {
-        updates.push(`notes = $${idx++}`);
-        values.push(notes ? String(notes).trim() : null);
+        sharedUpdates.push(`notes = $${sharedIdx++}`);
+        sharedValues.push(notes ? String(notes).trim() : null);
       }
 
       if (series !== undefined) {
-        updates.push(`series = $${idx++}`);
-        values.push(series ? String(series).trim() : null);
+        sharedUpdates.push(`series = $${sharedIdx++}`);
+        sharedValues.push(series ? String(series).trim() : null);
       }
 
       if (addedEntries !== undefined) {
-        updates.push(`added_entries = $${idx++}`);
-        values.push(addedEntries ? String(addedEntries).trim() : null);
+        sharedUpdates.push(`added_entries = $${sharedIdx++}`);
+        sharedValues.push(addedEntries ? String(addedEntries).trim() : null);
       }
 
       if (barcode !== undefined) {
-        updates.push(`barcode = $${idx++}`);
-        values.push(barcode ? String(barcode).trim() : null);
+        directUpdates.push(`barcode = $${directIdx++}`);
+        directValues.push(barcode ? String(barcode).trim() : null);
       }
 
       if (callNumber !== undefined) {
-        updates.push(`call_number = $${idx++}`);
-        values.push(callNumber ? String(callNumber).trim() : null);
+        sharedUpdates.push(`call_number = $${sharedIdx++}`);
+        sharedValues.push(callNumber ? String(callNumber).trim() : null);
       }
 
       if (copyNumber !== undefined) {
@@ -1337,13 +1318,14 @@ router.patch(
             message: "copyNumber must be a positive number.",
           });
         }
-        updates.push(`copy_number = $${idx++}`);
-        values.push(copyNum);
+
+        directUpdates.push(`copy_number = $${directIdx++}`);
+        directValues.push(copyNum);
       }
 
       if (volumeNumber !== undefined) {
-        updates.push(`volume_number = $${idx++}`);
-        values.push(volumeNumber ? String(volumeNumber).trim() : null);
+        sharedUpdates.push(`volume_number = $${sharedIdx++}`);
+        sharedValues.push(volumeNumber ? String(volumeNumber).trim() : null);
       }
 
       if (libraryArea !== undefined || isLibraryUseOnly !== undefined) {
@@ -1353,8 +1335,8 @@ router.patch(
             : currentBook.library_area ?? null;
 
         if (libraryArea !== undefined) {
-          updates.push(`library_area = $${idx++}`);
-          values.push(resolvedLibraryArea);
+          sharedUpdates.push(`library_area = $${sharedIdx++}`);
+          sharedValues.push(resolvedLibraryArea);
         }
 
         const resolvedLibraryUseOnly = resolveLibraryUseOnlyFlag(
@@ -1363,8 +1345,8 @@ router.patch(
           Boolean(currentBook.is_library_use_only)
         );
 
-        updates.push(`is_library_use_only = $${idx++}`);
-        values.push(resolvedLibraryUseOnly);
+        sharedUpdates.push(`is_library_use_only = $${sharedIdx++}`);
+        sharedValues.push(resolvedLibraryUseOnly);
       }
 
       if (numberOfCopies !== undefined) {
@@ -1376,8 +1358,10 @@ router.patch(
             message: "numberOfCopies must be a positive number.",
           });
         }
-        updates.push(`number_of_copies = $${idx++}`);
-        values.push(copiesTotal);
+
+        directUpdates.push(`number_of_copies = $${directIdx++}`);
+        directValues.push(copiesTotal);
+        shouldRefreshAvailability = true;
       }
 
       if (copiesToAdd !== undefined) {
@@ -1389,8 +1373,10 @@ router.patch(
             message: "copiesToAdd must be a positive number.",
           });
         }
-        updates.push(`number_of_copies = number_of_copies + $${idx++}`);
-        values.push(inc);
+
+        directUpdates.push(`number_of_copies = number_of_copies + $${directIdx++}`);
+        directValues.push(inc);
+        shouldRefreshAvailability = true;
       }
 
       if (borrowDurationDays !== undefined) {
@@ -1402,11 +1388,12 @@ router.patch(
             message: "borrowDurationDays must be a positive number of days.",
           });
         }
-        updates.push(`borrow_duration_days = $${idx++}`);
-        values.push(Math.floor(parsed));
+
+        sharedUpdates.push(`borrow_duration_days = $${sharedIdx++}`);
+        sharedValues.push(Math.floor(parsed));
       }
 
-      if (updates.length === 0) {
+      if (directUpdates.length === 0 && sharedUpdates.length === 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
           ok: false,
@@ -1414,26 +1401,28 @@ router.patch(
         });
       }
 
-      updates.push(`updated_at = NOW()`);
-
-      const sql = `
-        UPDATE books
-        SET ${updates.join(", ")}
-        WHERE id = $${idx}
-        RETURNING ${BOOK_RETURNING}
-      `;
-      values.push(bookId);
-
-      let updated: BookRow;
       try {
-        const result = await client.query<BookRow>(sql, values);
-
-        if (!result.rowCount) {
-          await client.query("ROLLBACK");
-          return res.status(404).json({ ok: false, message: "Book not found." });
+        if (sharedUpdates.length > 0) {
+          const sharedSql = `
+            UPDATE books
+            SET ${sharedUpdates.join(", ")},
+                updated_at = NOW()
+            WHERE id = ANY($${sharedIdx}::int[])
+          `;
+          sharedValues.push(groupedBookIds);
+          await client.query(sharedSql, sharedValues);
         }
 
-        updated = result.rows[0];
+        if (directUpdates.length > 0) {
+          const directSql = `
+            UPDATE books
+            SET ${directUpdates.join(", ")},
+                updated_at = NOW()
+            WHERE id = $${directIdx}
+          `;
+          directValues.push(bookId);
+          await client.query(directSql, directValues);
+        }
       } catch (err: any) {
         if (err && err.code === "23505") {
           await client.query("ROLLBACK");
@@ -1446,30 +1435,44 @@ router.patch(
         throw err;
       }
 
-      const state = await computeCopyStateForBook(
-        client,
-        bookId,
-        updated.number_of_copies
-      );
+      if (shouldRefreshAvailability) {
+        const state = await computeCopyStateForBook(client, bookId);
 
-      const final = await client.query<BookRow>(
-        `UPDATE books
-            SET available = $1,
-                updated_at = NOW()
-          WHERE id = $2
-          RETURNING ${BOOK_RETURNING}`,
-        [state.available, bookId]
+        await client.query(
+          `UPDATE books
+              SET available = $1,
+                  updated_at = NOW()
+            WHERE id = $2`,
+          [state.available, bookId]
+        );
+      }
+
+      const rowsForGroup = await client.query<BookRowWithCounts>(
+        `
+        SELECT
+          ${BOOK_RETURNING_B},
+          COALESCE(stats.active_count, 0)::int AS active_count,
+          COALESCE(stats.total_borrow_count, 0)::int AS total_borrow_count,
+          GREATEST(b.number_of_copies - COALESCE(stats.active_count, 0), 0)::int AS available_copies,
+          (COALESCE(stats.active_count, 0) < b.number_of_copies) AS computed_available
+        FROM books b
+        LEFT JOIN (
+          SELECT
+            book_id,
+            COUNT(*) FILTER (WHERE status <> 'returned')::int AS active_count,
+            COUNT(*)::int AS total_borrow_count
+          FROM borrow_records
+          GROUP BY book_id
+        ) stats ON stats.book_id = b.id
+        WHERE b.id = ANY($1::int[])
+        `,
+        [groupedBookIds]
       );
 
       await client.query("COMMIT");
 
-      const finalRow = final.rows[0] as BookRowWithCounts;
-      finalRow.active_count = state.activeCount;
-      finalRow.total_borrow_count = state.totalBorrowCount;
-      finalRow.available_copies = state.remainingCopies;
-      finalRow.computed_available = state.available;
-
-      res.json({ ok: true, book: toDTO(finalRow) });
+      const groupedBook = aggregateBookGroupRows(rowsForGroup.rows);
+      res.json({ ok: true, book: toDTO(groupedBook) });
     } catch (err: any) {
       try {
         await client.query("ROLLBACK");
@@ -1488,22 +1491,57 @@ router.delete(
   requireAuth,
   requireRole(["librarian", "admin"]),
   async (req, res, next) => {
+    const client = await dbPool.connect();
     try {
       const { id } = req.params;
+      const bookId = Number(id);
 
-      const result = await dbQuery(`DELETE FROM books WHERE id = $1`, [
-        Number(id),
-      ]);
-
-      if (!result.rowCount) {
-        return res
-          .status(404)
-          .json({ ok: false, message: "Book not found." });
+      if (!bookId) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
+      await client.query("BEGIN");
+
+      const currentBookResult = await client.query<BookRow>(
+        `SELECT ${BOOK_RETURNING}
+           FROM books
+           WHERE id = $1
+           LIMIT 1`,
+        [bookId]
+      );
+
+      if (!currentBookResult.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Book not found." });
+      }
+
+      const groupedRows = await findGroupedBookRows(client, currentBookResult.rows[0]);
+      const groupedBookIds = groupedRows
+        .map((row) => Number(row.id))
+        .filter((value) => Number.isFinite(value) && value > 0);
+
+      const result = await client.query(
+        `DELETE FROM books
+          WHERE id = ANY($1::int[])`,
+        [groupedBookIds]
+      );
+
+      if (!result.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, message: "Book not found." });
+      }
+
+      await client.query("COMMIT");
       res.json({ ok: true, message: "Book deleted." });
     } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore
+      }
       next(err);
+    } finally {
+      client.release();
     }
   }
 );
