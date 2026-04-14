@@ -71,6 +71,7 @@ type BorrowNotificationEmailRow = {
   user_id: string;
   due_date: string;
   status: BorrowStatus;
+  extension_request_status: ExtensionRequestStatus | null;
   return_requested_at: string | null;
   return_requested_by: number | null;
   return_request_note: string | null;
@@ -519,6 +520,129 @@ function getDueNotificationKind(
   return null;
 }
 
+function formatFriendlyBorrowDate(value: string | null | undefined) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "—";
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const utcMs = dateOnlyToUtcMs(raw);
+    if (!Number.isNaN(utcMs)) {
+      return new Intl.DateTimeFormat("en-PH", {
+        timeZone: "UTC",
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      }).format(new Date(utcMs));
+    }
+  }
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+
+  return new Intl.DateTimeFormat("en-PH", {
+    timeZone: APP_TIME_ZONE,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
+
+function formatFriendlyBorrowDateTime(value: string | null | undefined) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "—";
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return formatFriendlyBorrowDate(raw);
+  }
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+
+  return new Intl.DateTimeFormat("en-PH", {
+    timeZone: APP_TIME_ZONE,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function getOverdueDays(dueDate: string | null | undefined, todayDateOnly: string) {
+  if (!dueDate) return 0;
+
+  const diff = compareDateOnly(todayDateOnly, dueDate);
+  if (Number.isNaN(diff) || diff <= 0) return 0;
+  return Math.max(0, Math.round(diff / DAY_MS));
+}
+
+function getStaffNotificationPriority(
+  row: BorrowNotificationEmailRow,
+  todayDateOnly: string,
+  canManageExtensions: boolean
+) {
+  if (getDueNotificationKind(row.due_date, todayDateOnly) === "overdue") return 0;
+  if (row.status === "pending_pickup") return 1;
+  if (
+    row.status === "pending_return" ||
+    row.status === "pending" ||
+    Boolean(row.return_requested_at)
+  ) {
+    return 2;
+  }
+  if (
+    canManageExtensions &&
+    String(row.extension_request_status ?? "").toLowerCase().trim() === "pending"
+  ) {
+    return 3;
+  }
+  if (getDueNotificationKind(row.due_date, todayDateOnly) === "due_today") return 4;
+  return 5;
+}
+
+function getStaffNotificationLabel(
+  row: BorrowNotificationEmailRow,
+  todayDateOnly: string,
+  canManageExtensions: boolean
+) {
+  const dueKind = getDueNotificationKind(row.due_date, todayDateOnly);
+  if (dueKind === "overdue") {
+    const overdueDays = getOverdueDays(row.due_date, todayDateOnly);
+    return overdueDays > 0
+      ? `Overdue (${overdueDays} day${overdueDays === 1 ? "" : "s"})`
+      : "Overdue";
+  }
+  if (row.status === "pending_pickup") return "Pending Pickup";
+  if (row.status === "pending_return" || row.status === "pending") {
+    return "Pending Return";
+  }
+  if (Boolean(row.return_requested_at)) return "Return Requested";
+  if (
+    canManageExtensions &&
+    String(row.extension_request_status ?? "").toLowerCase().trim() === "pending"
+  ) {
+    return "Extension Pending";
+  }
+  if (dueKind === "due_today") return "Due Today";
+  return "Borrowed";
+}
+
+function formatStaffNotificationEmailLine(
+  row: BorrowNotificationEmailRow,
+  todayDateOnly: string,
+  canManageExtensions: boolean
+) {
+  const borrowerName = trimText(row.full_name, 80) || `Borrower #${row.user_id}`;
+  const title = getBorrowRecordTitle(row);
+  const label = getStaffNotificationLabel(row, todayDateOnly, canManageExtensions);
+  const due = row.due_date ? ` • Due ${formatFriendlyBorrowDate(row.due_date)}` : "";
+  const note = row.return_request_note
+    ? ` • Note: ${trimText(row.return_request_note, 90)}`
+    : "";
+
+  return `• ${borrowerName} — ${title} (Borrow ID ${row.id} • ${label}${due}${note})`;
+}
+
 function getBorrowRecordTitle(row: {
   title?: string | null;
   id?: string | number | null;
@@ -564,13 +688,19 @@ function formatBorrowEmailLine(
   kind: "due_today" | "overdue" | "return_requested"
 ) {
   const title = getBorrowRecordTitle(row);
-  const due = row.due_date ? `Due ${row.due_date}` : "No due date";
+  const due = row.due_date
+    ? `Due ${formatFriendlyBorrowDate(row.due_date)}`
+    : "No due date";
   const borrower = row.full_name ? ` • Borrower: ${row.full_name}` : "";
+  const requestedAt =
+    kind === "return_requested" && row.return_requested_at
+      ? ` • Requested: ${formatFriendlyBorrowDateTime(row.return_requested_at)}`
+      : "";
   const note =
     kind === "return_requested" && row.return_request_note
       ? ` • Note: ${trimText(row.return_request_note, 90)}`
       : "";
-  return `• ${title} (Borrow ID ${row.id} • ${due}${borrower}${note})`;
+  return `• ${title} (Borrow ID ${row.id} • ${due}${borrower}${requestedAt}${note})`;
 }
 
 function buildBorrowerDashboardEmail(opts: {
@@ -616,7 +746,7 @@ function buildBorrowerDashboardEmail(opts: {
   const text = [
     `Hello ${greetingName},`,
     "",
-    `These borrow notifications currently match what is showing in your Book-Hive dashboard as of ${opts.todayDateOnly}.`,
+    `These borrow notifications currently match what is showing in your Book-Hive dashboard as of ${formatFriendlyBorrowDate(opts.todayDateOnly)}.`,
     "",
     ...textSections.flatMap((section) => [section, ""]),
     "Please open your Book-Hive circulation dashboard to review the full details.",
@@ -647,7 +777,7 @@ function buildBorrowerDashboardEmail(opts: {
         <div style="font-size:14px;line-height:1.6;color:#334155;">
           Hello ${escapeHtml(greetingName)},<br /><br />
           These borrow notifications currently match what is showing in your Book-Hive dashboard as of
-          <strong>${escapeHtml(opts.todayDateOnly)}</strong>.
+          <strong>${escapeHtml(formatFriendlyBorrowDate(opts.todayDateOnly))}</strong>.
         </div>
         ${renderList("Books due today", opts.dueTodayRows, "due_today")}
         ${renderList("Overdue books", opts.overdueRows, "overdue")}
@@ -674,17 +804,13 @@ function buildStaffDashboardEmail(opts: {
   pendingExtensionCount: number;
   dueTodayCount: number;
   overdueCount: number;
-  dueRows: BorrowNotificationEmailRow[];
+  canManageExtensions: boolean;
+  notificationRows: BorrowNotificationEmailRow[];
 }) {
-  const totalNotifications =
-    opts.pendingPickupCount +
-    opts.pendingReturnCount +
-    opts.pendingExtensionCount +
-    opts.dueTodayCount +
-    opts.overdueCount;
-
+  const totalNotifications = opts.notificationRows.length;
   const subject = `Book-Hive librarian alert: ${totalNotifications} notification${totalNotifications === 1 ? "" : "s"} need attention`;
   const greetingName = trimText(opts.fullName, 80) || "Library staff";
+  const friendlyToday = formatFriendlyBorrowDate(opts.todayDateOnly);
 
   const dashboardCounts = [
     `Pending pickup: ${opts.pendingPickupCount}`,
@@ -694,55 +820,26 @@ function buildStaffDashboardEmail(opts: {
     `Overdue: ${opts.overdueCount}`,
   ];
 
-  const dueTodayRows = opts.dueRows.filter(
-    (row) => getDueNotificationKind(row.due_date, opts.todayDateOnly) === "due_today"
-  );
-  const overdueRows = opts.dueRows.filter(
-    (row) => getDueNotificationKind(row.due_date, opts.todayDateOnly) === "overdue"
+  const notificationLines = opts.notificationRows.map((row) =>
+    formatStaffNotificationEmailLine(row, opts.todayDateOnly, opts.canManageExtensions)
   );
 
   const text = [
     `Hello ${greetingName},`,
     "",
-    `Here is your Book-Hive borrow records digest for ${opts.todayDateOnly}.`,
+    `Here is your Book-Hive borrow records digest for ${friendlyToday}.`,
     "",
     "Dashboard counts:",
     ...dashboardCounts.map((line) => `• ${line}`),
     "",
-    ...(dueTodayRows.length
-      ? [
-          `Due today (${dueTodayRows.length})`,
-          ...dueTodayRows.map((row) => formatBorrowEmailLine(row, "due_today")),
-          "",
-        ]
-      : []),
-    ...(overdueRows.length
-      ? [
-          `Overdue (${overdueRows.length})`,
-          ...overdueRows.map((row) => formatBorrowEmailLine(row, "overdue")),
-          "",
-        ]
-      : []),
+    "Included borrower records in Automatic email updates",
+    "These are the borrower records currently included in the automatic email update snapshot.",
+    ...(notificationLines.length
+      ? ["", ...notificationLines]
+      : ["", "• No borrower records are currently included in the automatic email update snapshot."]),
+    "",
     "Please open the Borrow Records dashboard to review and process these items.",
   ].join("\n");
-
-  const renderDueList = (
-    title: string,
-    rows: BorrowNotificationEmailRow[],
-    kind: "due_today" | "overdue"
-  ) => {
-    if (!rows.length) return "";
-    return `
-      <div style="margin-top:16px;">
-        <div style="font-size:14px;font-weight:700;margin-bottom:8px;">${escapeHtml(title)}</div>
-        <ul style="margin:0;padding-left:18px;color:#111827;">
-          ${rows
-            .map((row) => `<li style="margin-bottom:6px;">${escapeHtml(formatBorrowEmailLine(row, kind).replace(/^•\s*/, ""))}</li>`)
-            .join("")}
-        </ul>
-      </div>
-    `;
-  };
 
   const html = `
     <div style="font-family:Arial,Helvetica,sans-serif;background:#f8fafc;padding:24px;color:#111827;">
@@ -750,7 +847,7 @@ function buildStaffDashboardEmail(opts: {
         <div style="font-size:20px;font-weight:700;margin-bottom:8px;">Book-Hive borrow records alert</div>
         <div style="font-size:14px;line-height:1.6;color:#334155;">
           Hello ${escapeHtml(greetingName)},<br /><br />
-          Here is your borrow records digest for <strong>${escapeHtml(opts.todayDateOnly)}</strong>.
+          Here is your borrow records digest for <strong>${escapeHtml(friendlyToday)}</strong>.
         </div>
         <div style="margin-top:16px;padding:16px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc;">
           <div style="font-size:14px;font-weight:700;margin-bottom:8px;">Dashboard counts</div>
@@ -758,8 +855,25 @@ function buildStaffDashboardEmail(opts: {
             ${dashboardCounts.map((line) => `<li style="margin-bottom:6px;">${escapeHtml(line)}</li>`).join("")}
           </ul>
         </div>
-        ${renderDueList("Due today", dueTodayRows, "due_today")}
-        ${renderDueList("Overdue", overdueRows, "overdue")}
+        <div style="margin-top:16px;padding:16px;border:1px solid #dbeafe;border-radius:12px;background:#eff6ff;">
+          <div style="font-size:14px;font-weight:700;margin-bottom:8px;">Included borrower records in Automatic email updates</div>
+          <div style="font-size:12px;line-height:1.6;color:#475569;">
+            These are the borrower records currently included in the automatic email update snapshot.
+          </div>
+          ${notificationLines.length
+            ? `
+              <ul style="margin:12px 0 0;padding-left:18px;color:#111827;">
+                ${notificationLines
+                  .map((line) => `<li style="margin-bottom:6px;">${escapeHtml(line.replace(/^•\s*/, ""))}</li>`)
+                  .join("")}
+              </ul>
+            `
+            : `
+              <div style="margin-top:12px;font-size:13px;color:#475569;line-height:1.6;">
+                No borrower records are currently included in the automatic email update snapshot.
+              </div>
+            `}
+        </div>
         <div style="margin-top:18px;font-size:13px;color:#475569;line-height:1.6;">
           Please open the Borrow Records dashboard to review and process these items.
         </div>
@@ -810,8 +924,8 @@ async function sendBorrowWorkflowEmail(args: {
 
   const borrowerName = trimText(args.joinedRow.full_name, 80) || "Borrower";
   const bookTitle = getBorrowRecordTitle(args.joinedRow);
-  const dueDate = args.joinedRow.due_date ?? "—";
-  const returnDate = args.joinedRow.return_date ?? "—";
+  const dueDate = formatFriendlyBorrowDate(args.joinedRow.due_date);
+  const returnDate = formatFriendlyBorrowDate(args.joinedRow.return_date);
   const note = trimText(args.joinedRow.extension_decision_note ?? args.joinedRow.return_request_note ?? "", 180);
 
   let title = "Book-Hive notification";
@@ -1594,11 +1708,12 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
         overdue_count: 0,
       };
 
-      const dueRowsResult = await dbQuery<BorrowNotificationEmailRow>(
+      const notificationRowsResult = await dbQuery<BorrowNotificationEmailRow>(
         `SELECT br.id,
                 br.user_id,
                 br.due_date,
                 br.status,
+                br.extension_request_status,
                 br.return_requested_at,
                 br.return_requested_by,
                 br.return_request_note,
@@ -1610,10 +1725,26 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
            LEFT JOIN books b ON b.id = br.book_id
            WHERE br.return_date IS NULL
              AND br.status <> 'returned'
-             AND br.due_date <= $1::date
-           ORDER BY br.due_date ASC, br.id DESC
-           LIMIT $2`,
-        [todayDateOnly, BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT]
+             AND (
+               br.status = 'pending_pickup'
+               OR br.status IN ('pending_return', 'pending')
+               OR br.return_requested_at IS NOT NULL
+               OR br.due_date <= $1::date
+               OR ($2::boolean AND br.extension_request_status = 'pending')
+             )
+           ORDER BY CASE
+                      WHEN br.due_date < $1::date THEN 0
+                      WHEN br.status = 'pending_pickup' THEN 1
+                      WHEN br.status IN ('pending_return', 'pending') OR br.return_requested_at IS NOT NULL THEN 2
+                      WHEN $2::boolean AND br.extension_request_status = 'pending' THEN 3
+                      WHEN br.due_date = $1::date THEN 4
+                      ELSE 5
+                    END,
+                    br.due_date ASC NULLS LAST,
+                    br.borrow_date DESC,
+                    br.id DESC
+           LIMIT $3`,
+        [todayDateOnly, canManageExtensions, BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT]
       );
 
       const pendingPickupCount = Number(summaryRow.pending_pickup_count) || 0;
@@ -1623,6 +1754,15 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
         : 0;
       const dueTodayCount = Number(dueCountRow.due_today_count) || 0;
       const overdueCount = Number(dueCountRow.overdue_count) || 0;
+      const notificationRows = notificationRowsResult.rows.sort(
+        (left, right) =>
+          getStaffNotificationPriority(left, todayDateOnly, canManageExtensions) -
+            getStaffNotificationPriority(right, todayDateOnly, canManageExtensions) ||
+          String(left.due_date ?? '9999-12-31').localeCompare(
+            String(right.due_date ?? '9999-12-31')
+          ) ||
+          String(right.id).localeCompare(String(left.id))
+      );
 
       const emailContent = buildStaffDashboardEmail({
         fullName,
@@ -1632,7 +1772,8 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
         pendingExtensionCount,
         dueTodayCount,
         overdueCount,
-        dueRows: dueRowsResult.rows,
+        canManageExtensions,
+        notificationRows,
       });
 
       const totalNotifications = emailContent.totalNotifications;
@@ -1659,7 +1800,10 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
         pendingExtensionCount,
         dueTodayCount,
         overdueCount,
-        rows: dueRowsResult.rows.map((row) => `${row.id}:${row.due_date}`),
+        rows: notificationRows.map(
+          (row) =>
+            `${row.id}:${row.status}:${row.due_date ?? ''}:${row.return_requested_at ?? ''}:${row.extension_request_status ?? ''}`
+        ),
       });
       const cacheKey = `staff:${session.sub}:${todayDateOnly}:${signature}`;
       const suppressed = !claimBorrowNotificationEmailSlot(cacheKey);
