@@ -2955,9 +2955,10 @@ router.post("/self", requireAuth, async (req, res, next) => {
  *
  * assistant_librarian:
  * - can manage borrow/return workflow
+ * - can confirm returns and set the final fine during return confirmation
  * - cannot approve/disapprove extensions
  * - cannot change due date
- * - cannot override fine
+ * - cannot change the fine outside of return confirmation
  */
 router.patch("/:id", requireAuth, async (req, res, next) => {
   const client = await dbPool.connect();
@@ -3027,6 +3028,8 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
 
     const desiredStatus =
       status !== undefined ? String(status).toLowerCase() : undefined;
+    const isAssistantReturnConfirmation =
+      isAssistantLibrarian && desiredStatus === "returned";
 
     if (isAssistantLibrarian) {
       const allowedAssistantStatuses: BorrowStatus[] = [
@@ -3056,16 +3059,17 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
         });
       }
 
-      if (fine !== undefined) {
+      if (fine !== undefined && !isAssistantReturnConfirmation) {
         await client.query("ROLLBACK");
         return res.status(403).json({
           ok: false,
-          message: "Assistant librarian cannot override the fine.",
+          message:
+            "Assistant librarian can only set the fine when confirming a return.",
         });
       }
     }
 
-    if (!isPrivilegedStaff) {
+    if (!isPrivilegedStaff && !isAssistantLibrarian) {
       if (dueDate !== undefined || fine !== undefined) {
         await client.query("ROLLBACK");
         return res.status(403).json({
