@@ -4,7 +4,13 @@ import { query } from "../db";
 
 const router = express.Router();
 
-type Role = "student" | "librarian" | "faculty" | "admin" | "other";
+type Role =
+  | "student"
+  | "assistant_librarian"
+  | "librarian"
+  | "faculty"
+  | "admin"
+  | "other";
 type BorrowStatus =
   | "borrowed"
   | "pending"
@@ -16,7 +22,7 @@ type BorrowStatus =
  * Over-the-counter only:
  * - Removed: e-wallet payment config, QR uploads, and proof uploads
  * - Removed: student "pay" request flow (pending_verification)
- * - Staff (librarian/admin) marks fines as paid via PATCH /api/fines/:id
+ * - Staff (assistant_librarian/librarian/admin) marks fines as paid via PATCH /api/fines/:id
  */
 type FineStatus = "active" | "paid" | "cancelled";
 
@@ -64,6 +70,13 @@ const HOUR_MS = 1000 * 60 * 60;
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
+  if (
+    v === "assistant_librarian" ||
+    v === "assistant librarian" ||
+    v === "assistant-librarian"
+  ) {
+    return "assistant_librarian";
+  }
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
@@ -104,7 +117,12 @@ function computeBorrowOverdueMetrics(
 }
 
 function isStaffRole(role: Role) {
-  return role === "admin" || role === "librarian" || role === "faculty";
+  return (
+    role === "admin" ||
+    role === "assistant_librarian" ||
+    role === "librarian" ||
+    role === "faculty"
+  );
 }
 
 function readSession(req: express.Request): SessionPayload | null {
@@ -138,7 +156,7 @@ function requireAuth(
 
 /**
  * ✅ FIXED: Effective AUTH role for guards/authorization
- * - Prefer legacy `role` if it's a staff role (admin/librarian/faculty)
+ * - Prefer legacy `role` if it's a staff role (admin/assistant_librarian/librarian/faculty)
  * - Else if account_type is staff role, use it
  * - Else if legacy role exists (student/other), use it
  * - Else fallback to account_type (or student)
@@ -311,7 +329,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
 
 /**
  * GET /api/fines
- * List fines (librarian/admin).
+ * List fines (assistant_librarian/librarian/admin).
  * Optional query params:
  *   - userId: filter by user
  *   - status: active | paid | cancelled
@@ -319,7 +337,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
 router.get(
   "/",
   requireAuth,
-  requireRole(["librarian", "admin"]),
+  requireRole(["assistant_librarian", "librarian", "admin"]),
   async (req, res, next) => {
     try {
       const { userId, status } = req.query as {
@@ -368,7 +386,7 @@ router.get(
 
 /**
  * PATCH /api/fines/:id
- * Update a fine (librarian/admin).
+ * Update a fine (assistant_librarian/librarian/admin).
  * Body: { status?, amount?, reason?, officialReceiptNumber? }
  * - status: active | paid | cancelled
  * - amount: updated fine amount (>= 0)
@@ -381,7 +399,7 @@ router.get(
 router.patch(
   "/:id",
   requireAuth,
-  requireRole(["librarian", "admin"]),
+  requireRole(["assistant_librarian", "librarian", "admin"]),
   async (req, res, next) => {
     try {
       const { id } = req.params;

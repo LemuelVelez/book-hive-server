@@ -161,6 +161,15 @@ const BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT = Math.max(
   3,
   Math.min(20, Number(process.env.BORROW_NOTIFICATION_EMAIL_DETAIL_LIMIT ?? 10))
 );
+const PENDING_PICKUP_EXPIRY_HOURS = Math.max(1, Number(process.env.PENDING_PICKUP_EXPIRY_HOURS ?? 24));
+
+function getPendingPickupActiveSql(alias = "br") {
+  return `(${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) >= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour'))`;
+}
+
+function getActiveBorrowRecordSql(alias = "br") {
+  return `(${alias}.status <> 'returned' AND NOT (${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) < NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour')))`;
+}
 
 const PROGRAM_TO_COLLEGE = new Map<string, string>([
   ["bsba", "College of Business Administration"],
@@ -612,7 +621,7 @@ function getStaffNotificationLabel(
       ? `Overdue (${overdueDays} day${overdueDays === 1 ? "" : "s"})`
       : "Overdue";
   }
-  if (row.status === "pending_pickup") return "Pending Pickup";
+  if (row.status === "pending_pickup") return "Reserved Pending Pickup";
   if (row.status === "pending_return" || row.status === "pending") {
     return "Pending Return";
   }
@@ -813,7 +822,7 @@ function buildStaffDashboardEmail(opts: {
   const friendlyToday = formatFriendlyBorrowDate(opts.todayDateOnly);
 
   const dashboardCounts = [
-    `Pending pickup: ${opts.pendingPickupCount}`,
+    `Reserved pending pickup: ${opts.pendingPickupCount}`,
     `Pending return: ${opts.pendingReturnCount}`,
     `Pending extension: ${opts.pendingExtensionCount}`,
     `Due today: ${opts.dueTodayCount}`,
@@ -1070,7 +1079,7 @@ async function countActiveBorrowRecordsForUser(
     `SELECT COUNT(*)::int AS active_count
        FROM borrow_records
       WHERE user_id = $1
-        AND status <> 'returned'`,
+        AND ${getActiveBorrowRecordSql()}`,
     [userId]
   );
 
@@ -1196,7 +1205,7 @@ async function fetchBorrowRecordsJoined(
 /**
  * ✅ Recompute book availability based on:
  * available = (activeBorrowCount < number_of_copies)
- * activeBorrowCount = borrow_records where status <> 'returned'
+ * activeBorrowCount = borrow_records where active reservations still block availability
  */
 async function recomputeAndUpdateBookAvailability(
   client: DBClient,
@@ -1226,7 +1235,7 @@ async function recomputeAndUpdateBookAvailability(
     `SELECT COUNT(*)::int AS active_count
        FROM borrow_records
        WHERE book_id = $1
-         AND status <> 'returned'`,
+         AND ${getActiveBorrowRecordSql()}`,
     [bookId]
   );
 
@@ -1456,27 +1465,27 @@ router.get(
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
-                    AND br.status = 'pending_pickup'
+                    AND ${getActiveBorrowRecordSql('br')}
+                    AND ${getPendingPickupActiveSql('br')}
                 )::int AS pending_pickup_count,
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
+                    AND ${getActiveBorrowRecordSql('br')}
                     AND br.status IN ('pending_return', 'pending')
                 )::int AS pending_return_count,
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
+                    AND ${getActiveBorrowRecordSql('br')}
                     AND br.extension_request_status = 'pending'
                 )::int AS pending_extension_count,
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
+                    AND ${getActiveBorrowRecordSql('br')}
                     AND (
-                      br.status = 'pending_pickup'
+                      ${getPendingPickupActiveSql('br')}
                       OR br.status IN ('pending_return', 'pending')
                       OR ($1::boolean AND br.extension_request_status = 'pending')
                     )
@@ -1656,27 +1665,27 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
-                    AND br.status = 'pending_pickup'
+                    AND ${getActiveBorrowRecordSql('br')}
+                    AND ${getPendingPickupActiveSql('br')}
                 )::int AS pending_pickup_count,
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
+                    AND ${getActiveBorrowRecordSql('br')}
                     AND br.status IN ('pending_return', 'pending')
                 )::int AS pending_return_count,
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
+                    AND ${getActiveBorrowRecordSql('br')}
                     AND br.extension_request_status = 'pending'
                 )::int AS pending_extension_count,
 
                 COUNT(*) FILTER (
                   WHERE br.return_date IS NULL
-                    AND br.status <> 'returned'
+                    AND ${getActiveBorrowRecordSql('br')}
                     AND (
-                      br.status = 'pending_pickup'
+                      ${getPendingPickupActiveSql('br')}
                       OR br.status IN ('pending_return', 'pending')
                       OR ($1::boolean AND br.extension_request_status = 'pending')
                     )
@@ -1698,7 +1707,7 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
                 COUNT(*) FILTER (WHERE br.due_date < $1::date)::int AS overdue_count
            FROM borrow_records br
            WHERE br.return_date IS NULL
-             AND br.status <> 'returned'
+             AND ${getActiveBorrowRecordSql('br')}
              AND br.due_date <= $1::date`,
         [todayDateOnly]
       );
@@ -1724,9 +1733,9 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
            LEFT JOIN users u ON u.id = br.user_id
            LEFT JOIN books b ON b.id = br.book_id
            WHERE br.return_date IS NULL
-             AND br.status <> 'returned'
+             AND ${getActiveBorrowRecordSql('br')}
              AND (
-               br.status = 'pending_pickup'
+               ${getPendingPickupActiveSql('br')}
                OR br.status IN ('pending_return', 'pending')
                OR br.return_requested_at IS NOT NULL
                OR br.due_date <= $1::date
@@ -1734,7 +1743,7 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
              )
            ORDER BY CASE
                       WHEN br.due_date < $1::date THEN 0
-                      WHEN br.status = 'pending_pickup' THEN 1
+                      WHEN ${getPendingPickupActiveSql('br')} THEN 1
                       WHEN br.status IN ('pending_return', 'pending') OR br.return_requested_at IS NOT NULL THEN 2
                       WHEN $2::boolean AND br.extension_request_status = 'pending' THEN 3
                       WHEN br.due_date = $1::date THEN 4
@@ -1854,7 +1863,7 @@ router.post("/notifications/email-sync", requireAuth, async (req, res, next) => 
          LEFT JOIN books b ON b.id = br.book_id
          WHERE br.user_id = $1
            AND br.return_date IS NULL
-           AND br.status <> 'returned'
+           AND ${getActiveBorrowRecordSql('br')}
            AND (
              br.due_date <= $2::date
              OR br.return_requested_at IS NOT NULL
@@ -2726,7 +2735,7 @@ router.post(
         `SELECT COUNT(*)::int AS active_count
            FROM borrow_records
            WHERE book_id = $1
-             AND status <> 'returned'`,
+             AND ${getActiveBorrowRecordSql()}`,
         [bid]
       );
 
@@ -2883,7 +2892,7 @@ router.post("/self", requireAuth, async (req, res, next) => {
       `SELECT COUNT(*)::int AS active_count
          FROM borrow_records
          WHERE book_id = $1
-           AND status <> 'returned'`,
+           AND ${getActiveBorrowRecordSql()}`,
       [bid]
     );
 
