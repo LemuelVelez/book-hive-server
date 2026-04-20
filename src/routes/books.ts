@@ -653,16 +653,57 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
   try {
     const bookId = Number(req.params.id);
     if (!bookId) return res.status(400).json({ ok: false, message: "Invalid id." });
+
     await client.query("BEGIN");
-    const currentBookResult = await client.query<BookRow>(`SELECT ${BOOK_RETURNING} FROM books WHERE id = $1 LIMIT 1`, [bookId]);
-    if (!currentBookResult.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Book not found." }); }
-    const groupedRows = await findGroupedBookRows(client, currentBookResult.rows[0]);
-    const groupedBookIds = groupedRows.map((row) => Number(row.id)).filter((value) => Number.isFinite(value) && value > 0);
-    const result = await client.query(`DELETE FROM books WHERE id = ANY($1::int[])`, [groupedBookIds]);
-    if (!result.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Book not found." }); }
+
+    const currentBookResult = await client.query<BookRow>(
+      `SELECT ${BOOK_RETURNING} FROM books WHERE id = $1 LIMIT 1`,
+      [bookId]
+    );
+
+    if (!currentBookResult.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, message: "Book not found." });
+    }
+
+    const borrowReferenceResult = await client.query<{ borrow_count: number }>(
+      `SELECT COUNT(*)::int AS borrow_count
+         FROM borrow_records
+        WHERE book_id = $1`,
+      [bookId]
+    );
+
+    const borrowCount =
+      typeof borrowReferenceResult.rows[0]?.borrow_count === "number" &&
+      Number.isFinite(borrowReferenceResult.rows[0].borrow_count)
+        ? borrowReferenceResult.rows[0].borrow_count
+        : 0;
+
+    if (borrowCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        message: "This book copy cannot be deleted because it already has borrow records.",
+      });
+    }
+
+    const result = await client.query(`DELETE FROM books WHERE id = $1`, [bookId]);
+
+    if (!result.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, message: "Book not found." });
+    }
+
     await client.query("COMMIT");
     res.json({ ok: true, message: "Book deleted." });
-  } catch (err) { try { await client.query("ROLLBACK"); } catch {} next(err); } finally { client.release(); }
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    next(err);
+  } finally {
+    client.release();
+  }
 });
 
 export default router;
