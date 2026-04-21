@@ -666,25 +666,41 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
       return res.status(404).json({ ok: false, message: "Book not found." });
     }
 
-    const borrowReferenceResult = await client.query<{ borrow_count: number }>(
-      `SELECT COUNT(*)::int AS borrow_count
+    const borrowReferenceResult = await client.query<{
+      active_borrow_count: number;
+      total_borrow_count: number;
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE ${ACTIVE_BORROW_COUNT_SQL})::int AS active_borrow_count,
+         COUNT(*)::int AS total_borrow_count
          FROM borrow_records
         WHERE book_id = $1`,
       [bookId]
     );
 
-    const borrowCount =
-      typeof borrowReferenceResult.rows[0]?.borrow_count === "number" &&
-      Number.isFinite(borrowReferenceResult.rows[0].borrow_count)
-        ? borrowReferenceResult.rows[0].borrow_count
+    const activeBorrowCount =
+      typeof borrowReferenceResult.rows[0]?.active_borrow_count === "number" &&
+      Number.isFinite(borrowReferenceResult.rows[0].active_borrow_count)
+        ? borrowReferenceResult.rows[0].active_borrow_count
         : 0;
 
-    if (borrowCount > 0) {
+    const totalBorrowCount =
+      typeof borrowReferenceResult.rows[0]?.total_borrow_count === "number" &&
+      Number.isFinite(borrowReferenceResult.rows[0].total_borrow_count)
+        ? borrowReferenceResult.rows[0].total_borrow_count
+        : 0;
+
+    if (activeBorrowCount > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
-        message: "This book copy cannot be deleted because it already has borrow records.",
+        message:
+          "This book copy cannot be deleted because it still has active borrow records.",
       });
+    }
+
+    if (totalBorrowCount > 0) {
+      await client.query(`DELETE FROM borrow_records WHERE book_id = $1`, [bookId]);
     }
 
     const result = await client.query(`DELETE FROM books WHERE id = $1`, [bookId]);
@@ -695,7 +711,13 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
     }
 
     await client.query("COMMIT");
-    res.json({ ok: true, message: "Book deleted." });
+    res.json({
+      ok: true,
+      message:
+        totalBorrowCount > 0
+          ? "Book deleted. Historical borrow records for this copy were also removed."
+          : "Book deleted.",
+    });
   } catch (err) {
     try {
       await client.query("ROLLBACK");
