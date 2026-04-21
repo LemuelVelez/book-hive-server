@@ -4,7 +4,7 @@ import { pool, query } from "../db";
 
 const router = express.Router();
 
-type Role = "student" | "librarian" | "faculty" | "admin" | "other";
+type Role = "student" | "assistant_librarian" | "librarian" | "faculty" | "admin" | "other";
 
 type LibraryArea =
   | "filipiniana"
@@ -65,6 +65,7 @@ type BookRow = {
   barcode: string | null;
   call_number: string | null;
   copy_number: number | null;
+  parent_book_id: number | null;
   volume_number: string | null;
   library_area: LibraryArea | null;
   number_of_copies: number;
@@ -115,6 +116,14 @@ const ACTIVE_BORROW_COUNT_SQL = `status <> 'returned' AND NOT (status = 'pending
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
   if (v === "student") return "student";
+  if (
+    v === "assistant_librarian" ||
+    v === "assistant librarian" ||
+    v === "assistant-librarian" ||
+    v === "assistantlibrarian"
+  ) {
+    return "assistant_librarian";
+  }
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
@@ -282,6 +291,10 @@ function buildBookDTO(row: BookRow | BookRowWithCounts) {
     barcode: row.barcode ?? "",
     callNumber: row.call_number ?? "",
     copyNumber: typeof row.copy_number === "number" ? row.copy_number : null,
+    parentBookId:
+      typeof row.parent_book_id === "number" && Number.isFinite(row.parent_book_id)
+        ? String(row.parent_book_id)
+        : null,
     volumeNumber: row.volume_number ?? "",
     libraryArea: row.library_area ?? null,
     numberOfCopies: remainingCopies,
@@ -294,10 +307,17 @@ function buildBookDTO(row: BookRow | BookRowWithCounts) {
   };
 }
 
-function toDTO(row: BookRow | BookRowWithCounts | GroupedBookRow) {
+function toDTO(
+  row: BookRow | BookRowWithCounts | GroupedBookRow,
+  options?: { includeCopies?: boolean }
+) {
   const base = buildBookDTO(row);
   const groupedRows = (row as GroupedBookRow).grouped_rows;
   if (!Array.isArray(groupedRows) || groupedRows.length === 0) {
+    return base;
+  }
+
+  if (options?.includeCopies === false) {
     return base;
   }
 
@@ -311,24 +331,49 @@ function toDTO(row: BookRow | BookRowWithCounts | GroupedBookRow) {
 }
 
 const BOOK_RETURNING = `
-  id, title, subtitle, author, statement_of_responsibility, edition, isbn, issn, accession_number, subjects, genre, category, place_of_publication, publisher, publication_year, copyright_year, pages, physical_details, dimensions, notes, series, added_entries, barcode, call_number, copy_number, volume_number, library_area, number_of_copies, available, borrow_duration_days, is_library_use_only, created_at, updated_at
+  id, title, subtitle, author, statement_of_responsibility, edition, isbn, issn, accession_number, subjects, genre, category, place_of_publication, publisher, publication_year, copyright_year, pages, physical_details, dimensions, notes, series, added_entries, barcode, call_number, copy_number, parent_book_id, volume_number, library_area, number_of_copies, available, borrow_duration_days, is_library_use_only, created_at, updated_at
 `;
 
 const BOOK_RETURNING_B = `
-  b.id, b.title, b.subtitle, b.author, b.statement_of_responsibility, b.edition, b.isbn, b.issn, b.accession_number, b.subjects, b.genre, b.category, b.place_of_publication, b.publisher, b.publication_year, b.copyright_year, b.pages, b.physical_details, b.dimensions, b.notes, b.series, b.added_entries, b.barcode, b.call_number, b.copy_number, b.volume_number, b.library_area, b.number_of_copies, b.available, b.borrow_duration_days, b.is_library_use_only, b.created_at, b.updated_at
+  b.id, b.title, b.subtitle, b.author, b.statement_of_responsibility, b.edition, b.isbn, b.issn, b.accession_number, b.subjects, b.genre, b.category, b.place_of_publication, b.publisher, b.publication_year, b.copyright_year, b.pages, b.physical_details, b.dimensions, b.notes, b.series, b.added_entries, b.barcode, b.call_number, b.copy_number, b.parent_book_id, b.volume_number, b.library_area, b.number_of_copies, b.available, b.borrow_duration_days, b.is_library_use_only, b.created_at, b.updated_at
 `;
 
-function normalizeBookGroupValue(raw: unknown) { return String(raw ?? "").trim().toLowerCase(); }
-function buildBookGroupKey(input: { title?: unknown; author?: unknown; callNumber?: unknown; isbn?: unknown; }) { return [normalizeBookGroupValue(input.title), normalizeBookGroupValue(input.author), normalizeBookGroupValue(input.callNumber), normalizeBookGroupValue(input.isbn)].join("|"); }
+function getBookNumericId(value: unknown): number | null {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return Math.floor(numeric);
+}
+
+function getBookGroupRootId(
+  row: Pick<BookRow, "id" | "parent_book_id"> | Pick<BookGroupLookupRow, "id" | "parent_book_id">
+): number | null {
+  const parentId = getBookNumericId(row.parent_book_id);
+  if (parentId !== null) return parentId;
+  return getBookNumericId(row.id);
+}
+
+function isBookGroupOriginalRow(
+  row: Pick<BookRow, "id" | "parent_book_id"> | Pick<BookGroupLookupRow, "id" | "parent_book_id">
+) {
+  const rootId = getBookGroupRootId(row);
+  const ownId = getBookNumericId(row.id);
+  return rootId !== null && ownId !== null && rootId === ownId;
+}
+
 type BookGroupLookupRow = Pick<
   BookRow,
-  "id" | "title" | "author" | "call_number" | "isbn" | "copy_number"
+  "id" | "title" | "author" | "call_number" | "isbn" | "copy_number" | "parent_book_id" | "created_at"
 >;
 
-function buildBookGroupKeyFromRow(row: Pick<BookRow, "title" | "author" | "call_number" | "isbn">) { return buildBookGroupKey({ title: row.title, author: row.author, callNumber: row.call_number, isbn: row.isbn }); }
-function compareBookGroupOrder(a: BookRow, b: BookRow) {
-  const createdAtDiff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-  if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) return createdAtDiff;
+type BookGroupSortableRow = Pick<BookRow, "id" | "copy_number" | "parent_book_id" | "created_at">;
+
+function compareBookGroupOrder(a: BookGroupSortableRow, b: BookGroupSortableRow) {
+  const aIsOriginal = isBookGroupOriginalRow(a);
+  const bIsOriginal = isBookGroupOriginalRow(b);
+  if (aIsOriginal !== bIsOriginal) {
+    return aIsOriginal ? -1 : 1;
+  }
+
   const aCopyNumber =
     typeof a.copy_number === "number" && Number.isFinite(a.copy_number)
       ? a.copy_number
@@ -338,54 +383,101 @@ function compareBookGroupOrder(a: BookRow, b: BookRow) {
       ? b.copy_number
       : Number.MAX_SAFE_INTEGER;
   if (aCopyNumber !== bCopyNumber) return aCopyNumber - bCopyNumber;
-  const aId = Number(a.id);
-  const bId = Number(b.id);
-  if (Number.isFinite(aId) && Number.isFinite(bId) && aId !== bId) return aId - bId;
+
+  const createdAtDiff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+  if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) return createdAtDiff;
+
+  const aId = getBookNumericId(a.id) ?? Number.MAX_SAFE_INTEGER;
+  const bId = getBookNumericId(b.id) ?? Number.MAX_SAFE_INTEGER;
+  if (aId !== bId) return aId - bId;
+
   return String(a.id).localeCompare(String(b.id), undefined, { numeric: true, sensitivity: "base" });
 }
-function chooseBookGroupRepresentative(rows: BookRowWithCounts[]) { return [...rows].sort(compareBookGroupOrder)[0]; }
+
+function chooseBookGroupRepresentative(rows: BookRowWithCounts[]) {
+  return [...rows].sort(compareBookGroupOrder)[0];
+}
+
 function aggregateBookGroupRows(rows: BookRowWithCounts[]): GroupedBookRow {
   const sortedRows = [...rows].sort(compareBookGroupOrder);
   const representative = chooseBookGroupRepresentative(sortedRows);
   const aggregate = { ...representative, grouped_rows: sortedRows } as GroupedBookRow;
-  let totalCopies = 0; let activeCount = 0; let totalBorrowCount = 0;
+  let totalCopies = 0;
+  let activeCount = 0;
+  let totalBorrowCount = 0;
+
   for (const row of sortedRows) {
-    const rowTotalCopies = typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies) ? Math.max(1, Math.floor(row.number_of_copies)) : 1;
-    const rowActiveCount = typeof row.active_count === "number" && Number.isFinite(row.active_count) ? row.active_count : 0;
-    const rowTotalBorrowCount = typeof row.total_borrow_count === "number" && Number.isFinite(row.total_borrow_count) ? row.total_borrow_count : 0;
-    totalCopies += rowTotalCopies; activeCount += rowActiveCount; totalBorrowCount += rowTotalBorrowCount;
+    const rowTotalCopies =
+      typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
+        ? Math.max(1, Math.floor(row.number_of_copies))
+        : 1;
+    const rowActiveCount =
+      typeof row.active_count === "number" && Number.isFinite(row.active_count)
+        ? row.active_count
+        : 0;
+    const rowTotalBorrowCount =
+      typeof row.total_borrow_count === "number" && Number.isFinite(row.total_borrow_count)
+        ? row.total_borrow_count
+        : 0;
+
+    totalCopies += rowTotalCopies;
+    activeCount += rowActiveCount;
+    totalBorrowCount += rowTotalBorrowCount;
   }
+
   aggregate.number_of_copies = Math.max(1, totalCopies);
   aggregate.active_count = activeCount;
   aggregate.total_borrow_count = totalBorrowCount;
   aggregate.available_copies = Math.max(0, totalCopies - activeCount);
   aggregate.computed_available = aggregate.available_copies > 0;
   aggregate.available = Boolean(aggregate.computed_available);
+
   return aggregate;
 }
+
 function groupBookRows(rows: BookRowWithCounts[]) {
   const grouped = new Map<string, BookRowWithCounts[]>();
+
   for (const row of rows) {
-    const key = buildBookGroupKeyFromRow(row);
+    const rootId = getBookGroupRootId(row);
+    const key = String(rootId ?? row.id);
     const items = grouped.get(key) ?? [];
     items.push(row);
     grouped.set(key, items);
   }
-  return Array.from(grouped.values()).map(aggregateBookGroupRows).sort((a, b) => {
-    const updatedAtDiff = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
-    if (Number.isFinite(updatedAtDiff) && updatedAtDiff !== 0) return updatedAtDiff;
-    return compareBookGroupOrder(a, b);
-  });
+
+  return Array.from(grouped.values())
+    .map(aggregateBookGroupRows)
+    .sort((a, b) => {
+      const updatedAtDiff = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+      if (Number.isFinite(updatedAtDiff) && updatedAtDiff !== 0) return updatedAtDiff;
+      return compareBookGroupOrder(a, b);
+    });
 }
 
-async function findGroupedBookRows(client: DBClient, row: Pick<BookRow, "title" | "author" | "call_number" | "isbn">) {
-  const result = await client.query<BookGroupLookupRow>(`SELECT id, title, author, call_number, isbn, copy_number FROM books`);
-  const sourceKey = buildBookGroupKeyFromRow(row);
-  return result.rows.filter((candidate) => buildBookGroupKeyFromRow(candidate) === sourceKey);
+async function findGroupedBookRows(
+  client: DBClient,
+  row: Pick<BookRow, "id" | "parent_book_id">
+) {
+  const rootId = getBookGroupRootId(row);
+  if (!rootId) return [];
+
+  const result = await client.query<BookGroupLookupRow>(
+    `SELECT id, title, author, call_number, isbn, copy_number, parent_book_id, created_at
+       FROM books
+      WHERE id = $1 OR parent_book_id = $1`,
+    [rootId]
+  );
+
+  return result.rows;
 }
 
-router.get("/", async (_req, res, next) => {
+router.get("/", async (req, res, next) => {
   try {
+    const session = readSession(req);
+    const canSeeCopies =
+      session?.role === "librarian" || session?.role === "assistant_librarian";
+
     const result = await dbQuery<BookRowWithCounts>(`
       SELECT ${BOOK_RETURNING_B}, COALESCE(stats.active_count, 0)::int AS active_count, COALESCE(stats.total_borrow_count, 0)::int AS total_borrow_count, GREATEST(b.number_of_copies - COALESCE(stats.active_count, 0), 0)::int AS available_copies, (COALESCE(stats.active_count, 0) < b.number_of_copies) AS computed_available
       FROM books b
@@ -396,7 +488,9 @@ router.get("/", async (_req, res, next) => {
       ) stats ON stats.book_id = b.id
       ORDER BY b.created_at DESC, b.id DESC
     `);
-    const books = groupBookRows(result.rows).map(toDTO);
+    const books = groupBookRows(result.rows).map((row) =>
+      toDTO(row, { includeCopies: canSeeCopies })
+    );
     res.json({ ok: true, books });
   } catch (err) { next(err); }
 });
@@ -415,6 +509,8 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
 
     const source = sourceBookResult.rows[0];
     const groupedRows = await findGroupedBookRows(client, source);
+    const sourceIdNumber = getBookNumericId(source.id) ?? bookId;
+    const groupRootId = getBookGroupRootId(source) ?? sourceIdNumber;
     const body = req.body || {};
 
     const title = trimToNull(body.title) ?? source.title;
@@ -522,15 +618,15 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
           accession_number, subjects, genre, category, place_of_publication, publisher,
           publication_year, copyright_year, pages, physical_details, dimensions, notes,
           series, added_entries, barcode, call_number, copy_number, volume_number,
-          library_area, number_of_copies, available, borrow_duration_days,
+          library_area, parent_book_id, number_of_copies, available, borrow_duration_days,
           is_library_use_only
         ) VALUES (
           $1, $2, $3, NULL, $4, $5, $6,
           $7, $8, $9, $10, $11, $12,
           $13, $14, $15, $16, $17, $18,
           $19, $20, $21, $22, $23, $24,
-          $25, 1, $26, $27,
-          $28
+          $25, $26, 1, $27, $28,
+          $29
         ) RETURNING ${BOOK_RETURNING}`,
         [
           title,
@@ -558,6 +654,7 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
           copyNumber,
           volumeNumber,
           libraryArea,
+          groupRootId,
           available,
           borrowDurationDays,
           isLibraryUseOnly,
@@ -573,7 +670,9 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
     }
 
     const regroupedRows = await findGroupedBookRows(client, insertedRow);
-    const regroupedBookIds = regroupedRows.map((row) => Number(row.id)).filter((value) => Number.isFinite(value) && value > 0);
+    const regroupedBookIds = regroupedRows
+      .map((row) => getBookNumericId(row.id))
+      .filter((value): value is number => value !== null && Number.isFinite(value) && value > 0);
     const rowsForGroup = await client.query<BookRowWithCounts>(`
       SELECT ${BOOK_RETURNING_B}, COALESCE(stats.active_count, 0)::int AS active_count, COALESCE(stats.total_borrow_count, 0)::int AS total_borrow_count, GREATEST(b.number_of_copies - COALESCE(stats.active_count, 0), 0)::int AS available_copies, (COALESCE(stats.active_count, 0) < b.number_of_copies) AS computed_available
       FROM books b
@@ -606,7 +705,9 @@ router.patch("/:id", requireAuth, requireRole(["librarian", "admin"]), async (re
     if (!currentBookResult.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Book not found." }); }
     const currentBook = currentBookResult.rows[0];
     const groupedRows = await findGroupedBookRows(client, currentBook);
-    const groupedBookIds = groupedRows.map((row) => Number(row.id)).filter((value) => Number.isFinite(value) && value > 0);
+    const groupedBookIds = groupedRows
+      .map((row) => getBookNumericId(row.id))
+      .filter((value): value is number => value !== null && Number.isFinite(value) && value > 0);
     const directUpdates: string[] = []; const directValues: any[] = []; let directIdx = 1; let shouldRefreshAvailability = false;
     const sharedUpdates: string[] = []; const sharedValues: any[] = []; let sharedIdx = 1;
     if (title !== undefined) { sharedUpdates.push(`title = $${sharedIdx++}`); sharedValues.push(String(title).trim()); }
@@ -675,6 +776,11 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
       return res.status(404).json({ ok: false, message: "Book not found." });
     }
 
+    const currentBook = currentBookResult.rows[0];
+    const groupedRows = (await findGroupedBookRows(client, currentBook)).sort(compareBookGroupOrder);
+    const currentIsOriginal = isBookGroupOriginalRow(currentBook);
+    const remainingGroupRows = groupedRows.filter((row) => getBookNumericId(row.id) !== bookId);
+
     const borrowReferenceResult = await client.query<{
       active_borrow_count: number;
       total_borrow_count: number;
@@ -710,6 +816,36 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
 
     if (totalBorrowCount > 0) {
       await client.query(`DELETE FROM borrow_records WHERE book_id = $1`, [bookId]);
+    }
+
+    if (currentIsOriginal && remainingGroupRows.length > 0) {
+      const replacement = remainingGroupRows[0];
+      const replacementId = getBookNumericId(replacement.id);
+
+      if (replacementId) {
+        await client.query(
+          `UPDATE books
+              SET parent_book_id = NULL,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [replacementId]
+        );
+
+        const childIds = remainingGroupRows
+          .slice(1)
+          .map((row) => getBookNumericId(row.id))
+          .filter((value): value is number => value !== null && Number.isFinite(value) && value > 0);
+
+        if (childIds.length > 0) {
+          await client.query(
+            `UPDATE books
+                SET parent_book_id = $1,
+                    updated_at = NOW()
+              WHERE id = ANY($2::int[])`,
+            [replacementId, childIds]
+          );
+        }
+      }
     }
 
     const result = await client.query(`DELETE FROM books WHERE id = $1`, [bookId]);

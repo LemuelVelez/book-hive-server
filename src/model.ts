@@ -282,3 +282,24 @@ export function resolveClassificationPayload(input: {
     category: explicitCategory !== undefined ? explicitCategory : fallback,
   };
 }
+
+
+export type BookCopyRelationRow = {
+  id: string | number;
+  parent_book_id?: string | number | null;
+  copy_number?: number | null;
+};
+
+export function resolveBookCopyGroupId(
+  row: Pick<BookCopyRelationRow, "id" | "parent_book_id">
+): string {
+  const parentId = String(row.parent_book_id ?? "").trim();
+  if (parentId) return parentId;
+  return String(row.id);
+}
+
+export function isOriginalBookCopy(
+  row: Pick<BookCopyRelationRow, "id" | "parent_book_id">
+) {
+  return resolveBookCopyGroupId(row) === String(row.id);
+}

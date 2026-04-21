@@ -156,6 +156,7 @@ type BorrowableCopySelectionRow = {
   isbn: string | null;
   accession_number: string | null;
   copy_number: number | null;
+  parent_book_id: number | null;
   number_of_copies: number | null;
   borrow_duration_days: number | null;
   is_library_use_only: boolean | null;
@@ -1364,7 +1365,7 @@ async function recomputeAndUpdateBookAvailability(
 
 /**
  * ✅ Parse how many copies user wants to borrow in a single action.
- * We keep DB schema unchanged by creating 1 borrow_record per copy.
+ * Each borrow request still creates 1 borrow_record per assigned physical copy.
  */
 function parseBorrowQuantity(body: any): number {
   const raw =
@@ -1387,18 +1388,35 @@ function parseBorrowQuantity(body: any): number {
   return Math.min(q, maxAllowed);
 }
 
-function normalizeBorrowBookGroupValue(raw: unknown) {
-  return String(raw ?? "").trim().toLowerCase();
+function getBorrowableCopyGroupRootId(
+  row: Pick<BorrowableCopySelectionRow, "id" | "parent_book_id">
+) {
+  if (
+    typeof row.parent_book_id === "number" &&
+    Number.isFinite(row.parent_book_id) &&
+    row.parent_book_id > 0
+  ) {
+    return Math.floor(row.parent_book_id);
+  }
+
+  return Math.floor(row.id);
+}
+
+function isOriginalBorrowableCopyRow(
+  row: Pick<BorrowableCopySelectionRow, "id" | "parent_book_id">
+) {
+  return getBorrowableCopyGroupRootId(row) === Math.floor(row.id);
 }
 
 function compareBorrowableCopySelectionRows(
   a: BorrowableCopySelectionRow,
   b: BorrowableCopySelectionRow
 ) {
-  const createdAtDiff =
-    new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-  if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) {
-    return createdAtDiff;
+  const aIsOriginal = isOriginalBorrowableCopyRow(a);
+  const bIsOriginal = isOriginalBorrowableCopyRow(b);
+
+  if (aIsOriginal !== bIsOriginal) {
+    return aIsOriginal ? -1 : 1;
   }
 
   const aCopyNumber =
@@ -1411,6 +1429,12 @@ function compareBorrowableCopySelectionRows(
       : Number.MAX_SAFE_INTEGER;
   if (aCopyNumber !== bCopyNumber) {
     return aCopyNumber - bCopyNumber;
+  }
+
+  const createdAtDiff =
+    new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+  if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) {
+    return createdAtDiff;
   }
 
   return a.id - b.id;
@@ -1448,6 +1472,7 @@ async function resolveBorrowableCopySelection(
             isbn,
             accession_number,
             copy_number,
+            parent_book_id,
             number_of_copies,
             borrow_duration_days,
             is_library_use_only,
@@ -1464,10 +1489,7 @@ async function resolveBorrowableCopySelection(
   }
 
   const source = sourceResult.rows[0];
-  const normalizedTitle = normalizeBorrowBookGroupValue(source.title);
-  const normalizedAuthor = normalizeBorrowBookGroupValue(source.author);
-  const normalizedCallNumber = normalizeBorrowBookGroupValue(source.call_number);
-  const normalizedIsbn = normalizeBorrowBookGroupValue(source.isbn);
+  const groupRootId = getBorrowableCopyGroupRootId(source);
 
   const groupedRowsResult = await client.query<BorrowableCopySelectionRow>(
     `SELECT b.id,
@@ -1477,6 +1499,7 @@ async function resolveBorrowableCopySelection(
             b.isbn,
             b.accession_number,
             b.copy_number,
+            b.parent_book_id,
             b.number_of_copies,
             b.borrow_duration_days,
             b.is_library_use_only,
@@ -1489,12 +1512,9 @@ async function resolveBorrowableCopySelection(
            FROM borrow_records br
           GROUP BY br.book_id
        ) stats ON stats.book_id = b.id
-      WHERE lower(trim(coalesce(b.title, ''))) = $1
-        AND lower(trim(coalesce(b.author, ''))) = $2
-        AND lower(trim(coalesce(b.call_number, ''))) = $3
-        AND lower(trim(coalesce(b.isbn, ''))) = $4
+      WHERE b.id = $1 OR b.parent_book_id = $1
       FOR UPDATE OF b`,
-    [normalizedTitle, normalizedAuthor, normalizedCallNumber, normalizedIsbn]
+    [groupRootId]
   );
 
   const rows = groupedRowsResult.rows.length
