@@ -3013,6 +3013,13 @@ router.post("/self", requireAuth, async (req, res, next) => {
   const bid = Number(bookId);
   const qty = parseBorrowQuantity(req.body || {});
 
+  if (!Number.isFinite(userId) || userId <= 0) {
+    return res.status(401).json({
+      ok: false,
+      message: "Unauthorized: invalid session user.",
+    });
+  }
+
   if (!bid) {
     return res.status(400).json({ ok: false, message: "bookId is required." });
   }
@@ -3099,16 +3106,21 @@ router.post("/self", requireAuth, async (req, res, next) => {
       });
     }
 
-    const today = new Date();
-    const borrowDays = resolveBorrowDurationDays(
-      effectiveRole,
-      borrowableSelection.source.borrow_duration_days
+    const borrowDays = Math.max(
+      1,
+      resolveBorrowDurationDays(
+        effectiveRole,
+        borrowableSelection.source.borrow_duration_days
+      )
     );
-
-    const due = new Date(today.getTime() + borrowDays * DAY_MS);
-
-    const borrowDateStr = today.toISOString().slice(0, 10);
-    const dueDateStr = due.toISOString().slice(0, 10);
+    const borrowDateStr = getDateOnlyInTimeZone();
+    const borrowDateUtcMs = dateOnlyToUtcMs(borrowDateStr);
+    const dueDateStr = Number.isNaN(borrowDateUtcMs)
+      ? getDateOnlyInTimeZone(new Date(Date.now() + borrowDays * DAY_MS))
+      : getDateOnlyInTimeZone(
+          new Date(borrowDateUtcMs + borrowDays * DAY_MS),
+          "UTC"
+        );
 
     const ins = await client.query<{ id: string }>(
       `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
