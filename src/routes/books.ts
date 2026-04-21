@@ -329,6 +329,15 @@ function buildBookGroupKeyFromRow(row: Pick<BookRow, "title" | "author" | "call_
 function compareBookGroupOrder(a: BookRow, b: BookRow) {
   const createdAtDiff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
   if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) return createdAtDiff;
+  const aCopyNumber =
+    typeof a.copy_number === "number" && Number.isFinite(a.copy_number)
+      ? a.copy_number
+      : Number.MAX_SAFE_INTEGER;
+  const bCopyNumber =
+    typeof b.copy_number === "number" && Number.isFinite(b.copy_number)
+      ? b.copy_number
+      : Number.MAX_SAFE_INTEGER;
+  if (aCopyNumber !== bCopyNumber) return aCopyNumber - bCopyNumber;
   const aId = Number(a.id);
   const bId = Number(b.id);
   if (Number.isFinite(aId) && Number.isFinite(bId) && aId !== bId) return aId - bId;

@@ -1511,7 +1511,9 @@ function selectBorrowableBookIdsInCycle(
   const target = Math.max(0, Math.floor(Number(quantity) || 0));
   if (target <= 0 || rows.length === 0) return [];
 
-  const queue = rows
+  const orderedRows = rows
+    .slice()
+    .sort(compareBorrowableCopySelectionRows)
     .map((row) => ({
       bookId: row.id,
       remaining: getRemainingUnitsForBorrowableCopyRow(row),
@@ -1520,14 +1522,14 @@ function selectBorrowableBookIdsInCycle(
 
   const selected: number[] = [];
 
-  while (selected.length < target && queue.some((row) => row.remaining > 0)) {
-    for (const row of queue) {
-      if (row.remaining <= 0) continue;
+  for (const row of orderedRows) {
+    while (row.remaining > 0 && selected.length < target) {
       selected.push(row.bookId);
       row.remaining -= 1;
-      if (selected.length >= target) {
-        break;
-      }
+    }
+
+    if (selected.length >= target) {
+      break;
     }
   }
 
