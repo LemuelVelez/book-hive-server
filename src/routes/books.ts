@@ -540,31 +540,39 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
     const groupedRows = await findGroupedBookRows(client, source);
     const sourceIdNumber = getBookNumericId(source.id) ?? bookId;
     const groupRootId = getBookGroupRootId(source) ?? sourceIdNumber;
+    const originalBookResult =
+      groupRootId === sourceIdNumber
+        ? sourceBookResult
+        : await client.query<BookRow>(
+            `SELECT ${BOOK_RETURNING} FROM books WHERE id = $1 LIMIT 1`,
+            [groupRootId]
+          );
+    const original = originalBookResult.rows[0] ?? source;
     const body = req.body || {};
 
-    const title = trimToNull(body.title) ?? source.title;
-    const author = trimToNull(body.author) ?? source.author;
-    const subtitle = body.subtitle !== undefined ? trimToNull(body.subtitle) : source.subtitle ?? null;
-    const edition = body.edition !== undefined ? trimToNull(body.edition) : source.edition ?? null;
+    const title = original.title;
+    const author = original.author;
+    const subtitle = original.subtitle ?? null;
+    const edition = original.edition ?? null;
     const accessionNumber = trimToNull(body.accessionNumber);
-    const isbn = body.isbn !== undefined ? trimToNull(body.isbn) : source.isbn ?? null;
-    const issn = body.issn !== undefined ? trimToNull(body.issn) : source.issn ?? null;
+    const isbn = original.isbn ?? null;
+    const issn = original.issn ?? null;
     const classification = resolveClassificationPayload({
-      subjects: body.subjects !== undefined ? body.subjects : source.subjects,
-      genre: body.genre !== undefined ? body.genre : source.genre,
-      category: body.category !== undefined ? body.category : source.category,
+      subjects: original.subjects,
+      genre: original.genre,
+      category: original.category,
     });
-    const placeOfPublication = body.placeOfPublication !== undefined ? trimToNull(body.placeOfPublication) : source.place_of_publication ?? null;
-    const publisher = body.publisher !== undefined ? trimToNull(body.publisher) : source.publisher ?? null;
+    const placeOfPublication = original.place_of_publication ?? null;
+    const publisher = original.publisher ?? null;
 
-    const publicationYearRaw = body.publicationYear !== undefined ? Number(body.publicationYear) : source.publication_year;
+    const publicationYearRaw = original.publication_year;
     if (!Number.isFinite(publicationYearRaw) || publicationYearRaw < 1000 || publicationYearRaw > 9999) {
       await client.query("ROLLBACK");
       return res.status(400).json({ ok: false, message: "publicationYear must be a valid 4-digit year." });
     }
     const publicationYear = Math.floor(publicationYearRaw);
 
-    const copyrightSource = body.copyrightYear !== undefined ? body.copyrightYear : source.copyright_year;
+    const copyrightSource = original.copyright_year;
     const copyrightYear = copyrightSource === null || copyrightSource === undefined || String(copyrightSource).trim() === ""
       ? publicationYear
       : Math.floor(Number(copyrightSource));
@@ -573,7 +581,7 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
       return res.status(400).json({ ok: false, message: "copyrightYear must be a valid 4-digit year." });
     }
 
-    const pagesSource = body.pages !== undefined ? body.pages : source.pages;
+    const pagesSource = original.pages;
     const pages = pagesSource === null || pagesSource === undefined || String(pagesSource).trim() === ""
       ? null
       : Math.floor(Number(pagesSource));
@@ -582,13 +590,13 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
       return res.status(400).json({ ok: false, message: "pages must be a positive number." });
     }
 
-    const otherDetails = body.otherDetails !== undefined ? trimToNull(body.otherDetails) : source.physical_details ?? null;
-    const dimensions = body.dimensions !== undefined ? trimToNull(body.dimensions) : source.dimensions ?? null;
-    const notes = body.notes !== undefined ? trimToNull(body.notes) : source.notes ?? null;
-    const series = body.series !== undefined ? trimToNull(body.series) : source.series ?? null;
-    const addedEntries = body.addedEntries !== undefined ? trimToNull(body.addedEntries) : source.added_entries ?? null;
+    const otherDetails = original.physical_details ?? null;
+    const dimensions = original.dimensions ?? null;
+    const notes = original.notes ?? null;
+    const series = original.series ?? null;
+    const addedEntries = original.added_entries ?? null;
     const barcode = trimToNull(body.barcode);
-    const callNumber = body.callNumber !== undefined ? trimToNull(body.callNumber) : source.call_number ?? null;
+    const callNumber = original.call_number ?? null;
     const maxCopyNumber = groupedRows.reduce((max, row) => {
       const current = typeof row.copy_number === "number" && Number.isFinite(row.copy_number) ? row.copy_number : 0;
       return Math.max(max, current);
@@ -600,10 +608,14 @@ router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), asy
       return res.status(400).json({ ok: false, message: "copyNumber must be a positive number." });
     }
     const volumeNumber = body.volumeNumber !== undefined ? trimToNull(body.volumeNumber) : source.volume_number ?? null;
-    const libraryArea = body.libraryArea !== undefined ? normalizeLibraryArea(body.libraryArea) : source.library_area ?? null;
-    const isLibraryUseOnly = resolveLibraryUseOnlyFlag(body.isLibraryUseOnly, libraryArea, Boolean(source.is_library_use_only));
+    const libraryArea = body.libraryArea !== undefined ? normalizeLibraryArea(body.libraryArea) : source.library_area ?? original.library_area ?? null;
+    const isLibraryUseOnly = resolveLibraryUseOnlyFlag(
+      body.isLibraryUseOnly,
+      libraryArea,
+      Boolean(source.is_library_use_only || original.is_library_use_only)
+    );
     const available = parseOptionalBoolean(body.available) ?? true;
-    const borrowDurationRaw = body.borrowDurationDays !== undefined ? Number(body.borrowDurationDays) : source.borrow_duration_days ?? 7;
+    const borrowDurationRaw = body.borrowDurationDays !== undefined ? Number(body.borrowDurationDays) : source.borrow_duration_days ?? original.borrow_duration_days ?? 7;
     if (!Number.isFinite(borrowDurationRaw) || borrowDurationRaw <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({ ok: false, message: "borrowDurationDays must be a positive number of days." });
