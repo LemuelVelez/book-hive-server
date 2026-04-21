@@ -1121,9 +1121,9 @@ async function countActiveBorrowRecordsForUser(
 ): Promise<number> {
   const result = await client.query<{ active_count: number }>(
     `SELECT COUNT(*)::int AS active_count
-       FROM borrow_records
-      WHERE user_id = $1
-        AND ${getActiveBorrowRecordSql()}`,
+       FROM borrow_records br
+      WHERE br.user_id = $1
+        AND ${getActiveBorrowRecordSql('br')}`,
     [userId]
   );
 
@@ -1283,9 +1283,9 @@ async function recomputeAndUpdateBookAvailability(
 
   const activeRes = await client.query<{ active_count: number }>(
     `SELECT COUNT(*)::int AS active_count
-       FROM borrow_records
-       WHERE book_id = $1
-         AND ${getActiveBorrowRecordSql()}`,
+       FROM borrow_records br
+       WHERE br.book_id = $1
+         AND ${getActiveBorrowRecordSql('br')}`,
     [bookId]
   );
 
@@ -1428,10 +1428,10 @@ async function resolveBorrowableCopySelection(
             COALESCE(stats.active_count, 0)::int AS active_count
        FROM books b
        LEFT JOIN (
-         SELECT book_id,
-                COUNT(*) FILTER (WHERE ${getActiveBorrowRecordSql()})::int AS active_count
-           FROM borrow_records
-          GROUP BY book_id
+         SELECT br.book_id,
+                COUNT(*) FILTER (WHERE ${getActiveBorrowRecordSql('br')})::int AS active_count
+           FROM borrow_records br
+          GROUP BY br.book_id
        ) stats ON stats.book_id = b.id
       WHERE lower(trim(coalesce(b.title, ''))) = $1
         AND lower(trim(coalesce(b.author, ''))) = $2
