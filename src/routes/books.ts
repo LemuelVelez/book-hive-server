@@ -524,6 +524,222 @@ router.get("/", async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+router.post("/", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
+  const client = await dbPool.connect();
+  try {
+    const body = req.body || {};
+    await client.query("BEGIN");
+
+    const title = trimToNull(body.title);
+    const subtitle = trimToNull(body.subtitle);
+    const author = trimToNull(body.author);
+    const edition = trimToNull(body.edition);
+    const accessionNumber = trimToNull(body.accessionNumber);
+    const isbn = trimToNull(body.isbn);
+    const issn = trimToNull(body.issn);
+    const classification = resolveClassificationPayload({
+      subjects: body.subjects,
+      genre: body.genre,
+      category: body.category,
+    });
+    const placeOfPublication = trimToNull(body.placeOfPublication);
+    const publisher = trimToNull(body.publisher);
+
+    const publicationYearRaw = Number(body.publicationYear);
+    if (!Number.isFinite(publicationYearRaw) || publicationYearRaw < 1000 || publicationYearRaw > 9999) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "publicationYear must be a valid 4-digit year." });
+    }
+    const publicationYear = Math.floor(publicationYearRaw);
+
+    const copyrightInput = body.copyrightYear;
+    const copyrightYear = copyrightInput === undefined || copyrightInput === null || String(copyrightInput).trim() === ""
+      ? publicationYear
+      : Math.floor(Number(copyrightInput));
+    if (!Number.isFinite(copyrightYear) || copyrightYear < 1000 || copyrightYear > 9999) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "copyrightYear must be a valid 4-digit year." });
+    }
+
+    const pagesInput = body.pages;
+    let pages: number | null = null;
+    if (pagesInput !== undefined && pagesInput !== null && String(pagesInput).trim() !== "") {
+      const pagesNumeric = Number(pagesInput);
+      if (Number.isFinite(pagesNumeric)) {
+        pages = Math.floor(pagesNumeric);
+        if (pages <= 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ ok: false, message: "pages must be a positive number." });
+        }
+      } else {
+        pages = null;
+      }
+    }
+
+    const otherDetails = trimToNull(body.otherDetails);
+    const dimensions = trimToNull(body.dimensions);
+    const notes = trimToNull(body.notes);
+    const series = trimToNull(body.series);
+    const addedEntries = trimToNull(body.addedEntries);
+    const barcode = trimToNull(body.barcode);
+    const callNumber = trimToNull(body.callNumber);
+
+    const copyNumberRaw = body.copyNumber === undefined ? 1 : Number(body.copyNumber);
+    const copyNumber = Math.floor(copyNumberRaw);
+    if (!Number.isFinite(copyNumber) || copyNumber <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "copyNumber must be a positive number." });
+    }
+
+    const volumeNumber = trimToNull(body.volumeNumber);
+    const libraryAreaRaw = body.libraryArea;
+    const libraryArea = normalizeLibraryArea(libraryAreaRaw);
+    if (libraryAreaRaw !== undefined && libraryAreaRaw !== null && trimToNull(libraryAreaRaw) && !libraryArea) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "libraryArea is invalid." });
+    }
+
+    const numberOfCopiesRaw = body.numberOfCopies === undefined ? 1 : Number(body.numberOfCopies);
+    const numberOfCopies = Math.floor(numberOfCopiesRaw);
+    if (!Number.isFinite(numberOfCopies) || numberOfCopies <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "numberOfCopies must be a positive number." });
+    }
+
+    const isLibraryUseOnly = resolveLibraryUseOnlyFlag(body.isLibraryUseOnly, libraryArea, false);
+    const available = parseOptionalBoolean(body.available) ?? true;
+
+    const borrowDurationRaw = body.borrowDurationDays === undefined ? 7 : Number(body.borrowDurationDays);
+    if (!Number.isFinite(borrowDurationRaw) || borrowDurationRaw <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "borrowDurationDays must be a positive number of days." });
+    }
+    const borrowDurationDays = Math.floor(borrowDurationRaw);
+
+    if (!title) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "title is required." });
+    }
+    if (!author) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "author is required." });
+    }
+    if (!accessionNumber) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "accessionNumber is required." });
+    }
+    if (!barcode) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "barcode is required." });
+    }
+    if (!callNumber) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "callNumber is required." });
+    }
+    if (!placeOfPublication) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "placeOfPublication is required." });
+    }
+    if (!publisher) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, message: "publisher is required." });
+    }
+
+    let insertedRow: BookRow;
+    try {
+      const inserted = await client.query<BookRow>(
+        `INSERT INTO books (
+          title, subtitle, author, statement_of_responsibility, edition, isbn, issn,
+          accession_number, subjects, genre, category, place_of_publication, publisher,
+          publication_year, copyright_year, pages, physical_details, dimensions, notes,
+          series, added_entries, barcode, call_number, copy_number, volume_number,
+          library_area, parent_book_id, number_of_copies, available, borrow_duration_days,
+          is_library_use_only
+        ) VALUES (
+          $1, $2, $3, NULL, $4, $5, $6,
+          $7, $8, $9, $10, $11, $12,
+          $13, $14, $15, $16, $17, $18,
+          $19, $20, $21, $22, $23, $24,
+          $25, NULL, $26, $27, $28,
+          $29
+        ) RETURNING ${BOOK_RETURNING}`,
+        [
+          title,
+          subtitle,
+          author,
+          edition,
+          isbn,
+          issn,
+          accessionNumber,
+          classification?.subjects ?? null,
+          classification?.genre ?? null,
+          classification?.category ?? null,
+          placeOfPublication,
+          publisher,
+          publicationYear,
+          copyrightYear,
+          pages,
+          otherDetails,
+          dimensions,
+          notes,
+          series,
+          addedEntries,
+          barcode,
+          callNumber,
+          copyNumber,
+          volumeNumber,
+          libraryArea,
+          numberOfCopies,
+          available,
+          borrowDurationDays,
+          isLibraryUseOnly,
+        ]
+      );
+      insertedRow = inserted.rows[0];
+    } catch (err: any) {
+      if (err && err.code === "23505") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ ok: false, message: "A book with the same accession number, barcode, or another unique identifier already exists." });
+      }
+      throw err;
+    }
+
+    const insertedBookId = getBookNumericId(insertedRow.id);
+    const createdResult =
+      insertedBookId === null
+        ? null
+        : await client.query<BookRowWithCounts>(
+            `SELECT ${BOOK_RETURNING_B}, COALESCE(stats.active_count, 0)::int AS active_count, COALESCE(stats.total_borrow_count, 0)::int AS total_borrow_count, GREATEST(b.number_of_copies - COALESCE(stats.active_count, 0), 0)::int AS available_copies, (COALESCE(stats.active_count, 0) < b.number_of_copies) AS computed_available
+             FROM books b
+             LEFT JOIN (
+               SELECT book_id, COUNT(*) FILTER (WHERE ${ACTIVE_BORROW_COUNT_SQL})::int AS active_count, COUNT(*)::int AS total_borrow_count
+               FROM borrow_records
+               GROUP BY book_id
+             ) stats ON stats.book_id = b.id
+             WHERE b.id = $1
+             LIMIT 1`,
+            [insertedBookId]
+          );
+
+    await client.query("COMMIT");
+    res.status(201).json({
+      ok: true,
+      book:
+        createdResult && createdResult.rowCount
+          ? toDTO(createdResult.rows[0])
+          : toDTO(insertedRow),
+    });
+  } catch (err: any) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 router.post("/:id/copies", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
   const client = await dbPool.connect();
   try {
