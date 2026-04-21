@@ -1441,18 +1441,23 @@ function compareBorrowableCopySelectionRows(
 }
 
 function getRemainingUnitsForBorrowableCopyRow(
-  row: BorrowableCopySelectionRow
+  row: BorrowableCopySelectionRow,
+  options?: { forceSingleCopyUnit?: boolean }
 ): number {
-  const totalUnits =
-    typeof row.number_of_copies === "number" &&
-    Number.isFinite(row.number_of_copies) &&
-    row.number_of_copies > 0
+  const totalUnits = options?.forceSingleCopyUnit
+    ? 1
+    : typeof row.number_of_copies === "number" &&
+        Number.isFinite(row.number_of_copies) &&
+        row.number_of_copies > 0
       ? Math.floor(row.number_of_copies)
       : 1;
-  const activeCount =
+  const rawActiveCount =
     typeof row.active_count === "number" && Number.isFinite(row.active_count)
       ? row.active_count
       : 0;
+  const activeCount = options?.forceSingleCopyUnit
+    ? Math.min(rawActiveCount, totalUnits)
+    : rawActiveCount;
 
   return Math.max(0, totalUnits - activeCount);
 }
@@ -1531,12 +1536,15 @@ function selectBorrowableBookIdsInCycle(
   const target = Math.max(0, Math.floor(Number(quantity) || 0));
   if (target <= 0 || rows.length === 0) return [];
 
+  const forceSingleCopyUnit = rows.length > 1;
   const orderedRows = rows
     .slice()
     .sort(compareBorrowableCopySelectionRows)
     .map((row) => ({
       bookId: row.id,
-      remaining: getRemainingUnitsForBorrowableCopyRow(row),
+      remaining: getRemainingUnitsForBorrowableCopyRow(row, {
+        forceSingleCopyUnit,
+      }),
     }))
     .filter((row) => row.remaining > 0);
 
@@ -3029,7 +3037,11 @@ router.post(
         qty
       );
       const remaining = borrowableSelection.rows.reduce(
-        (sum, row) => sum + getRemainingUnitsForBorrowableCopyRow(row),
+        (sum, row) =>
+          sum +
+          getRemainingUnitsForBorrowableCopyRow(row, {
+            forceSingleCopyUnit: borrowableSelection.rows.length > 1,
+          }),
         0
       );
 
@@ -3178,7 +3190,11 @@ router.post("/self", requireAuth, async (req, res, next) => {
       qty
     );
     const remaining = borrowableSelection.rows.reduce(
-      (sum, row) => sum + getRemainingUnitsForBorrowableCopyRow(row),
+      (sum, row) =>
+        sum +
+        getRemainingUnitsForBorrowableCopyRow(row, {
+          forceSingleCopyUnit: borrowableSelection.rows.length > 1,
+        }),
       0
     );
 

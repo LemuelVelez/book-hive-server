@@ -252,16 +252,33 @@ async function computeCopyStateForBook(client: DBClient, bookId: number, copiesT
   return { totalCopies: copies, activeCount: active, totalBorrowCount, remainingCopies: remaining, available: remaining > 0 };
 }
 
-function buildBookDTO(row: BookRow | BookRowWithCounts) {
-  const totalCopies = typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies) ? Math.max(1, Math.floor(row.number_of_copies)) : 1;
+function buildBookDTO(
+  row: BookRow | BookRowWithCounts,
+  options?: { forceSingleCopyUnit?: boolean }
+) {
+  const forceSingleCopyUnit = Boolean(options?.forceSingleCopyUnit);
+  const totalCopies = forceSingleCopyUnit
+    ? 1
+    : typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
+      ? Math.max(1, Math.floor(row.number_of_copies))
+      : 1;
   const activeCountRaw = (row as BookRowWithCounts).active_count;
   const totalBorrowCountRaw = (row as BookRowWithCounts).total_borrow_count;
   const availableCopiesRaw = (row as BookRowWithCounts).available_copies;
   const computedAvailableRaw = (row as BookRowWithCounts).computed_available;
-  const activeCount = typeof activeCountRaw === "number" && Number.isFinite(activeCountRaw) ? activeCountRaw : 0;
+  const rawActiveCount = typeof activeCountRaw === "number" && Number.isFinite(activeCountRaw) ? activeCountRaw : 0;
+  const activeCount = forceSingleCopyUnit ? Math.min(rawActiveCount, totalCopies) : rawActiveCount;
   const totalBorrowCount = typeof totalBorrowCountRaw === "number" && Number.isFinite(totalBorrowCountRaw) ? totalBorrowCountRaw : 0;
-  const remainingCopies = typeof availableCopiesRaw === "number" && Number.isFinite(availableCopiesRaw) ? availableCopiesRaw : Math.max(0, totalCopies - activeCount);
-  const available = typeof computedAvailableRaw === "boolean" ? computedAvailableRaw : remainingCopies > 0;
+  const remainingCopies = forceSingleCopyUnit
+    ? Math.max(0, totalCopies - activeCount)
+    : typeof availableCopiesRaw === "number" && Number.isFinite(availableCopiesRaw)
+      ? availableCopiesRaw
+      : Math.max(0, totalCopies - activeCount);
+  const available = forceSingleCopyUnit
+    ? remainingCopies > 0
+    : typeof computedAvailableRaw === "boolean"
+      ? computedAvailableRaw
+      : remainingCopies > 0;
   const isLibraryUseOnly = Boolean(row.is_library_use_only);
   const canBorrow = !isLibraryUseOnly;
   return {
@@ -311,8 +328,11 @@ function toDTO(
   row: BookRow | BookRowWithCounts | GroupedBookRow,
   options?: { includeCopies?: boolean }
 ) {
-  const base = buildBookDTO(row);
   const groupedRows = (row as GroupedBookRow).grouped_rows;
+  const hasExplicitCopyRows = Array.isArray(groupedRows) && groupedRows.length > 1;
+  const base = buildBookDTO(row, {
+    forceSingleCopyUnit: false,
+  });
   if (!Array.isArray(groupedRows) || groupedRows.length === 0) {
     return base;
   }
@@ -326,7 +346,11 @@ function toDTO(
     copies: groupedRows
       .slice()
       .sort(compareBookGroupOrder)
-      .map((item) => buildBookDTO(item)),
+      .map((item) =>
+        buildBookDTO(item, {
+          forceSingleCopyUnit: hasExplicitCopyRows,
+        })
+      ),
   };
 }
 
@@ -402,19 +426,24 @@ function aggregateBookGroupRows(rows: BookRowWithCounts[]): GroupedBookRow {
   const sortedRows = [...rows].sort(compareBookGroupOrder);
   const representative = chooseBookGroupRepresentative(sortedRows);
   const aggregate = { ...representative, grouped_rows: sortedRows } as GroupedBookRow;
+  const hasExplicitCopyRows = sortedRows.length > 1;
   let totalCopies = 0;
   let activeCount = 0;
   let totalBorrowCount = 0;
 
   for (const row of sortedRows) {
-    const rowTotalCopies =
-      typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
+    const rowTotalCopies = hasExplicitCopyRows
+      ? 1
+      : typeof row.number_of_copies === "number" && Number.isFinite(row.number_of_copies)
         ? Math.max(1, Math.floor(row.number_of_copies))
         : 1;
-    const rowActiveCount =
+    const rawRowActiveCount =
       typeof row.active_count === "number" && Number.isFinite(row.active_count)
         ? row.active_count
         : 0;
+    const rowActiveCount = hasExplicitCopyRows
+      ? Math.min(rawRowActiveCount, rowTotalCopies)
+      : rawRowActiveCount;
     const rowTotalBorrowCount =
       typeof row.total_borrow_count === "number" && Number.isFinite(row.total_borrow_count)
         ? row.total_borrow_count
@@ -734,6 +763,15 @@ router.patch("/:id", requireAuth, requireRole(["librarian", "admin"]), async (re
     if (copyNumber !== undefined) { const copyNum = copyNumber ? Math.floor(Number(copyNumber)) : null; if (copyNum !== null && (!Number.isFinite(copyNum) || copyNum <= 0)) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, message: "copyNumber must be a positive number." }); } directUpdates.push(`copy_number = $${directIdx++}`); directValues.push(copyNum); }
     if (volumeNumber !== undefined) { sharedUpdates.push(`volume_number = $${sharedIdx++}`); sharedValues.push(volumeNumber ? String(volumeNumber).trim() : null); }
     if (libraryArea !== undefined || isLibraryUseOnly !== undefined) { const resolvedLibraryArea = libraryArea !== undefined ? normalizeLibraryArea(libraryArea) : currentBook.library_area ?? null; if (libraryArea !== undefined) { sharedUpdates.push(`library_area = $${sharedIdx++}`); sharedValues.push(resolvedLibraryArea); } const resolvedLibraryUseOnly = resolveLibraryUseOnlyFlag(isLibraryUseOnly, resolvedLibraryArea, Boolean(currentBook.is_library_use_only)); sharedUpdates.push(`is_library_use_only = $${sharedIdx++}`); sharedValues.push(resolvedLibraryUseOnly); }
+    const hasExplicitCopyRows = groupedRows.length > 1;
+    if ((numberOfCopies !== undefined || copiesToAdd !== undefined) && hasExplicitCopyRows) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        message:
+          "This title is managed by individual copy records. Use Add Copy so each copy keeps its own accession number and barcode.",
+      });
+    }
     if (numberOfCopies !== undefined) { const copiesTotal = Math.floor(Number(numberOfCopies)); if (!Number.isFinite(copiesTotal) || copiesTotal <= 0) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, message: "numberOfCopies must be a positive number." }); } directUpdates.push(`number_of_copies = $${directIdx++}`); directValues.push(copiesTotal); shouldRefreshAvailability = true; }
     if (copiesToAdd !== undefined) { const inc = Math.floor(Number(copiesToAdd)); if (!Number.isFinite(inc) || inc <= 0) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, message: "copiesToAdd must be a positive number." }); } directUpdates.push(`number_of_copies = number_of_copies + $${directIdx++}`); directValues.push(inc); shouldRefreshAvailability = true; }
     if (borrowDurationDays !== undefined) { const parsed = Number(borrowDurationDays); if (!Number.isFinite(parsed) || parsed <= 0) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, message: "borrowDurationDays must be a positive number of days." }); } sharedUpdates.push(`borrow_duration_days = $${sharedIdx++}`); sharedValues.push(Math.floor(parsed)); }
