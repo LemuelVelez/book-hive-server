@@ -118,6 +118,7 @@ type BorrowRowJoined = {
   return_requested_by: number | null;
   return_request_note: string | null;
   return_requested_by_name: string | null;
+  borrow_updated_at: string | null;
 
   // joined fields
   email: string | null;
@@ -181,6 +182,59 @@ const BORROW_EMAIL_NOTIFICATION_DETAIL_LIMIT = Math.max(
   Math.min(20, Number(process.env.BORROW_NOTIFICATION_EMAIL_DETAIL_LIMIT ?? 10))
 );
 const PENDING_PICKUP_EXPIRY_HOURS = Math.max(1, Number(process.env.PENDING_PICKUP_EXPIRY_HOURS ?? 24));
+const PENDING_PICKUP_EXPIRY_MS = PENDING_PICKUP_EXPIRY_HOURS * HOUR_MS;
+
+function getPendingPickupBaseDateTime(value: string | null | undefined) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const utcMs = dateOnlyToUtcMs(raw);
+    if (!Number.isNaN(utcMs)) {
+      return new Date(utcMs);
+    }
+  }
+
+  return null;
+}
+
+function getPendingPickupReferenceDateTime(row: {
+  borrow_updated_at?: string | null;
+  borrow_date?: string | null;
+}) {
+  return (
+    getPendingPickupBaseDateTime(row.borrow_updated_at) ??
+    getPendingPickupBaseDateTime(row.borrow_date)
+  );
+}
+
+function getPendingPickupExpiryDateTime(row: {
+  status?: string | null;
+  borrow_updated_at?: string | null;
+  borrow_date?: string | null;
+}) {
+  const status = String(row.status ?? "").trim().toLowerCase();
+  if (status !== "pending_pickup") return null;
+
+  const referenceDate = getPendingPickupReferenceDateTime(row);
+  if (!referenceDate) return null;
+
+  return new Date(referenceDate.getTime() + PENDING_PICKUP_EXPIRY_MS);
+}
+
+function isPendingPickupReservationExpired(
+  row: { status?: string | null; borrow_updated_at?: string | null; borrow_date?: string | null },
+  now = Date.now()
+) {
+  const expiryDate = getPendingPickupExpiryDateTime(row);
+  if (!expiryDate) return false;
+  return expiryDate.getTime() <= now;
+}
 
 function getPendingPickupActiveSql(alias = "br") {
   return `(${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) >= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour'))`;
@@ -1179,6 +1233,7 @@ async function fetchBorrowRecordJoined(
             br.return_requested_by,
             br.return_request_note,
             rq.full_name AS return_requested_by_name,
+            br.updated_at AS borrow_updated_at,
 
             u.email,
             u.student_id,
@@ -1232,6 +1287,7 @@ async function fetchBorrowRecordsJoined(
             br.return_requested_by,
             br.return_request_note,
             rq.full_name AS return_requested_by_name,
+            br.updated_at AS borrow_updated_at,
 
             u.email,
             u.student_id,
@@ -1587,6 +1643,10 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
         : null,
     returnRequestedByName: row.return_requested_by_name ?? null,
     returnRequestNote: row.return_request_note ?? null,
+
+    reservationWindowHours: PENDING_PICKUP_EXPIRY_HOURS,
+    reservationExpiresAt: getPendingPickupExpiryDateTime(row)?.toISOString() ?? null,
+    reservationExpired: isPendingPickupReservationExpired(row),
   };
 }
 
@@ -1632,6 +1692,7 @@ router.get(
                 br.return_requested_by,
                 br.return_request_note,
                 rq.full_name AS return_requested_by_name,
+                br.updated_at AS borrow_updated_at,
 
                 u.email,
                 u.student_id,
@@ -1807,6 +1868,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
               br.return_requested_by,
               br.return_request_note,
               rq.full_name AS return_requested_by_name,
+              br.updated_at AS borrow_updated_at,
 
               u.email,
               u.student_id,
@@ -3412,13 +3474,16 @@ router.patch("/:id", requireAuth, async (req, res, next) => {
                    return_requested_by,
                    return_request_note,
                    NULL::text AS return_requested_by_name,
+                   updated_at AS borrow_updated_at,
 
                    NULL::text AS email,
                    NULL::text AS student_id,
                    NULL::text AS full_name,
                    NULL::text AS course,
                    NULL::text AS college,
-                   NULL::text AS title`,
+                   NULL::text AS title,
+                   NULL::text AS accession_number,
+                   NULL::int AS copy_number`,
       [...values, rid]
     );
 
