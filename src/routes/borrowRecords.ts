@@ -78,6 +78,8 @@ type BorrowNotificationEmailRow = {
   email: string | null;
   full_name: string | null;
   title: string | null;
+  accession_number?: string | null;
+  copy_number?: number | null;
 };
 
 type UserIdentityRow = UserRoleRow & {
@@ -124,6 +126,8 @@ type BorrowRowJoined = {
   course: string | null;
   college?: string | null;
   title: string | null;
+  accession_number: string | null;
+  copy_number: number | null;
 };
 
 /* ---------------- ✅ FIX TS2347: Typed DB wrappers ---------------- */
@@ -141,6 +145,21 @@ type DBClient = {
 
 type DBPool = {
   connect: () => Promise<DBClient>;
+};
+
+type BorrowableCopySelectionRow = {
+  id: number;
+  title: string;
+  author: string;
+  call_number: string | null;
+  isbn: string | null;
+  accession_number: string | null;
+  copy_number: number | null;
+  number_of_copies: number | null;
+  borrow_duration_days: number | null;
+  is_library_use_only: boolean | null;
+  created_at: string;
+  active_count: number;
 };
 
 // Cast untyped imports into typed wrappers (prevents TS2347)
@@ -652,12 +671,37 @@ function formatStaffNotificationEmailLine(
   return `• ${borrowerName} — ${title} (Borrow ID ${row.id} • ${label}${due}${note})`;
 }
 
+function formatBorrowRecordCopyLabel(row: {
+  copy_number?: number | null;
+  accession_number?: string | null;
+}) {
+  const parts: string[] = [];
+
+  if (typeof row.copy_number === "number" && Number.isFinite(row.copy_number)) {
+    parts.push(`Copy ${row.copy_number}`);
+  }
+
+  const accessionNumber = String(row.accession_number ?? "").trim();
+  if (accessionNumber) {
+    parts.push(`Accession ${accessionNumber}`);
+  }
+
+  return parts.join(" • ");
+}
+
 function getBorrowRecordTitle(row: {
   title?: string | null;
   id?: string | number | null;
+  copy_number?: number | null;
+  accession_number?: string | null;
 }) {
   const title = String(row.title ?? "").trim();
-  if (title) return title;
+  const copyLabel = formatBorrowRecordCopyLabel(row);
+
+  if (title) {
+    return copyLabel ? `${title} (${copyLabel})` : title;
+  }
+
   return `Borrow record #${row.id ?? "—"}`;
 }
 
@@ -1140,7 +1184,10 @@ async function fetchBorrowRecordJoined(
             u.student_id,
             u.full_name,
             u.course,
-            b.title
+            b.title,
+            b.accession_number,
+            b.copy_number
+
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
      LEFT JOIN users rq ON rq.id = br.return_requested_by
@@ -1190,7 +1237,10 @@ async function fetchBorrowRecordsJoined(
             u.student_id,
             u.full_name,
             u.course,
-            b.title
+            b.title,
+            b.accession_number,
+            b.copy_number
+
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
      LEFT JOIN users rq ON rq.id = br.return_requested_by
@@ -1281,6 +1331,168 @@ function parseBorrowQuantity(body: any): number {
   return Math.min(q, maxAllowed);
 }
 
+function normalizeBorrowBookGroupValue(raw: unknown) {
+  return String(raw ?? "").trim().toLowerCase();
+}
+
+function compareBorrowableCopySelectionRows(
+  a: BorrowableCopySelectionRow,
+  b: BorrowableCopySelectionRow
+) {
+  const createdAtDiff =
+    new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+  if (Number.isFinite(createdAtDiff) && createdAtDiff !== 0) {
+    return createdAtDiff;
+  }
+
+  const aCopyNumber =
+    typeof a.copy_number === "number" && Number.isFinite(a.copy_number)
+      ? a.copy_number
+      : Number.MAX_SAFE_INTEGER;
+  const bCopyNumber =
+    typeof b.copy_number === "number" && Number.isFinite(b.copy_number)
+      ? b.copy_number
+      : Number.MAX_SAFE_INTEGER;
+  if (aCopyNumber !== bCopyNumber) {
+    return aCopyNumber - bCopyNumber;
+  }
+
+  return a.id - b.id;
+}
+
+function getRemainingUnitsForBorrowableCopyRow(
+  row: BorrowableCopySelectionRow
+): number {
+  const totalUnits =
+    typeof row.number_of_copies === "number" &&
+    Number.isFinite(row.number_of_copies) &&
+    row.number_of_copies > 0
+      ? Math.floor(row.number_of_copies)
+      : 1;
+  const activeCount =
+    typeof row.active_count === "number" && Number.isFinite(row.active_count)
+      ? row.active_count
+      : 0;
+
+  return Math.max(0, totalUnits - activeCount);
+}
+
+async function resolveBorrowableCopySelection(
+  client: DBClient,
+  bookId: number
+): Promise<{
+  source: BorrowableCopySelectionRow;
+  rows: BorrowableCopySelectionRow[];
+} | null> {
+  const sourceResult = await client.query<BorrowableCopySelectionRow>(
+    `SELECT id,
+            title,
+            author,
+            call_number,
+            isbn,
+            accession_number,
+            copy_number,
+            number_of_copies,
+            borrow_duration_days,
+            is_library_use_only,
+            created_at,
+            0::int AS active_count
+       FROM books
+       WHERE id = $1
+       FOR UPDATE`,
+    [bookId]
+  );
+
+  if (!sourceResult.rowCount) {
+    return null;
+  }
+
+  const source = sourceResult.rows[0];
+  const normalizedTitle = normalizeBorrowBookGroupValue(source.title);
+  const normalizedAuthor = normalizeBorrowBookGroupValue(source.author);
+  const normalizedCallNumber = normalizeBorrowBookGroupValue(source.call_number);
+  const normalizedIsbn = normalizeBorrowBookGroupValue(source.isbn);
+
+  const groupedRowsResult = await client.query<BorrowableCopySelectionRow>(
+    `SELECT b.id,
+            b.title,
+            b.author,
+            b.call_number,
+            b.isbn,
+            b.accession_number,
+            b.copy_number,
+            b.number_of_copies,
+            b.borrow_duration_days,
+            b.is_library_use_only,
+            b.created_at,
+            COALESCE(stats.active_count, 0)::int AS active_count
+       FROM books b
+       LEFT JOIN (
+         SELECT book_id,
+                COUNT(*) FILTER (WHERE ${getActiveBorrowRecordSql()})::int AS active_count
+           FROM borrow_records
+          GROUP BY book_id
+       ) stats ON stats.book_id = b.id
+      WHERE lower(trim(coalesce(b.title, ''))) = $1
+        AND lower(trim(coalesce(b.author, ''))) = $2
+        AND lower(trim(coalesce(b.call_number, ''))) = $3
+        AND lower(trim(coalesce(b.isbn, ''))) = $4
+      FOR UPDATE OF b`,
+    [normalizedTitle, normalizedAuthor, normalizedCallNumber, normalizedIsbn]
+  );
+
+  const rows = groupedRowsResult.rows.length
+    ? groupedRowsResult.rows.slice().sort(compareBorrowableCopySelectionRows)
+    : [source];
+
+  return { source, rows };
+}
+
+function selectBorrowableBookIdsInCycle(
+  rows: BorrowableCopySelectionRow[],
+  quantity: number
+): number[] {
+  const target = Math.max(0, Math.floor(Number(quantity) || 0));
+  if (target <= 0 || rows.length === 0) return [];
+
+  const queue = rows
+    .map((row) => ({
+      bookId: row.id,
+      remaining: getRemainingUnitsForBorrowableCopyRow(row),
+    }))
+    .filter((row) => row.remaining > 0);
+
+  const selected: number[] = [];
+
+  while (selected.length < target && queue.some((row) => row.remaining > 0)) {
+    for (const row of queue) {
+      if (row.remaining <= 0) continue;
+      selected.push(row.bookId);
+      row.remaining -= 1;
+      if (selected.length >= target) {
+        break;
+      }
+    }
+  }
+
+  return selected;
+}
+
+async function recomputeAndUpdateBookAvailabilityForBookIds(
+  client: DBClient,
+  bookIds: number[]
+): Promise<void> {
+  const uniqueBookIds = Array.from(
+    new Set(
+      bookIds.filter((value) => Number.isFinite(value) && value > 0)
+    )
+  );
+
+  for (const bookId of uniqueBookIds) {
+    await recomputeAndUpdateBookAvailability(client, bookId);
+  }
+}
+
 /**
  * Convert a DB row into the DTO the client expects.
  */
@@ -1319,6 +1531,11 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     college,
     bookId: String(row.book_id),
     bookTitle: row.title,
+    accessionNumber: row.accession_number,
+    copyNumber:
+      typeof row.copy_number === "number" && Number.isFinite(row.copy_number)
+        ? row.copy_number
+        : null,
     borrowDate: row.borrow_date,
     dueDate: row.due_date,
     returnDate: row.return_date,
@@ -1420,7 +1637,10 @@ router.get(
                 u.student_id,
                 u.full_name,
                 u.course,
-                b.title
+                b.title,
+                b.accession_number,
+                b.copy_number
+
          FROM borrow_records br
          LEFT JOIN users u ON u.id = br.user_id
          LEFT JOIN users rq ON rq.id = br.return_requested_by
@@ -1592,7 +1812,10 @@ router.get("/my", requireAuth, async (req, res, next) => {
               u.student_id,
               u.full_name,
               u.course,
-              b.title
+              b.title,
+              b.accession_number,
+              b.copy_number
+
        FROM borrow_records br
        LEFT JOIN users u ON u.id = br.user_id
        LEFT JOIN users rq ON rq.id = br.return_requested_by
@@ -2698,24 +2921,17 @@ router.post(
         });
       }
 
-      const b = await client.query<{
-        id: number;
-        number_of_copies: number | null;
-        is_library_use_only: boolean | null;
-      }>(
-        `SELECT id, number_of_copies, is_library_use_only
-           FROM books
-           WHERE id=$1
-           FOR UPDATE`,
-        [bid]
+      const borrowableSelection = await resolveBorrowableCopySelection(
+        client,
+        bid
       );
 
-      if (!b.rowCount) {
+      if (!borrowableSelection) {
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, message: "Book not found." });
       }
 
-      if (Boolean(b.rows[0].is_library_use_only)) {
+      if (Boolean(borrowableSelection.source.is_library_use_only)) {
         await client.query("ROLLBACK");
         return res.status(409).json({
           ok: false,
@@ -2724,30 +2940,16 @@ router.post(
         });
       }
 
-      const copies =
-        typeof b.rows[0].number_of_copies === "number" &&
-        Number.isFinite(b.rows[0].number_of_copies) &&
-        b.rows[0].number_of_copies! > 0
-          ? Math.floor(b.rows[0].number_of_copies!)
-          : 1;
-
-      const activeRes = await client.query<{ active_count: number }>(
-        `SELECT COUNT(*)::int AS active_count
-           FROM borrow_records
-           WHERE book_id = $1
-             AND ${getActiveBorrowRecordSql()}`,
-        [bid]
+      const selectedBookIds = selectBorrowableBookIdsInCycle(
+        borrowableSelection.rows,
+        qty
+      );
+      const remaining = borrowableSelection.rows.reduce(
+        (sum, row) => sum + getRemainingUnitsForBorrowableCopyRow(row),
+        0
       );
 
-      const active =
-        typeof activeRes.rows[0]?.active_count === "number" &&
-        Number.isFinite(activeRes.rows[0].active_count)
-          ? activeRes.rows[0].active_count
-          : 0;
-
-      const remaining = Math.max(0, copies - active);
-
-      if (qty > remaining) {
+      if (selectedBookIds.length < qty) {
         await client.query("ROLLBACK");
         return res.status(409).json({
           ok: false,
@@ -2757,13 +2959,20 @@ router.post(
 
       const ins = await client.query<{ id: string }>(
         `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
-         SELECT $1, $2, COALESCE($3::date, CURRENT_DATE), $4::date, 'borrowed'
-         FROM generate_series(1, $5::int)
+         SELECT $1,
+                selected_book_id,
+                COALESCE($2::date, CURRENT_DATE),
+                $3::date,
+                'borrowed'
+           FROM unnest($4::int[]) AS selection(selected_book_id)
          RETURNING id`,
-        [uid, bid, borrowDate || null, dueDate, qty]
+        [uid, borrowDate || null, dueDate, selectedBookIds]
       );
 
-      await recomputeAndUpdateBookAvailability(client, bid);
+      await recomputeAndUpdateBookAvailabilityForBookIds(
+        client,
+        selectedBookIds
+      );
 
       await client.query("COMMIT");
 
@@ -2854,25 +3063,17 @@ router.post("/self", requireAuth, async (req, res, next) => {
       });
     }
 
-    const b = await client.query<{
-      id: number;
-      borrow_duration_days: number | null;
-      number_of_copies: number | null;
-      is_library_use_only: boolean | null;
-    }>(
-      `SELECT id, borrow_duration_days, number_of_copies, is_library_use_only
-         FROM books
-         WHERE id = $1
-         FOR UPDATE`,
-      [bid]
+    const borrowableSelection = await resolveBorrowableCopySelection(
+      client,
+      bid
     );
 
-    if (!b.rowCount) {
+    if (!borrowableSelection) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, message: "Book not found." });
     }
 
-    if (Boolean(b.rows[0].is_library_use_only)) {
+    if (Boolean(borrowableSelection.source.is_library_use_only)) {
       await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
@@ -2881,30 +3082,16 @@ router.post("/self", requireAuth, async (req, res, next) => {
       });
     }
 
-    const copies =
-      typeof b.rows[0].number_of_copies === "number" &&
-      Number.isFinite(b.rows[0].number_of_copies) &&
-      b.rows[0].number_of_copies! > 0
-        ? Math.floor(b.rows[0].number_of_copies!)
-        : 1;
-
-    const activeRes = await client.query<{ active_count: number }>(
-      `SELECT COUNT(*)::int AS active_count
-         FROM borrow_records
-         WHERE book_id = $1
-           AND ${getActiveBorrowRecordSql()}`,
-      [bid]
+    const selectedBookIds = selectBorrowableBookIdsInCycle(
+      borrowableSelection.rows,
+      qty
+    );
+    const remaining = borrowableSelection.rows.reduce(
+      (sum, row) => sum + getRemainingUnitsForBorrowableCopyRow(row),
+      0
     );
 
-    const active =
-      typeof activeRes.rows[0]?.active_count === "number" &&
-      Number.isFinite(activeRes.rows[0].active_count)
-        ? activeRes.rows[0].active_count
-        : 0;
-
-    const remaining = Math.max(0, copies - active);
-
-    if (qty > remaining) {
+    if (selectedBookIds.length < qty) {
       await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
@@ -2915,7 +3102,7 @@ router.post("/self", requireAuth, async (req, res, next) => {
     const today = new Date();
     const borrowDays = resolveBorrowDurationDays(
       effectiveRole,
-      b.rows[0].borrow_duration_days
+      borrowableSelection.source.borrow_duration_days
     );
 
     const due = new Date(today.getTime() + borrowDays * DAY_MS);
@@ -2925,13 +3112,20 @@ router.post("/self", requireAuth, async (req, res, next) => {
 
     const ins = await client.query<{ id: string }>(
       `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
-         SELECT $1, $2, $3::date, $4::date, 'pending_pickup'
-         FROM generate_series(1, $5::int)
+         SELECT $1,
+                selected_book_id,
+                $2::date,
+                $3::date,
+                'pending_pickup'
+           FROM unnest($4::int[]) AS selection(selected_book_id)
          RETURNING id`,
-      [userId, bid, borrowDateStr, dueDateStr, qty]
+      [userId, borrowDateStr, dueDateStr, selectedBookIds]
     );
 
-    await recomputeAndUpdateBookAvailability(client, bid);
+    await recomputeAndUpdateBookAvailabilityForBookIds(
+      client,
+      selectedBookIds
+    );
 
     await client.query("COMMIT");
 
