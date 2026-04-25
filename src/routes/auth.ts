@@ -314,9 +314,7 @@ function readSession(
 }
 
 function isExemptFromApproval(role: Role) {
-  return (
-    role === "assistant_librarian" || role === "librarian" || role === "admin"
-  );
+  return role === "admin";
 }
 
 // --- Routes ---
@@ -344,6 +342,18 @@ router.get("/me", async (req, res, next) => {
 
     // keep whatever your DB says for account_type
     const accountType = normalizeRole(user.account_type);
+
+    const approved = Boolean(user.is_approved);
+    if (!isExemptFromApproval(role) && !approved) {
+      clearSessionCookie(res);
+      return res.status(403).json({
+        ok: false,
+        message:
+          role === "librarian" || role === "assistant_librarian"
+            ? "Your librarian account is pending admin approval. Please wait for an admin to approve your account before logging in."
+            : "Your account is pending approval. Please wait for approval to log in.",
+      });
+    }
 
     return res.json({
       ok: true,
@@ -420,7 +430,8 @@ router.post("/register", async (req, res, next) => {
       "admin",
       "other",
     ];
-    if (!allowed.includes(accountType as Role)) {
+    const normalizedAccountType = normalizeRole(accountType);
+    if (!allowed.includes(normalizedAccountType)) {
       return res
         .status(400)
         .json({ ok: false, message: "Invalid account type." });
@@ -464,7 +475,7 @@ router.post("/register", async (req, res, next) => {
       });
     }
 
-    if (accountType === "student") {
+    if (normalizedAccountType === "student") {
       if (!studentId || !course || !yearLevel) {
         return res
           .status(400)
@@ -487,7 +498,7 @@ router.post("/register", async (req, res, next) => {
     const hash = await bcrypt.hash(String(password), 10);
 
     // ✅ approval logic
-    const roleForApproval = accountType as Role;
+    const roleForApproval = normalizedAccountType;
     const approved = isExemptFromApproval(roleForApproval);
 
     const ins = await query<UserRow>(
@@ -501,7 +512,7 @@ router.post("/register", async (req, res, next) => {
           .trim()
           .toLowerCase(),
         hash,
-        accountType as Role,
+        normalizedAccountType,
         studentIdVal,
         courseVal,
         yearLevelVal,
@@ -595,7 +606,9 @@ router.post("/login", async (req, res, next) => {
       return res.status(403).json({
         ok: false,
         message:
-          "Your account is pending librarian approval. Please wait for approval to log in.",
+          role === "librarian" || role === "assistant_librarian"
+            ? "Your librarian account is pending admin approval. Please wait for an admin to approve your account before logging in."
+            : "Your account is pending approval. Please wait for approval to log in.",
       });
     }
 
@@ -900,4 +913,3 @@ router.post("/reset-password", async (req, res, next) => {
 });
 
 export default router;
-

@@ -157,8 +157,14 @@ function computeEffectiveRoleFromRow(
 }
 
 function isExemptFromApproval(role: Role) {
+  return role === "admin";
+}
+
+function isAdminManagedRole(role: Role) {
   return (
-    role === "assistant_librarian" || role === "librarian" || role === "admin"
+    role === "admin" ||
+    role === "librarian" ||
+    role === "assistant_librarian"
   );
 }
 
@@ -204,7 +210,7 @@ function requireRole(roles: Role[]) {
     }
     try {
       const r = await query<UserRow>(
-        `SELECT id, email, full_name, account_type, role, avatar_url
+        `SELECT id, email, full_name, account_type, role, avatar_url, is_approved
          FROM users
          WHERE id = $1
          LIMIT 1`,
@@ -214,6 +220,16 @@ function requireRole(roles: Role[]) {
         return res.status(401).json({ ok: false, message: "Not authenticated." });
       }
       const effective = computeEffectiveRoleFromRow(r.rows[0]);
+      const approved = Boolean(r.rows[0].is_approved);
+      if (!isExemptFromApproval(effective) && !approved) {
+        return res.status(403).json({
+          ok: false,
+          message:
+            effective === "librarian" || effective === "assistant_librarian"
+              ? "Your librarian account is pending admin approval."
+              : "Your account is pending approval.",
+        });
+      }
       if (!roles.includes(effective)) {
         return res
           .status(403)
@@ -1178,7 +1194,7 @@ router.patch("/:id/role", requireAuth, requireRole(["librarian", "admin"]), asyn
     const currentRole = computeEffectiveRoleFromRow(currentUser);
 
     if (s.role === "librarian") {
-      if (isExemptFromApproval(currentRole)) {
+      if (isAdminManagedRole(currentRole)) {
         return res.status(403).json({
           ok: false,
           message:
@@ -1305,6 +1321,13 @@ router.patch("/:id/approve", requireAuth, requireRole(["librarian", "admin"]), a
       });
     }
 
+    if (isAdminManagedRole(effRole) && s.role !== "admin") {
+      return res.status(403).json({
+        ok: false,
+        message: "Only admins can approve assistant librarian or librarian accounts.",
+      });
+    }
+
     if (row.is_approved) {
       return res.json({ ok: true, message: "User is already approved." });
     }
@@ -1327,6 +1350,7 @@ router.patch("/:id/approve", requireAuth, requireRole(["librarian", "admin"]), a
 
 router.patch("/:id/disapprove", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
   try {
+    const s = (req as any).sessionUser as SessionPayload;
     const targetId = readIdParam(req.params.id);
 
     if (!targetId) {
@@ -1352,6 +1376,13 @@ router.patch("/:id/disapprove", requireAuth, requireRole(["librarian", "admin"])
       return res.status(400).json({
         ok: false,
         message: "This user role is exempt from approval.",
+      });
+    }
+
+    if (isAdminManagedRole(effRole) && s.role !== "admin") {
+      return res.status(403).json({
+        ok: false,
+        message: "Only admins can disapprove assistant librarian or librarian accounts.",
       });
     }
 
@@ -1412,7 +1443,7 @@ router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (r
           message: "Librarian can only delete newly registered (not approved) users.",
         });
       }
-      if (isExemptFromApproval(effRole)) {
+      if (isAdminManagedRole(effRole)) {
         return res.status(403).json({
           ok: false,
           message: "Cannot delete assistant librarian/librarian/admin accounts.",
@@ -1461,4 +1492,3 @@ router.get("/check-student-id", async (req, res, next) => {
 });
 
 export default router;
-
