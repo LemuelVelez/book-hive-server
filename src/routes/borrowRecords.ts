@@ -3223,12 +3223,13 @@ router.post("/self", requireAuth, async (req, res, next) => {
         );
 
     const ins = await client.query<{ id: string }>(
-      `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status)
+      `INSERT INTO borrow_records (user_id, book_id, borrow_date, due_date, status, updated_at)
          SELECT $1,
                 selected_book_id,
                 $2::date,
                 $3::date,
-                'pending_pickup'
+                'pending_pickup',
+                NOW()
            FROM unnest($4::int[]) AS selection(selected_book_id)
          RETURNING id`,
       [userId, borrowDateStr, dueDateStr, selectedBookIds]
