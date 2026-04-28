@@ -238,11 +238,11 @@ function isPendingPickupReservationExpired(
 }
 
 function getPendingPickupActiveSql(alias = "br") {
-  return `(${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) >= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour'))`;
+  return `(${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) > NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour'))`;
 }
 
 function getActiveBorrowRecordSql(alias = "br") {
-  return `(${alias}.status <> 'returned' AND NOT (${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) < NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour')))`;
+  return `(${alias}.status <> 'returned' AND NOT (${alias}.status = 'pending_pickup' AND COALESCE(${alias}.updated_at, ${alias}.borrow_date::timestamp) <= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour')))`;
 }
 
 const PROGRAM_TO_COLLEGE = new Map<string, string>([
@@ -1579,6 +1579,51 @@ async function recomputeAndUpdateBookAvailabilityForBookIds(
   }
 }
 
+async function releaseExpiredPendingPickupReservations(
+  client: DBClient
+): Promise<number[]> {
+  const expired = await client.query<{ book_id: number }>(
+    `UPDATE borrow_records br
+        SET status = 'returned',
+            return_date = COALESCE(br.return_date, CURRENT_DATE),
+            fine = COALESCE(br.fine, 0),
+            updated_at = NOW()
+      WHERE br.status = 'pending_pickup'
+        AND COALESCE(br.updated_at, br.borrow_date::timestamp) <= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour')
+      RETURNING br.book_id`
+  );
+
+  const bookIds = Array.from(
+    new Set(
+      expired.rows
+        .map((row) => Number(row.book_id))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    )
+  );
+
+  await recomputeAndUpdateBookAvailabilityForBookIds(client, bookIds);
+
+  return bookIds;
+}
+
+async function releaseExpiredPendingPickupReservationsNow(): Promise<void> {
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+    await releaseExpiredPendingPickupReservations(client);
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Convert a DB row into the DTO the client expects.
  */
@@ -1692,6 +1737,8 @@ router.get(
   requireRole(["assistant_librarian", "librarian", "admin"]),
   async (_req, res, next) => {
     try {
+      await releaseExpiredPendingPickupReservationsNow();
+
       const finePerHour = getBorrowFinePerHour();
 
       const result = await dbQuery<BorrowRowJoined>(
@@ -1766,6 +1813,8 @@ router.get(
   requireRole(["assistant_librarian", "librarian", "admin"]),
   async (req, res, next) => {
     try {
+      await releaseExpiredPendingPickupReservationsNow();
+
       const session = (req as any).sessionUser as SessionPayload;
       const effectiveRole = await getEffectiveRole(session.sub, session.role);
       const canManageExtensions =
@@ -1866,6 +1915,8 @@ router.get(
  */
 router.get("/my", requireAuth, async (req, res, next) => {
   try {
+    await releaseExpiredPendingPickupReservationsNow();
+
     const s = (req as any).sessionUser as SessionPayload;
     const userId = Number(s.sub);
     const finePerHour = getBorrowFinePerHour();
@@ -2969,6 +3020,7 @@ router.post(
       }
 
       await client.query("BEGIN");
+      await releaseExpiredPendingPickupReservations(client);
 
       const u = await client.query<UserRoleRow>(
         `SELECT id, account_type, role
@@ -3123,6 +3175,7 @@ router.post("/self", requireAuth, async (req, res, next) => {
   const client = await dbPool.connect();
   try {
     await client.query("BEGIN");
+    await releaseExpiredPendingPickupReservations(client);
 
     const u = await client.query<UserRoleRow>(
       `SELECT id, account_type, role

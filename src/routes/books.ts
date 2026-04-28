@@ -111,7 +111,8 @@ const dbPool = pool as unknown as DBPool;
 
 const ENFORCE_ROLE_GUARDS = false;
 const PENDING_PICKUP_EXPIRY_HOURS = Math.max(1, Number(process.env.PENDING_PICKUP_EXPIRY_HOURS ?? 24));
-const ACTIVE_BORROW_COUNT_SQL = `status <> 'returned' AND NOT (status = 'pending_pickup' AND COALESCE(updated_at, borrow_date::timestamp) < NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour'))`;
+const ACTIVE_BORROW_COUNT_SQL = `status <> 'returned' AND NOT (status = 'pending_pickup' AND COALESCE(updated_at, borrow_date::timestamp) <= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour'))`;
+const EXPIRED_PENDING_PICKUP_SQL = `status = 'pending_pickup' AND COALESCE(updated_at, borrow_date::timestamp) <= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour')`;
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "").trim().toLowerCase();
@@ -250,6 +251,60 @@ async function computeCopyStateForBook(client: DBClient, bookId: number, copiesT
   const totalBorrowCount = typeof statsRes.rows[0]?.total_borrow_count === "number" && Number.isFinite(statsRes.rows[0].total_borrow_count) ? statsRes.rows[0].total_borrow_count : 0;
   const remaining = Math.max(0, copies - active);
   return { totalCopies: copies, activeCount: active, totalBorrowCount, remainingCopies: remaining, available: remaining > 0 };
+}
+
+async function recomputeAndUpdateBookAvailability(
+  client: DBClient,
+  bookId: number
+): Promise<void> {
+  const state = await computeCopyStateForBook(client, bookId);
+  await client.query(
+    `UPDATE books
+        SET available = $1,
+            updated_at = NOW()
+      WHERE id = $2`,
+    [state.available, bookId]
+  );
+}
+
+async function releaseExpiredPendingPickupReservations(): Promise<void> {
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const expired = await client.query<{ book_id: number }>(
+      `UPDATE borrow_records
+          SET status = 'returned',
+              return_date = COALESCE(return_date, CURRENT_DATE),
+              fine = COALESCE(fine, 0),
+              updated_at = NOW()
+        WHERE ${EXPIRED_PENDING_PICKUP_SQL}
+        RETURNING book_id`
+    );
+
+    const bookIds = Array.from(
+      new Set(
+        expired.rows
+          .map((row) => Number(row.book_id))
+          .filter((value) => Number.isFinite(value) && value > 0)
+      )
+    );
+
+    for (const bookId of bookIds) {
+      await recomputeAndUpdateBookAvailability(client, bookId);
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // ignore rollback errors
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 function buildBookDTO(
@@ -503,6 +558,8 @@ async function findGroupedBookRows(
 
 router.get("/", async (req, res, next) => {
   try {
+    await releaseExpiredPendingPickupReservations();
+
     const session = readSession(req);
     const canSeeCopies =
       session?.role === "librarian" || session?.role === "assistant_librarian";
