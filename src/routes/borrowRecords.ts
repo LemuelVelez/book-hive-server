@@ -1583,14 +1583,10 @@ async function releaseExpiredPendingPickupReservations(
   client: DBClient
 ): Promise<number[]> {
   const expired = await client.query<{ book_id: number }>(
-    `UPDATE borrow_records br
-        SET status = 'returned',
-            return_date = COALESCE(br.return_date, CURRENT_DATE),
-            fine = COALESCE(br.fine, 0),
-            updated_at = NOW()
+    `DELETE FROM borrow_records br
       WHERE br.status = 'pending_pickup'
         AND COALESCE(br.updated_at, br.borrow_date::timestamp) <= NOW() - (${PENDING_PICKUP_EXPIRY_HOURS} * INTERVAL '1 hour')
-      RETURNING br.book_id`
+      RETURNING book_id`
   );
 
   const bookIds = Array.from(

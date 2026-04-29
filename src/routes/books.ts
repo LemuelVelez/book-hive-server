@@ -273,11 +273,7 @@ async function releaseExpiredPendingPickupReservations(): Promise<void> {
     await client.query("BEGIN");
 
     const expired = await client.query<{ book_id: number }>(
-      `UPDATE borrow_records
-          SET status = 'returned',
-              return_date = COALESCE(return_date, CURRENT_DATE),
-              fine = COALESCE(fine, 0),
-              updated_at = NOW()
+      `DELETE FROM borrow_records
         WHERE ${EXPIRED_PENDING_PICKUP_SQL}
         RETURNING book_id`
     );
