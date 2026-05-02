@@ -129,6 +129,7 @@ type BorrowRowJoined = {
   title: string | null;
   accession_number: string | null;
   copy_number: number | null;
+  parent_book_id: number | null;
 };
 
 /* ---------------- ✅ FIX TS2347: Typed DB wrappers ---------------- */
@@ -1242,7 +1243,8 @@ async function fetchBorrowRecordJoined(
             u.course,
             b.title,
             b.accession_number,
-            b.copy_number
+            b.copy_number,
+            b.parent_book_id
 
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
@@ -1296,7 +1298,8 @@ async function fetchBorrowRecordsJoined(
             u.course,
             b.title,
             b.accession_number,
-            b.copy_number
+            b.copy_number,
+            b.parent_book_id
 
      FROM borrow_records br
      LEFT JOIN users u ON u.id = br.user_id
@@ -1657,6 +1660,10 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     course: row.course ?? null,
     college,
     bookId: String(row.book_id),
+    parentBookId:
+      typeof row.parent_book_id === "number" && Number.isFinite(row.parent_book_id)
+        ? String(row.parent_book_id)
+        : null,
     bookTitle: row.title,
     accessionNumber: row.accession_number,
     copyNumber:
@@ -1773,7 +1780,8 @@ router.get(
                 u.course,
                 b.title,
                 b.accession_number,
-                b.copy_number
+                b.copy_number,
+                b.parent_book_id
 
          FROM borrow_records br
          LEFT JOIN users u ON u.id = br.user_id
@@ -1953,7 +1961,8 @@ router.get("/my", requireAuth, async (req, res, next) => {
               u.course,
               b.title,
               b.accession_number,
-              b.copy_number
+              b.copy_number,
+              b.parent_book_id
 
        FROM borrow_records br
        LEFT JOIN users u ON u.id = br.user_id
