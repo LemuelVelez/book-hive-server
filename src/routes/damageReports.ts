@@ -255,6 +255,15 @@ function toDTO(row: DamageUnionRow) {
     liableStudentId: row.liable_student_id,
     liableStudentName: row.liable_full_name,
 
+    reportedByUserId: String(row.user_id),
+    reportedByEmail: row.email,
+    reportedBySchoolId: row.student_id,
+    reportedByName: row.full_name,
+
+    liableUserEmail: row.liable_email,
+    liableUserSchoolId: row.liable_student_id,
+    liableUserName: row.liable_full_name,
+
     bookId: String(row.book_id),
     bookTitle: row.title,
 
@@ -473,9 +482,8 @@ router.get("/", requireAuth, requireRole(["librarian", "admin"]), async (_req, r
 
 /**
  * GET /api/damage-reports/my
- * List damage reports relevant to current authenticated user:
- * - reports they submitted (user_id)
- * - reports they are liable for (liable_user_id)
+ * List damage reports sent to the current authenticated borrower.
+ * Borrowers only read reports where they are the liable user.
  * Includes active + archived via UNION.
  */
 router.get("/my", requireAuth, async (req, res, next) => {
@@ -483,7 +491,7 @@ router.get("/my", requireAuth, async (req, res, next) => {
     const s = (req as any).sessionUser as SessionPayload;
     const userId = Number(s.sub);
 
-    const sql = buildUnionQuery("drp.user_id = $1 OR drp.liable_user_id = $1");
+    const sql = buildUnionQuery("drp.liable_user_id = $1");
     const result = await query<DamageUnionRow>(sql, [userId]);
 
     const reports = result.rows.map(toDTO);
@@ -495,25 +503,48 @@ router.get("/my", requireAuth, async (req, res, next) => {
 
 /**
  * POST /api/damage-reports
- * Create a damage report – students (and staff) can submit.
+ * Create and send a damage report to a borrower – librarian/admin only.
  */
 router.post(
   "/",
   requireAuth,
-  requireRole(["student", "faculty", "librarian", "admin"]),
+  requireRole(["librarian", "admin"]),
   upload.array("photos", 3),
   async (req, res, next) => {
     try {
-      if (!S3_BUCKET) {
-        return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
-      }
-
       const s = (req as any).sessionUser as SessionPayload;
       const { bookId, damageType, severity, fee, notes } = req.body || {};
+      const rawLiable =
+        (req.body && (req.body.liableUserId ?? req.body.liable_user_id ?? req.body.borrowerId ?? req.body.borrowerUserId)) ??
+        undefined;
 
       const bid = Number(bookId);
       if (!bid || !Number.isFinite(bid)) {
         return res.status(400).json({ ok: false, message: "bookId is required." });
+      }
+
+      const liableId = Number(rawLiable);
+      if (!liableId || !Number.isFinite(liableId)) {
+        return res.status(400).json({ ok: false, message: "A valid borrower/liable user is required." });
+      }
+
+      const borrower = await query<UserRoleRow>(
+        `SELECT id, account_type, role
+         FROM users
+         WHERE id = $1
+         LIMIT 1`,
+        [liableId]
+      );
+      if (!borrower.rowCount) {
+        return res.status(404).json({ ok: false, message: "Borrower not found." });
+      }
+
+      const borrowerRole = computeEffectiveRoleFromRow(borrower.rows[0]);
+      if (!["student", "faculty", "other"].includes(borrowerRole)) {
+        return res.status(400).json({
+          ok: false,
+          message: "Only Student, Faculty, and Other accounts can receive borrower damage reports.",
+        });
       }
 
       const dt = String(damageType || "").trim();
@@ -534,8 +565,11 @@ router.post(
       }
 
       const files = (req.files as Express.Multer.File[]) || [];
-      const uploadedUrls: string[] = [];
+      if (files.length > 0 && !S3_BUCKET) {
+        return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
+      }
 
+      const uploadedUrls: string[] = [];
       for (const file of files) {
         const url = await uploadBufferToS3(file.buffer, file.mimetype, file.originalname);
         uploadedUrls.push(url);
@@ -550,9 +584,9 @@ router.post(
 
       const ins = await query<{ id: string }>(
         `INSERT INTO damage_reports (user_id, liable_user_id, book_id, damage_type, severity, fee, status, notes, photo_url)
-         VALUES ($1, NULL, $2, $3, $4, $5, 'pending', $6, $7)
+         VALUES ($1, $2, $3, $4, $5, $6, 'assessed', $7, $8)
          RETURNING id`,
-        [Number(s.sub), bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrlJson]
+        [Number(s.sub), liableId, bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrlJson]
       );
 
       const rid = Number(ins.rows[0].id);
@@ -560,6 +594,8 @@ router.post(
       if (!row) {
         return res.status(500).json({ ok: false, message: "Failed to load created report." });
       }
+
+      await syncFineForDamageReport(row);
 
       res.status(201).json({ ok: true, report: toDTO(row) });
     } catch (err) {
