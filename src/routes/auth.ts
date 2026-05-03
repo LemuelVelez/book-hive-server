@@ -49,6 +49,28 @@ type UserRow = {
   role?: Role;
 };
 
+type ApprovalNotificationRecipientRow = {
+  email: string | null;
+  full_name: string | null;
+  account_type: Role | string | null;
+  role?: Role | string | null;
+};
+
+type PendingApprovalNotificationRow = Pick<
+  UserRow,
+  | "id"
+  | "full_name"
+  | "email"
+  | "account_type"
+  | "student_id"
+  | "course"
+  | "year_level"
+  | "contact_number"
+  | "created_at"
+> & {
+  role?: Role | string | null;
+};
+
 /* ------------------------------------------------------------------
    ✅ ROLE RESOLUTION (IMPORTANT)
    We must rely on `role` (authorization) for guarding/redirecting,
@@ -317,6 +339,173 @@ function isExemptFromApproval(role: Role) {
   return role === "admin";
 }
 
+function roleLabel(role: Role | string | null | undefined) {
+  const normalized = normalizeRole(role);
+  return normalized === "assistant_librarian"
+    ? "assistant librarian"
+    : normalized;
+}
+
+function parseEmailList(value: string | undefined) {
+  return String(value || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter((email) => email.includes("@"));
+}
+
+function uniqueEmails(values: Array<string | null | undefined>) {
+  return Array.from(
+    new Set(
+      values
+        .map((email) => String(email || "").trim().toLowerCase())
+        .filter((email) => email.includes("@"))
+    )
+  );
+}
+
+function clientUrl(pathname = "/dashboard/librarian/users") {
+  const base = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .toString()
+    .replace(/\/+$/, "");
+  const path = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${base}${path}`;
+}
+
+async function getApprovalNotificationRecipients() {
+  const envRecipients = uniqueEmails([
+    ...parseEmailList(process.env.APPROVAL_NOTIFICATION_EMAILS),
+    ...parseEmailList(process.env.ADMIN_NOTIFICATION_EMAILS),
+    ...parseEmailList(process.env.LIBRARIAN_NOTIFICATION_EMAILS),
+  ]);
+
+  if (envRecipients.length > 0) return envRecipients;
+
+  const result = await query<ApprovalNotificationRecipientRow>(
+    `SELECT email, full_name, account_type, role
+       FROM users
+      WHERE email IS NOT NULL
+        AND COALESCE(is_approved, TRUE) = TRUE
+        AND (
+          account_type IN ('admin', 'librarian', 'assistant_librarian')
+          OR role IN ('admin', 'librarian', 'assistant_librarian')
+        )
+      ORDER BY
+        CASE
+          WHEN role = 'admin' OR account_type = 'admin' THEN 0
+          WHEN role = 'librarian' OR account_type = 'librarian' THEN 1
+          ELSE 2
+        END,
+        created_at ASC`
+  );
+
+  return uniqueEmails(result.rows.map((row) => row.email));
+}
+
+function buildPendingApprovalItemHtml(user: PendingApprovalNotificationRow) {
+  const safeName = escapeHtml(user.full_name || "Unnamed user");
+  const safeEmail = escapeHtml(user.email || "No email");
+  const safeRole = escapeHtml(roleLabel(user.role ?? user.account_type));
+  const safeStudentId = user.student_id ? escapeHtml(user.student_id) : "—";
+  const safeCourse = user.course ? escapeHtml(user.course) : "—";
+  const safeYear = user.year_level ? escapeHtml(user.year_level) : "—";
+  const safeContact = user.contact_number ? escapeHtml(user.contact_number) : "—";
+  const safeCreated = user.created_at ? escapeHtml(new Date(user.created_at).toLocaleString()) : "—";
+
+  return `
+    <tr>
+      <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;">
+        <div style="font-weight:700;color:#111827;">${safeName}</div>
+        <div style="font-size:12px;color:#4b5563;word-break:break-all;">${safeEmail}</div>
+      </td>
+      <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;text-transform:capitalize;">${safeRole}</td>
+      <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;">
+        <div>Student ID: ${safeStudentId}</div>
+        <div>Course: ${safeCourse}</div>
+        <div>Year: ${safeYear}</div>
+        <div>Contact: ${safeContact}</div>
+      </td>
+      <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;">${safeCreated}</td>
+    </tr>
+  `;
+}
+
+async function sendPendingApprovalNotificationEmail(
+  users: PendingApprovalNotificationRow[]
+) {
+  if (users.length === 0) {
+    return { sent: false, recipientCount: 0 };
+  }
+
+  const recipients = await getApprovalNotificationRecipients();
+  if (recipients.length === 0) {
+    console.warn(
+      "[approval-notification] No recipients found. Set APPROVAL_NOTIFICATION_EMAILS, ADMIN_NOTIFICATION_EMAILS, or LIBRARIAN_NOTIFICATION_EMAILS."
+    );
+    return { sent: false, recipientCount: 0 };
+  }
+
+  const manageUrl = clientUrl("/dashboard/librarian/users");
+  const safeManageUrl = escapeHtml(manageUrl);
+  const count = users.length;
+  const subject =
+    count === 1
+      ? "Account approval needed • JRMSU-TC Book-Hive"
+      : `${count} account approvals needed • JRMSU-TC Book-Hive`;
+
+  const rows = users.map(buildPendingApprovalItemHtml).join("");
+  const html = `
+    <div style="background:#ffffff;color:#111827;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;padding:24px;">
+      <div style="max-width:760px;margin:0 auto;">
+        <div style="font-size:18px;font-weight:800;margin-bottom:12px;">JRMSU-TC Book-Hive</div>
+        <p style="margin:0 0 10px;">There ${count === 1 ? "is" : "are"} ${count} account${count === 1 ? "" : "s"} waiting for approval.</p>
+        <p style="margin:0 0 16px;color:#4b5563;">Please review the pending account${count === 1 ? "" : "s"} in the librarian user management page.</p>
+        <p style="margin:0 0 18px;">
+          <a href="${safeManageUrl}" style="display:inline-block;padding:10px 12px;border-radius:10px;background:#111827;color:#ffffff;text-decoration:none;font-weight:700;">
+            Open user approvals
+          </a>
+        </p>
+        <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;font-size:14px;">
+          <thead>
+            <tr style="background:#f9fafb;">
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">User</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Role</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Details</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Registered</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <p style="margin:18px 0 0;font-size:12px;color:#6b7280;word-break:break-all;">${safeManageUrl}</p>
+      </div>
+    </div>
+  `.trim();
+
+  const text = [
+    `JRMSU-TC Book-Hive`,
+    ``,
+    `There ${count === 1 ? "is" : "are"} ${count} account${count === 1 ? "" : "s"} waiting for approval.`,
+    `Open user approvals: ${manageUrl}`,
+    ``,
+    ...users.map(
+      (user, index) =>
+        `${index + 1}. ${user.full_name || "Unnamed user"} <${user.email}> - ${roleLabel(user.role ?? user.account_type)}`
+    ),
+  ].join("\n");
+
+  await sendMail({
+    to: recipients.join(", "),
+    subject,
+    html,
+    text,
+  });
+
+  return { sent: true, recipientCount: recipients.length };
+}
+
+function canSendApprovalNotifications(role: Role) {
+  return role === "admin" || role === "librarian" || role === "assistant_librarian";
+}
+
 // --- Routes ---
 
 // GET /api/auth/me
@@ -532,6 +721,12 @@ router.post("/register", async (req, res, next) => {
     createAndSendVerifyEmail(user.id, user.email, user.full_name).catch((e) => {
       console.warn("Failed creating/sending verification email:", e);
     });
+
+    if (!approved) {
+      sendPendingApprovalNotificationEmail([user]).catch((e) => {
+        console.warn("Failed sending pending approval notification email:", e);
+      });
+    }
 
     return res.status(201).json({
       ok: true,
@@ -777,6 +972,62 @@ router.get("/verify-email/confirm", async (req, res, next) => {
     ]);
 
     return res.redirect(302, to(`?status=success`));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/notify-pending-approvals
+router.post("/notify-pending-approvals", async (req, res, next) => {
+  try {
+    const session = readSession(req);
+    if (!session) {
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+
+    const actorResult = await query<UserRow>(
+      `SELECT * FROM users WHERE id = $1 LIMIT 1`,
+      [session.sub]
+    );
+
+    if (!actorResult.rowCount) {
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+
+    const actorRole = getEffectiveRole(actorResult.rows[0]);
+    if (!canSendApprovalNotifications(actorRole)) {
+      return res.status(403).json({ ok: false, message: "Forbidden: insufficient role." });
+    }
+
+    const pending = await query<PendingApprovalNotificationRow>(
+      `SELECT id, full_name, email, account_type, role, student_id, course, year_level, contact_number, created_at
+         FROM users
+        WHERE COALESCE(is_approved, FALSE) = FALSE
+        ORDER BY created_at DESC
+        LIMIT 50`
+    );
+
+    if (!pending.rowCount) {
+      return res.json({
+        ok: true,
+        notified: false,
+        pendingCount: 0,
+        recipientCount: 0,
+        message: "There are no pending accounts to notify.",
+      });
+    }
+
+    const result = await sendPendingApprovalNotificationEmail(pending.rows);
+
+    return res.json({
+      ok: true,
+      notified: result.sent,
+      pendingCount: pending.rowCount,
+      recipientCount: result.recipientCount,
+      message: result.sent
+        ? `Pending approval notification sent to ${result.recipientCount} recipient${result.recipientCount === 1 ? "" : "s"}.`
+        : "No approval notification recipients were found. Set APPROVAL_NOTIFICATION_EMAILS, ADMIN_NOTIFICATION_EMAILS, or LIBRARIAN_NOTIFICATION_EMAILS.",
+    });
   } catch (err) {
     next(err);
   }
