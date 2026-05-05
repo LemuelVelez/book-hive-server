@@ -5,17 +5,27 @@ import multer from "multer";
 import crypto from "crypto";
 import path from "path";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { sendMail } from "../email";
 
 const router = express.Router();
 
 /* ---------------- S3 setup ---------------- */
-const S3_REGION = process.env.AWS_REGION || process.env.S3_REGION || "ap-southeast-2";
+const S3_REGION =
+  process.env.AWS_REGION || process.env.S3_REGION || "ap-southeast-2";
 const S3_BUCKET = process.env.S3_BUCKET_NAME || "";
-const S3_PUBLIC_BASE = (process.env.S3_PUBLIC_URL_BASE || "").replace(/\/+$/, "");
-const S3_PREFIX = (process.env.S3_PREFIX || "uploads/").replace(/^\/+|\/+$/g, "");
+const S3_PUBLIC_BASE = (process.env.S3_PUBLIC_URL_BASE || "").replace(
+  /\/+$/,
+  "",
+);
+const S3_PREFIX = (process.env.S3_PREFIX || "uploads/").replace(
+  /^\/+|\/+$/g,
+  "",
+);
 
 if (!S3_BUCKET) {
-  console.warn("[damage-reports] S3 bucket not set (S3_BUCKET_NAME). Image uploads will fail.");
+  console.warn(
+    "[damage-reports] S3 bucket not set (S3_BUCKET_NAME). Image uploads will fail.",
+  );
 }
 
 const s3 = new S3Client({ region: S3_REGION });
@@ -38,7 +48,10 @@ function makeObjectKey(originalName: string, mime: string) {
   const rand = crypto.randomBytes(6).toString("hex");
   const ts = Date.now();
   const safeBase = path.basename(originalName).replace(/[^a-z0-9_.-]+/gi, "_");
-  const ext = extFromMime(mime, path.extname(safeBase).replace(/^\./, "") || "jpg");
+  const ext = extFromMime(
+    mime,
+    path.extname(safeBase).replace(/^\./, "") || "jpg",
+  );
   const folder = S3_PREFIX ? `${S3_PREFIX}/damage-reports` : "damage-reports";
   return `${folder}/${ts}_${rand}.${ext}`;
 }
@@ -48,7 +61,11 @@ function publicUrlForKey(key: string) {
   return `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${key}`;
 }
 
-async function uploadBufferToS3(buf: Buffer, mime: string, originalName: string): Promise<string> {
+async function uploadBufferToS3(
+  buf: Buffer,
+  mime: string,
+  originalName: string,
+): Promise<string> {
   const Key = makeObjectKey(originalName, mime);
   await s3.send(
     new PutObjectCommand({
@@ -57,7 +74,7 @@ async function uploadBufferToS3(buf: Buffer, mime: string, originalName: string)
       Body: buf,
       ContentType: mime,
       CacheControl: "public, max-age=31536000, immutable",
-    })
+    }),
   );
   return publicUrlForKey(Key);
 }
@@ -125,17 +142,27 @@ type DamageUnionRow = {
   sort_ts: string;
 };
 
+type DamageNotificationRecipientRow = {
+  email: string | null;
+  full_name: string | null;
+  account_type: Role | string | null;
+  role?: Role | string | null;
+};
+
 /* ---------------- helpers (consistent with other routes) ---------------- */
 
 function normalizeRole(raw: unknown): Role {
-  const v = String(raw ?? "").trim().toLowerCase();
+  const v = String(raw ?? "")
+    .trim()
+    .toLowerCase();
   if (v === "student") return "student";
   if (v === "librarian") return "librarian";
   if (v === "faculty") return "faculty";
   if (v === "admin") return "admin";
   if (v === "administrator") return "admin";
   if (v === "staff") return "librarian";
-  if (v === "teacher" || v === "professor" || v === "lecturer") return "faculty";
+  if (v === "teacher" || v === "professor" || v === "lecturer")
+    return "faculty";
   return "other";
 }
 
@@ -161,9 +188,14 @@ function readSession(req: express.Request): SessionPayload | null {
   }
 }
 
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+function requireAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
   const s = readSession(req);
-  if (!s) return res.status(401).json({ ok: false, message: "Not authenticated." });
+  if (!s)
+    return res.status(401).json({ ok: false, message: "Not authenticated." });
   (req as any).sessionUser = s;
   next();
 }
@@ -172,7 +204,11 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
   const primary = normalizeRole(row.account_type);
   const legacy = row.role != null ? normalizeRole(row.role) : undefined;
 
-  if (legacy && legacy !== "student" && (primary === "student" || primary === "other")) {
+  if (
+    legacy &&
+    legacy !== "student" &&
+    (primary === "student" || primary === "other")
+  ) {
     return legacy;
   }
 
@@ -184,20 +220,27 @@ function computeEffectiveRoleFromRow(row: UserRoleRow): Role {
 function requireRole(roles: Role[]) {
   const required = roles.map(normalizeRole);
 
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  return (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) => {
     const s = (req as any).sessionUser as SessionPayload | undefined;
-    if (!s) return res.status(401).json({ ok: false, message: "Not authenticated." });
+    if (!s)
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
 
     query<UserRoleRow>(
       `SELECT id, account_type, role
        FROM users
        WHERE id = $1
        LIMIT 1`,
-      [s.sub]
+      [s.sub],
     )
       .then((result) => {
         if (!result.rowCount) {
-          return res.status(401).json({ ok: false, message: "Not authenticated." });
+          return res
+            .status(401)
+            .json({ ok: false, message: "Not authenticated." });
         }
         const u = result.rows[0];
         const effectiveRole = computeEffectiveRoleFromRow(u);
@@ -208,7 +251,9 @@ function requireRole(roles: Role[]) {
             effectiveRole,
             required,
           });
-          return res.status(403).json({ ok: false, message: "Forbidden: insufficient role." });
+          return res
+            .status(403)
+            .json({ ok: false, message: "Forbidden: insufficient role." });
         }
         (req as any).sessionUser = { ...s, role: effectiveRole };
         next();
@@ -281,10 +326,275 @@ function toDTO(row: DamageUnionRow) {
   };
 }
 
+/* ---------------- email notifications ---------------- */
+
+function escapeHtml(input: unknown) {
+  return String(input ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function parseEmailList(value: string | undefined) {
+  return String(value || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter((email) => email.includes("@"));
+}
+
+function uniqueEmails(values: Array<string | null | undefined>) {
+  return Array.from(
+    new Set(
+      values
+        .map((email) =>
+          String(email || "")
+            .trim()
+            .toLowerCase(),
+        )
+        .filter((email) => email.includes("@")),
+    ),
+  );
+}
+
+function clientUrl(pathname = "/dashboard/librarian/damage-reports") {
+  const base = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .toString()
+    .replace(/\/+$/, "");
+  const path = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${base}${path}`;
+}
+
+function formatPeso(amount: unknown) {
+  const value = Number(amount || 0);
+  try {
+    return new Intl.NumberFormat("en-PH", {
+      style: "currency",
+      currency: "PHP",
+      maximumFractionDigits: 2,
+    }).format(Number.isFinite(value) ? value : 0);
+  } catch {
+    return `₱${(Number.isFinite(value) ? value : 0).toFixed(2)}`;
+  }
+}
+
+function formatDateTime(value: string | null | undefined) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en-PH", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function damageReportLiableName(report: ReturnType<typeof toDTO>) {
+  return (
+    report.liableUserName ||
+    report.liableStudentName ||
+    report.liableUserEmail ||
+    report.liableStudentEmail ||
+    report.liableUserSchoolId ||
+    report.liableStudentId ||
+    `User #${report.liableUserId || report.userId}`
+  );
+}
+
+function damageReportTitle(report: ReturnType<typeof toDTO>) {
+  return report.bookTitle || `Book #${report.bookId}`;
+}
+
+async function getDamageReportNotificationRecipients() {
+  const envRecipients = uniqueEmails([
+    ...parseEmailList(process.env.DAMAGE_REPORT_NOTIFICATION_EMAILS),
+    ...parseEmailList(process.env.LIBRARIAN_NOTIFICATION_EMAILS),
+    ...parseEmailList(process.env.ADMIN_NOTIFICATION_EMAILS),
+  ]);
+
+  if (envRecipients.length > 0) return envRecipients;
+
+  const result = await query<DamageNotificationRecipientRow>(
+    `SELECT email, full_name, account_type, role
+       FROM users
+      WHERE email IS NOT NULL
+        AND COALESCE(is_approved, TRUE) = TRUE
+        AND (
+          account_type IN ('admin', 'librarian', 'assistant_librarian')
+          OR role IN ('admin', 'librarian', 'assistant_librarian')
+        )
+      ORDER BY
+        CASE
+          WHEN role = 'admin' OR account_type = 'admin' THEN 0
+          WHEN role = 'librarian' OR account_type = 'librarian' THEN 1
+          ELSE 2
+        END,
+        created_at ASC`,
+  );
+
+  return uniqueEmails(result.rows.map((row) => row.email));
+}
+
+function buildDamageReportRowsHtml(reports: Array<ReturnType<typeof toDTO>>) {
+  return reports
+    .map((report) => {
+      const safeBorrower = escapeHtml(damageReportLiableName(report));
+      const safeBook = escapeHtml(damageReportTitle(report));
+      const safeDamage = escapeHtml(report.damageType || "—");
+      const safeSeverity = escapeHtml(report.severity || "—");
+      const safeFee = escapeHtml(formatPeso(report.fee));
+      const safeStatus = escapeHtml(report.status || "—");
+      const safeReportedAt = escapeHtml(formatDateTime(report.reportedAt));
+
+      return `
+        <tr>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;">${safeBorrower}</td>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;">${safeBook}</td>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;">${safeDamage}</td>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;text-transform:capitalize;">${safeSeverity}</td>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;white-space:nowrap;">${safeFee}</td>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;text-transform:capitalize;">${safeStatus}</td>
+          <td style="padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;white-space:nowrap;">${safeReportedAt}</td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function sendDamageReportStaffNotificationEmail(
+  reports: Array<ReturnType<typeof toDTO>>,
+) {
+  if (reports.length === 0) {
+    return { sent: false, recipientCount: 0 };
+  }
+
+  const recipients = await getDamageReportNotificationRecipients();
+  if (recipients.length === 0) {
+    console.warn(
+      "[damage-report-notification] No recipients found. Set DAMAGE_REPORT_NOTIFICATION_EMAILS, LIBRARIAN_NOTIFICATION_EMAILS, or ADMIN_NOTIFICATION_EMAILS.",
+    );
+    return { sent: false, recipientCount: 0 };
+  }
+
+  const reportsUrl = clientUrl("/dashboard/librarian/damage-reports");
+  const safeReportsUrl = escapeHtml(reportsUrl);
+  const count = reports.length;
+  const subject = `Book-Hive damage report alert: ${count} report${count === 1 ? "" : "s"} need review`;
+  const html = `
+    <div style="background:#ffffff;color:#111827;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;padding:24px;">
+      <div style="max-width:900px;margin:0 auto;">
+        <div style="font-size:18px;font-weight:800;margin-bottom:12px;">JRMSU-TC Book-Hive</div>
+        <p style="margin:0 0 10px;">There ${count === 1 ? "is" : "are"} ${count} damage report${count === 1 ? "" : "s"} needing review.</p>
+        <p style="margin:0 0 16px;color:#4b5563;">Open the librarian damage reports page to review assessment, liability, and payment status.</p>
+        <p style="margin:0 0 18px;"><a href="${safeReportsUrl}" style="display:inline-block;padding:10px 12px;border-radius:10px;background:#111827;color:#ffffff;text-decoration:none;font-weight:700;">Open damage reports</a></p>
+        <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;font-size:14px;">
+          <thead>
+            <tr style="background:#f9fafb;">
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Borrower</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Book</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Damage</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Severity</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Fee</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Status</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Reported</th>
+            </tr>
+          </thead>
+          <tbody>${buildDamageReportRowsHtml(reports)}</tbody>
+        </table>
+        <p style="margin:18px 0 0;font-size:12px;color:#6b7280;word-break:break-all;">${safeReportsUrl}</p>
+      </div>
+    </div>
+  `.trim();
+  const text = [
+    "JRMSU-TC Book-Hive",
+    "",
+    `There ${count === 1 ? "is" : "are"} ${count} damage report${count === 1 ? "" : "s"} needing review.`,
+    `Open damage reports: ${reportsUrl}`,
+    "",
+    ...reports.map(
+      (report, index) =>
+        `${index + 1}. ${damageReportLiableName(report)} - ${damageReportTitle(report)} - ${report.damageType} - ${formatPeso(report.fee)} - ${report.status}`,
+    ),
+  ].join("\n");
+
+  await sendMail({
+    to: recipients.join(", "),
+    subject,
+    html,
+    text,
+  });
+
+  return { sent: true, recipientCount: recipients.length };
+}
+
+async function sendDamageReportBorrowerNotificationEmail(
+  report: ReturnType<typeof toDTO>,
+  kind: "created" | "updated" | "paid",
+) {
+  const recipient = uniqueEmails([
+    report.liableUserEmail,
+    report.liableStudentEmail,
+    report.studentEmail,
+  ])[0];
+
+  if (!recipient) {
+    return { sent: false, recipientCount: 0 };
+  }
+
+  const finesUrl = clientUrl("/dashboard/student/fines");
+  const safeFinesUrl = escapeHtml(finesUrl);
+  const statusPhrase =
+    kind === "created"
+      ? "A book damage report has been sent to your account."
+      : kind === "paid"
+        ? "Your book damage report has been marked as paid and archived."
+        : "Your book damage report has been updated.";
+  const subject =
+    kind === "paid"
+      ? `Book-Hive damage report paid: ${damageReportTitle(report)}`
+      : `Book-Hive damage report notice: ${damageReportTitle(report)}`;
+
+  const html = `
+    <div style="background:#ffffff;color:#111827;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;padding:24px;">
+      <div style="max-width:720px;margin:0 auto;">
+        <div style="font-size:18px;font-weight:800;margin-bottom:12px;">JRMSU-TC Book-Hive</div>
+        <p style="margin:0 0 10px;">${escapeHtml(statusPhrase)}</p>
+        <p style="margin:0 0 10px;color:#4b5563;">Book: ${escapeHtml(damageReportTitle(report))}</p>
+        <p style="margin:0 0 10px;color:#4b5563;">Damage: ${escapeHtml(report.damageType || "—")}</p>
+        <p style="margin:0 0 10px;color:#4b5563;">Severity: ${escapeHtml(report.severity || "—")}</p>
+        <p style="margin:0 0 10px;color:#4b5563;">Fee: ${escapeHtml(formatPeso(report.fee))}</p>
+        <p style="margin:0 0 10px;color:#4b5563;">Status: ${escapeHtml(report.status || "—")}</p>
+        <p style="margin:16px 0 0;"><a href="${safeFinesUrl}" style="display:inline-block;padding:10px 12px;border-radius:10px;background:#111827;color:#ffffff;text-decoration:none;font-weight:700;">Open my fines</a></p>
+      </div>
+    </div>
+  `.trim();
+
+  const text = [
+    "JRMSU-TC Book-Hive",
+    "",
+    statusPhrase,
+    `Book: ${damageReportTitle(report)}`,
+    `Damage: ${report.damageType || "—"}`,
+    `Severity: ${report.severity || "—"}`,
+    `Fee: ${formatPeso(report.fee)}`,
+    `Status: ${report.status || "—"}`,
+    `Open my fines: ${finesUrl}`,
+  ].join("\n");
+
+  await sendMail({ to: recipient, subject, html, text });
+  return { sent: true, recipientCount: 1 };
+}
+
 /* ---------------- shared UNION query builder ---------------- */
 
 function buildUnionQuery(whereSql: string | null) {
-  const whereActive = whereSql ? `WHERE ${whereSql.replace(/\bdrp\./g, "dr.")}` : "";
+  const whereActive = whereSql
+    ? `WHERE ${whereSql.replace(/\bdrp\./g, "dr.")}`
+    : "";
   const wherePaid = whereSql ? `WHERE ${whereSql}` : "";
 
   return `
@@ -354,7 +664,7 @@ async function fetchOneById(id: number): Promise<DamageUnionRow | null> {
 
 async function syncFineForDamageReport(
   row: DamageUnionRow,
-  options?: { officialReceiptNumber?: string | null }
+  options?: { officialReceiptNumber?: string | null },
 ): Promise<void> {
   const damageIdNum = Number(row.id);
 
@@ -387,24 +697,31 @@ async function syncFineForDamageReport(
 
   const resolvedAt = fineStatus === "paid" ? new Date() : null;
 
-  const existing = await query<{ id: string; official_receipt_number: string | null }>(
+  const existing = await query<{
+    id: string;
+    official_receipt_number: string | null;
+  }>(
     `SELECT id, official_receipt_number
      FROM fines
      WHERE damage_report_id = $1
      ORDER BY created_at ASC
      LIMIT 1`,
-    [damageIdNum]
+    [damageIdNum],
   );
 
   const existingFineId = existing.rowCount ? Number(existing.rows[0].id) : null;
 
   const finalOfficialReceiptNumber =
     fineStatus === "paid"
-      ? options?.officialReceiptNumber ?? existing.rows[0]?.official_receipt_number ?? null
+      ? (options?.officialReceiptNumber ??
+        existing.rows[0]?.official_receipt_number ??
+        null)
       : null;
 
   if (fineStatus === "paid" && !finalOfficialReceiptNumber) {
-    throw new Error("Official receipt number is required when marking a damage report as paid.");
+    throw new Error(
+      "Official receipt number is required when marking a damage report as paid.",
+    );
   }
 
   if (finalOfficialReceiptNumber) {
@@ -414,11 +731,13 @@ async function syncFineForDamageReport(
        WHERE LOWER(BTRIM(official_receipt_number)) = LOWER(BTRIM($1))
          AND ($2::bigint IS NULL OR id <> $2::bigint)
        LIMIT 1`,
-      [finalOfficialReceiptNumber, existingFineId]
+      [finalOfficialReceiptNumber, existingFineId],
     );
 
     if (duplicate.rowCount) {
-      throw new Error("Official receipt number already exists on another fine.");
+      throw new Error(
+        "Official receipt number already exists on another fine.",
+      );
     }
   }
 
@@ -443,7 +762,7 @@ async function syncFineForDamageReport(
         reason,
         resolvedAt,
         finalOfficialReceiptNumber,
-      ]
+      ],
     );
   } else {
     const fid = Number(existing.rows[0].id);
@@ -457,7 +776,15 @@ async function syncFineForDamageReport(
            official_receipt_number = $6,
            updated_at = NOW()
        WHERE id = $7`,
-      [liableIdNum, feeNum, fineStatus, reason, resolvedAt, finalOfficialReceiptNumber, fid]
+      [
+        liableIdNum,
+        feeNum,
+        fineStatus,
+        reason,
+        resolvedAt,
+        finalOfficialReceiptNumber,
+        fid,
+      ],
     );
   }
 }
@@ -469,16 +796,21 @@ async function syncFineForDamageReport(
  * List all damage reports (librarian/admin).
  * Includes active + archived/paid (separate record) via UNION.
  */
-router.get("/", requireAuth, requireRole(["librarian", "admin"]), async (_req, res, next) => {
-  try {
-    const sql = buildUnionQuery(null);
-    const result = await query<DamageUnionRow>(sql);
-    const reports = result.rows.map(toDTO);
-    res.json({ ok: true, reports });
-  } catch (err) {
-    next(err);
-  }
-});
+router.get(
+  "/",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (_req, res, next) => {
+    try {
+      const sql = buildUnionQuery(null);
+      const result = await query<DamageUnionRow>(sql);
+      const reports = result.rows.map(toDTO);
+      res.json({ ok: true, reports });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 /**
  * GET /api/damage-reports/my
@@ -502,6 +834,56 @@ router.get("/my", requireAuth, async (req, res, next) => {
 });
 
 /**
+ * POST /api/damage-reports/notify-librarians
+ * Send an email summary of active damage reports to librarian/admin recipients.
+ */
+router.post(
+  "/notify-librarians",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const requestedLimit = Number(req.body?.limit ?? 20);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.min(Math.max(Math.round(requestedLimit), 1), 50)
+        : 20;
+
+      const sql = `
+        SELECT *
+        FROM (${buildUnionQuery("drp.status IN ('pending', 'assessed')")}) q
+        LIMIT $1
+      `;
+      const result = await query<DamageUnionRow>(sql, [limit]);
+
+      if (!result.rowCount) {
+        return res.json({
+          ok: true,
+          notified: false,
+          reportCount: 0,
+          recipientCount: 0,
+          message: "There are no active damage reports to notify.",
+        });
+      }
+
+      const reports = result.rows.map(toDTO);
+      const sendResult = await sendDamageReportStaffNotificationEmail(reports);
+
+      return res.json({
+        ok: true,
+        notified: sendResult.sent,
+        reportCount: reports.length,
+        recipientCount: sendResult.recipientCount,
+        message: sendResult.sent
+          ? `Damage report notification sent to ${sendResult.recipientCount} recipient${sendResult.recipientCount === 1 ? "" : "s"}.`
+          : "No damage report notification recipients were found. Set DAMAGE_REPORT_NOTIFICATION_EMAILS, LIBRARIAN_NOTIFICATION_EMAILS, or ADMIN_NOTIFICATION_EMAILS.",
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
  * POST /api/damage-reports
  * Create and send a damage report to a borrower – librarian/admin only.
  */
@@ -515,17 +897,28 @@ router.post(
       const s = (req as any).sessionUser as SessionPayload;
       const { bookId, damageType, severity, fee, notes } = req.body || {};
       const rawLiable =
-        (req.body && (req.body.liableUserId ?? req.body.liable_user_id ?? req.body.borrowerId ?? req.body.borrowerUserId)) ??
+        (req.body &&
+          (req.body.liableUserId ??
+            req.body.liable_user_id ??
+            req.body.borrowerId ??
+            req.body.borrowerUserId)) ??
         undefined;
 
       const bid = Number(bookId);
       if (!bid || !Number.isFinite(bid)) {
-        return res.status(400).json({ ok: false, message: "bookId is required." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "bookId is required." });
       }
 
       const liableId = Number(rawLiable);
       if (!liableId || !Number.isFinite(liableId)) {
-        return res.status(400).json({ ok: false, message: "A valid borrower/liable user is required." });
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message: "A valid borrower/liable user is required.",
+          });
       }
 
       const borrower = await query<UserRoleRow>(
@@ -533,51 +926,71 @@ router.post(
          FROM users
          WHERE id = $1
          LIMIT 1`,
-        [liableId]
+        [liableId],
       );
       if (!borrower.rowCount) {
-        return res.status(404).json({ ok: false, message: "Borrower not found." });
+        return res
+          .status(404)
+          .json({ ok: false, message: "Borrower not found." });
       }
 
       const borrowerRole = computeEffectiveRoleFromRow(borrower.rows[0]);
       if (!["student", "faculty", "other"].includes(borrowerRole)) {
         return res.status(400).json({
           ok: false,
-          message: "Only Student, Faculty, and Other accounts can receive borrower damage reports.",
+          message:
+            "Only Student, Faculty, and Other accounts can receive borrower damage reports.",
         });
       }
 
       const dt = String(damageType || "").trim();
       if (!dt) {
-        return res.status(400).json({ ok: false, message: "damageType is required." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "damageType is required." });
       }
 
       const sev = String(severity || "").toLowerCase();
       if (!["minor", "moderate", "major"].includes(sev)) {
         return res
           .status(400)
-          .json({ ok: false, message: "severity must be 'minor' | 'moderate' | 'major'." });
+          .json({
+            ok: false,
+            message: "severity must be 'minor' | 'moderate' | 'major'.",
+          });
       }
 
       const feeNum = fee === undefined || fee === null ? 0 : Number(fee);
       if (!Number.isFinite(feeNum) || feeNum < 0) {
-        return res.status(400).json({ ok: false, message: "fee must be a non-negative number." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "fee must be a non-negative number." });
       }
 
       const files = (req.files as Express.Multer.File[]) || [];
       if (files.length > 0 && !S3_BUCKET) {
-        return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
+        return res
+          .status(500)
+          .json({ ok: false, message: "S3 bucket not configured." });
       }
 
       const uploadedUrls: string[] = [];
       for (const file of files) {
-        const url = await uploadBufferToS3(file.buffer, file.mimetype, file.originalname);
+        const url = await uploadBufferToS3(
+          file.buffer,
+          file.mimetype,
+          file.originalname,
+        );
         uploadedUrls.push(url);
       }
 
-      const photoUrlJson = uploadedUrls.length ? JSON.stringify(uploadedUrls) : null;
+      const photoUrlJson = uploadedUrls.length
+        ? JSON.stringify(uploadedUrls)
+        : null;
 
-      const book = await query(`SELECT id FROM books WHERE id = $1 LIMIT 1`, [bid]);
+      const book = await query(`SELECT id FROM books WHERE id = $1 LIMIT 1`, [
+        bid,
+      ]);
       if (!book.rowCount) {
         return res.status(404).json({ ok: false, message: "Book not found." });
       }
@@ -586,22 +999,49 @@ router.post(
         `INSERT INTO damage_reports (user_id, liable_user_id, book_id, damage_type, severity, fee, status, notes, photo_url)
          VALUES ($1, $2, $3, $4, $5, $6, 'assessed', $7, $8)
          RETURNING id`,
-        [Number(s.sub), liableId, bid, dt, sev, feeNum, notes ? String(notes).trim() : null, photoUrlJson]
+        [
+          Number(s.sub),
+          liableId,
+          bid,
+          dt,
+          sev,
+          feeNum,
+          notes ? String(notes).trim() : null,
+          photoUrlJson,
+        ],
       );
 
       const rid = Number(ins.rows[0].id);
       const row = await fetchOneById(rid);
       if (!row) {
-        return res.status(500).json({ ok: false, message: "Failed to load created report." });
+        return res
+          .status(500)
+          .json({ ok: false, message: "Failed to load created report." });
       }
 
       await syncFineForDamageReport(row);
 
-      res.status(201).json({ ok: true, report: toDTO(row) });
+      const report = toDTO(row);
+      sendDamageReportBorrowerNotificationEmail(report, "created").catch(
+        (e) => {
+          console.warn(
+            "Failed sending damage report borrower notification email:",
+            e,
+          );
+        },
+      );
+      sendDamageReportStaffNotificationEmail([report]).catch((e) => {
+        console.warn(
+          "Failed sending damage report staff notification email:",
+          e,
+        );
+      });
+
+      res.status(201).json({ ok: true, report });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
@@ -623,18 +1063,25 @@ router.patch(
       }
 
       // If it’s already archived, block edits
-      const alreadyArchived = await query(`SELECT id FROM damage_reports_paid WHERE id = $1 LIMIT 1`, [rid]);
+      const alreadyArchived = await query(
+        `SELECT id FROM damage_reports_paid WHERE id = $1 LIMIT 1`,
+        [rid],
+      );
       if (alreadyArchived.rowCount) {
         return res.status(409).json({
           ok: false,
-          message: "This damage report is already archived (paid) and can no longer be edited.",
+          message:
+            "This damage report is already archived (paid) and can no longer be edited.",
         });
       }
 
       const { status, severity, fee, notes, damageType } = req.body || {};
 
       const requestedOfficialReceiptNumberRaw =
-        (req.body && (req.body.officialReceiptNumber ?? req.body.orNumber ?? req.body.receiptNumber)) ??
+        (req.body &&
+          (req.body.officialReceiptNumber ??
+            req.body.orNumber ??
+            req.body.receiptNumber)) ??
         undefined;
       const requestedOfficialReceiptNumber =
         requestedOfficialReceiptNumberRaw === undefined
@@ -643,14 +1090,21 @@ router.patch(
 
       // Support both liableUserId and liable_user_id from clients
       const rawLiable =
-        (req.body && (req.body.liableUserId ?? req.body.liable_user_id)) ?? undefined;
+        (req.body && (req.body.liableUserId ?? req.body.liable_user_id)) ??
+        undefined;
 
       let newPhotoUrl: string | undefined = undefined;
       if (req.file) {
         if (!S3_BUCKET) {
-          return res.status(500).json({ ok: false, message: "S3 bucket not configured." });
+          return res
+            .status(500)
+            .json({ ok: false, message: "S3 bucket not configured." });
         }
-        newPhotoUrl = await uploadBufferToS3(req.file.buffer, req.file.mimetype, req.file.originalname);
+        newPhotoUrl = await uploadBufferToS3(
+          req.file.buffer,
+          req.file.mimetype,
+          req.file.originalname,
+        );
       }
 
       const updates: string[] = [];
@@ -660,12 +1114,15 @@ router.patch(
       if (status !== undefined) {
         const st = String(status).toLowerCase();
         if (!["pending", "assessed", "paid"].includes(st)) {
-          return res.status(400).json({ ok: false, message: "Invalid status." });
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid status." });
         }
         if (st === "paid" && !requestedOfficialReceiptNumber) {
           return res.status(400).json({
             ok: false,
-            message: "Official receipt number is required when marking a damage report as paid.",
+            message:
+              "Official receipt number is required when marking a damage report as paid.",
           });
         }
         updates.push(`status = $${i++}`);
@@ -678,14 +1135,17 @@ router.patch(
       ) {
         return res.status(400).json({
           ok: false,
-          message: "Official receipt number can only be submitted when marking as paid.",
+          message:
+            "Official receipt number can only be submitted when marking as paid.",
         });
       }
 
       if (severity !== undefined) {
         const sv = String(severity).toLowerCase();
         if (!["minor", "moderate", "major"].includes(sv)) {
-          return res.status(400).json({ ok: false, message: "Invalid severity." });
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid severity." });
         }
         updates.push(`severity = $${i++}`);
         values.push(sv);
@@ -694,7 +1154,9 @@ router.patch(
       if (fee !== undefined) {
         const f = Number(fee);
         if (!Number.isFinite(f) || f < 0) {
-          return res.status(400).json({ ok: false, message: "fee must be a non-negative number." });
+          return res
+            .status(400)
+            .json({ ok: false, message: "fee must be a non-negative number." });
         }
         updates.push(`fee = $${i++}`);
         values.push(f);
@@ -708,7 +1170,9 @@ router.patch(
       if (damageType !== undefined) {
         const dt = String(damageType || "").trim();
         if (!dt) {
-          return res.status(400).json({ ok: false, message: "damageType cannot be empty." });
+          return res
+            .status(400)
+            .json({ ok: false, message: "damageType cannot be empty." });
         }
         updates.push(`damage_type = $${i++}`);
         values.push(dt);
@@ -723,11 +1187,20 @@ router.patch(
         } else {
           const uid = Number(rawStr);
           if (!uid || !Number.isFinite(uid)) {
-            return res.status(400).json({ ok: false, message: "liableUserId must be a valid user id or null." });
+            return res
+              .status(400)
+              .json({
+                ok: false,
+                message: "liableUserId must be a valid user id or null.",
+              });
           }
-          const u = await query(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [uid]);
+          const u = await query(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [
+            uid,
+          ]);
           if (!u.rowCount) {
-            return res.status(404).json({ ok: false, message: "Liable user not found." });
+            return res
+              .status(404)
+              .json({ ok: false, message: "Liable user not found." });
           }
           updates.push(`liable_user_id = $${i++}`);
           values.push(uid);
@@ -741,7 +1214,9 @@ router.patch(
       }
 
       if (updates.length === 0) {
-        return res.status(400).json({ ok: false, message: "No changes provided." });
+        return res
+          .status(400)
+          .json({ ok: false, message: "No changes provided." });
       }
 
       updates.push(`updated_at = NOW()`);
@@ -751,11 +1226,13 @@ router.patch(
          SET ${updates.join(", ")}
          WHERE id = $${i}
          RETURNING id`,
-        [...values, rid]
+        [...values, rid],
       );
 
       if (!upd.rowCount) {
-        return res.status(404).json({ ok: false, message: "Damage report not found." });
+        return res
+          .status(404)
+          .json({ ok: false, message: "Damage report not found." });
       }
 
       // Load the updated row (still active at this point)
@@ -782,11 +1259,13 @@ router.patch(
         WHERE dr.id = $1
         LIMIT 1
         `,
-        [rid]
+        [rid],
       );
 
       if (!activeRowRes.rowCount) {
-        return res.status(404).json({ ok: false, message: "Damage report not found." });
+        return res
+          .status(404)
+          .json({ ok: false, message: "Damage report not found." });
       }
 
       const joinedRow = activeRowRes.rows[0];
@@ -811,22 +1290,45 @@ router.patch(
           FROM moved
           ON CONFLICT (id) DO NOTHING
           `,
-          [rid]
+          [rid],
         );
 
         const archivedRow = await fetchOneById(rid);
         if (!archivedRow) {
-          return res.status(500).json({ ok: false, message: "Archived record not found after moving." });
+          return res
+            .status(500)
+            .json({
+              ok: false,
+              message: "Archived record not found after moving.",
+            });
         }
 
-        return res.json({ ok: true, report: toDTO(archivedRow) });
+        const report = toDTO(archivedRow);
+        sendDamageReportBorrowerNotificationEmail(report, "paid").catch((e) => {
+          console.warn(
+            "Failed sending damage report paid notification email:",
+            e,
+          );
+        });
+
+        return res.json({ ok: true, report });
       }
 
-      res.json({ ok: true, report: toDTO(joinedRow) });
+      const report = toDTO(joinedRow);
+      sendDamageReportBorrowerNotificationEmail(report, "updated").catch(
+        (e) => {
+          console.warn(
+            "Failed sending damage report update notification email:",
+            e,
+          );
+        },
+      );
+
+      res.json({ ok: true, report });
     } catch (err) {
       next(err);
     }
-  }
+  },
 );
 
 /**
@@ -834,33 +1336,46 @@ router.patch(
  * Remove a report – librarian/admin only.
  * Works for both active and archived.
  */
-router.delete("/:id", requireAuth, requireRole(["librarian", "admin"]), async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const rid = Number(id);
-    if (!rid) {
-      return res.status(400).json({ ok: false, message: "Invalid id." });
+router.delete(
+  "/:id",
+  requireAuth,
+  requireRole(["librarian", "admin"]),
+  async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const rid = Number(id);
+      if (!rid) {
+        return res.status(400).json({ ok: false, message: "Invalid id." });
+      }
+
+      // Remove fine by direct link (preferred)
+      await query(`DELETE FROM fines WHERE damage_report_id = $1`, [rid]);
+
+      // Try delete active first
+      const delActive = await query(
+        `DELETE FROM damage_reports WHERE id = $1`,
+        [rid],
+      );
+      if (delActive.rowCount) {
+        return res.json({ ok: true, message: "Damage report deleted." });
+      }
+
+      // If not in active, try delete archived
+      const delPaid = await query(
+        `DELETE FROM damage_reports_paid WHERE id = $1`,
+        [rid],
+      );
+      if (!delPaid.rowCount) {
+        return res
+          .status(404)
+          .json({ ok: false, message: "Damage report not found." });
+      }
+
+      res.json({ ok: true, message: "Archived damage report deleted." });
+    } catch (err) {
+      next(err);
     }
-
-    // Remove fine by direct link (preferred)
-    await query(`DELETE FROM fines WHERE damage_report_id = $1`, [rid]);
-
-    // Try delete active first
-    const delActive = await query(`DELETE FROM damage_reports WHERE id = $1`, [rid]);
-    if (delActive.rowCount) {
-      return res.json({ ok: true, message: "Damage report deleted." });
-    }
-
-    // If not in active, try delete archived
-    const delPaid = await query(`DELETE FROM damage_reports_paid WHERE id = $1`, [rid]);
-    if (!delPaid.rowCount) {
-      return res.status(404).json({ ok: false, message: "Damage report not found." });
-    }
-
-    res.json({ ok: true, message: "Archived damage report deleted." });
-  } catch (err) {
-    next(err);
-  }
-});
+  },
+);
 
 export default router;
