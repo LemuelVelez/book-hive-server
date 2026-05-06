@@ -57,6 +57,7 @@ type FineRowJoined = {
   borrow_status: BorrowStatus | null;
   borrow_due_date: string | null;
   borrow_return_date: string | null;
+  borrow_created_at: string | null;
   book_id: string | null;
   book_title: string | null;
   email: string | null;
@@ -79,6 +80,13 @@ type FineNotificationSessionRow = UserRoleRow & {
 /* ---------------- helpers ---------------- */
 
 const HOUR_MS = 1000 * 60 * 60;
+const MANILA_UTC_OFFSET_HOURS = 8;
+
+type BorrowOverdueMetrics = {
+  fineStartsAt: string | null;
+  overdueHours: number | null;
+  overdueDays: number | null;
+};
 
 function normalizeRole(raw: unknown): Role {
   const v = String(raw ?? "")
@@ -110,25 +118,142 @@ function getBorrowFinePerHour(): number {
   return raw;
 }
 
-function endOfUtcDay(dateStr: string): Date {
-  return new Date(`${dateStr}T23:59:59.999Z`);
+function isDateOnlyValue(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
+}
+
+function parseDateValue(value: string | null | undefined): Date | null {
+  if (!value) return null;
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getManilaTimeParts(date: Date) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Manila",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const value = (type: string) =>
+    Number(parts.find((part) => part.type === type)?.value || 0);
+
+  return {
+    hour: value("hour"),
+    minute: value("minute"),
+    second: value("second"),
+    millisecond: date.getMilliseconds(),
+  };
+}
+
+function dateOnlyAtManilaTime(
+  dateOnly: string,
+  timeSource?: Date | null,
+): Date {
+  const [year, month, day] = dateOnly.split("-").map(Number);
+  const time = timeSource
+    ? getManilaTimeParts(timeSource)
+    : { hour: 0, minute: 0, second: 0, millisecond: 0 };
+
+  return new Date(
+    Date.UTC(
+      year,
+      month - 1,
+      day,
+      time.hour - MANILA_UTC_OFFSET_HOURS,
+      time.minute,
+      time.second,
+      time.millisecond,
+    ),
+  );
+}
+
+function getBorrowFineStartDate(
+  dueDate: string | null,
+  borrowCreatedAt: string | null,
+): Date | null {
+  if (!dueDate) return null;
+
+  const rawDueDate = String(dueDate).trim();
+  const borrowStart = parseDateValue(borrowCreatedAt);
+
+  if (isDateOnlyValue(rawDueDate)) {
+    return dateOnlyAtManilaTime(rawDueDate, borrowStart);
+  }
+
+  return parseDateValue(rawDueDate);
+}
+
+function getBorrowFineEndDate(
+  returnDate: string | null,
+  borrowCreatedAt: string | null,
+): Date {
+  if (!returnDate) return new Date();
+
+  const rawReturnDate = String(returnDate).trim();
+  const borrowStart = parseDateValue(borrowCreatedAt);
+
+  if (isDateOnlyValue(rawReturnDate)) {
+    return dateOnlyAtManilaTime(rawReturnDate, borrowStart);
+  }
+
+  return parseDateValue(rawReturnDate) ?? new Date();
 }
 
 function computeBorrowOverdueMetrics(
   dueDate: string | null,
   returnDate: string | null,
-): { overdueHours: number | null; overdueDays: number | null } {
-  if (!dueDate) {
-    return { overdueHours: null, overdueDays: null };
+  borrowCreatedAt: string | null,
+): BorrowOverdueMetrics {
+  const fineStartsAt = getBorrowFineStartDate(dueDate, borrowCreatedAt);
+
+  if (!fineStartsAt) {
+    return { fineStartsAt: null, overdueHours: null, overdueDays: null };
   }
 
-  const dueCutoff = endOfUtcDay(dueDate);
-  const end = returnDate ? endOfUtcDay(returnDate) : new Date();
-  const overdueMs = Math.max(0, end.getTime() - dueCutoff.getTime());
+  const end = getBorrowFineEndDate(returnDate, borrowCreatedAt);
+  const overdueMs = Math.max(0, end.getTime() - fineStartsAt.getTime());
   const overdueHours = overdueMs > 0 ? Math.ceil(overdueMs / HOUR_MS) : 0;
   const overdueDays = overdueHours > 0 ? Math.ceil(overdueHours / 24) : 0;
 
-  return { overdueHours, overdueDays };
+  return {
+    fineStartsAt: fineStartsAt.toISOString(),
+    overdueHours,
+    overdueDays,
+  };
+}
+
+function computeActiveBorrowFineAmount(
+  row: Pick<
+    FineRowJoined,
+    | "amount"
+    | "borrow_record_id"
+    | "borrow_due_date"
+    | "borrow_return_date"
+    | "borrow_created_at"
+    | "status"
+  >,
+): number {
+  const storedAmount = Number(row.amount || 0);
+
+  if (!row.borrow_record_id || row.status !== "active") {
+    return Number.isFinite(storedAmount) ? storedAmount : 0;
+  }
+
+  const metrics = computeBorrowOverdueMetrics(
+    row.borrow_due_date,
+    row.borrow_return_date,
+    row.borrow_created_at,
+  );
+  const overdueHours = metrics.overdueHours ?? 0;
+
+  return overdueHours * getBorrowFinePerHour();
 }
 
 function isStaffRole(role: Role) {
@@ -255,6 +380,7 @@ function fineToDTO(row: FineRowJoined) {
   const metrics = computeBorrowOverdueMetrics(
     row.borrow_due_date,
     row.borrow_return_date,
+    row.borrow_created_at,
   );
 
   return {
@@ -262,7 +388,7 @@ function fineToDTO(row: FineRowJoined) {
     userId: String(row.user_id),
     borrowRecordId: row.borrow_record_id ? String(row.borrow_record_id) : null,
     damageReportId: row.damage_report_id ? String(row.damage_report_id) : null,
-    amount: Number(row.amount || 0),
+    amount: computeActiveBorrowFineAmount(row),
     status: row.status,
     reason: row.reason,
     createdAt: row.created_at,
@@ -279,6 +405,8 @@ function fineToDTO(row: FineRowJoined) {
     borrowStatus: row.borrow_status,
     borrowDueDate: row.borrow_due_date,
     borrowReturnDate: row.borrow_return_date,
+    borrowStartedAt: row.borrow_created_at,
+    borrowFineStartsAt: metrics.fineStartsAt,
 
     finePerHour: row.borrow_record_id ? getBorrowFinePerHour() : null,
     overdueHours: metrics.overdueHours,
@@ -302,6 +430,7 @@ const BASE_SELECT = `
     br.status AS borrow_status,
     br.due_date AS borrow_due_date,
     br.return_date AS borrow_return_date,
+    br.created_at AS borrow_created_at,
     br.book_id,
     b.title AS book_title,
     u.email,
@@ -848,14 +977,9 @@ router.patch(
         return res.status(400).json({ ok: false, message: "Invalid id." });
       }
 
-      const currentFineResult = await query<{
-        id: string;
-        status: FineStatus;
-        official_receipt_number: string | null;
-      }>(
-        `SELECT id, status, official_receipt_number
-         FROM fines
-         WHERE id = $1
+      const currentFineResult = await query<FineRowJoined>(
+        `${BASE_SELECT}
+         WHERE f.id = $1
          LIMIT 1`,
         [fid],
       );
@@ -920,6 +1044,15 @@ router.patch(
         } else {
           updates.push(`resolved_at = NULL`);
         }
+      }
+
+      if (
+        amount === undefined &&
+        (nextStatus === "paid" || nextStatus === "cancelled") &&
+        currentFine.borrow_record_id
+      ) {
+        updates.push(`amount = $${i++}`);
+        values.push(computeActiveBorrowFineAmount(currentFine));
       }
 
       const finalOfficialReceiptNumber =
@@ -1004,6 +1137,7 @@ router.patch(
                    NULL::text AS borrow_status,
                    NULL::date AS borrow_due_date,
                    NULL::date AS borrow_return_date,
+                   NULL::timestamptz AS borrow_created_at,
                    NULL::bigint AS book_id,
                    NULL::text AS book_title,
                    NULL::text AS email,
