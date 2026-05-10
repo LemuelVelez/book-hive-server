@@ -58,6 +58,7 @@ type BorrowNotificationsSummaryRow = {
   pending_return_count: number;
   pending_extension_count: number;
   action_required_count: number;
+  action_required_latest_at?: string | null;
 };
 
 
@@ -1722,6 +1723,8 @@ function toDTO(row: BorrowRowJoined, finePerHour: number) {
     returnRequestedByName: row.return_requested_by_name ?? null,
     returnRequestNote: row.return_request_note ?? null,
 
+    updatedAt: row.borrow_updated_at ?? null,
+
     reservationWindowHours: PENDING_PICKUP_EXPIRY_HOURS,
     reservationExpiresAt: getPendingPickupExpiryDateTime(row)?.toISOString() ?? null,
     reservationExpired: isPendingPickupReservationExpired(row),
@@ -1853,7 +1856,17 @@ router.get(
                       OR br.status IN ('pending_return', 'pending')
                       OR ($1::boolean AND br.extension_request_status = 'pending')
                     )
-                )::int AS action_required_count
+                )::int AS action_required_count,
+
+                MAX(br.updated_at) FILTER (
+                  WHERE br.return_date IS NULL
+                    AND ${getActiveBorrowRecordSql('br')}
+                    AND (
+                      ${getPendingPickupActiveSql('br')}
+                      OR br.status IN ('pending_return', 'pending')
+                      OR ($1::boolean AND br.extension_request_status = 'pending')
+                    )
+                ) AS action_required_latest_at
          FROM borrow_records br`,
         [canManageExtensions]
       );
@@ -1864,6 +1877,7 @@ router.get(
         pending_return_count: 0,
         pending_extension_count: 0,
         action_required_count: 0,
+        action_required_latest_at: null,
       };
 
       const unreadCount =
@@ -1905,6 +1919,7 @@ router.get(
             Number.isFinite(row.pending_extension_count)
               ? row.pending_extension_count
               : 0,
+          lastActionRequiredAt: row.action_required_latest_at ?? null,
         },
       });
     } catch (err) {

@@ -1033,6 +1033,77 @@ router.post("/notify-pending-approvals", async (req, res, next) => {
   }
 });
 
+
+function normalizeNotificationReadKey(raw: unknown) {
+  const key = String(raw ?? "").trim().toLowerCase();
+  if (!key) return null;
+  if (!/^[a-z0-9:_-]{1,100}$/.test(key)) return null;
+  return key;
+}
+
+function toNotificationReadDTO(row: { notification_key: string; read_at: string }) {
+  return {
+    key: row.notification_key,
+    readAt: row.read_at,
+  };
+}
+
+// GET /api/auth/notification-reads
+router.get("/notification-reads", async (req, res, next) => {
+  try {
+    const session = readSession(req);
+    if (!session) {
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+
+    const result = await query<{ notification_key: string; read_at: string }>(
+      `SELECT notification_key, read_at
+         FROM notification_read_states
+        WHERE user_id = $1
+        ORDER BY notification_key ASC`,
+      [session.sub]
+    );
+
+    return res.json({
+      ok: true,
+      reads: result.rows.map(toNotificationReadDTO),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/notification-reads/:key
+router.post("/notification-reads/:key", async (req, res, next) => {
+  try {
+    const session = readSession(req);
+    if (!session) {
+      return res.status(401).json({ ok: false, message: "Not authenticated." });
+    }
+
+    const key = normalizeNotificationReadKey(req.params.key);
+    if (!key) {
+      return res.status(400).json({ ok: false, message: "Invalid notification key." });
+    }
+
+    const result = await query<{ notification_key: string; read_at: string }>(
+      `INSERT INTO notification_read_states (user_id, notification_key, read_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id, notification_key)
+       DO UPDATE SET read_at = EXCLUDED.read_at
+       RETURNING notification_key, read_at`,
+      [session.sub, key]
+    );
+
+    return res.json({
+      ok: true,
+      read: toNotificationReadDTO(result.rows[0]),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /* --------------------------- PASSWORD RESET --------------------------- */
 
 // POST /api/auth/forgot-password
